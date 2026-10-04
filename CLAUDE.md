@@ -15,7 +15,7 @@ Tauri 2 + React 19，后端约 21k 行 Rust。
 ```bash
 source scripts/msvc-env.sh     # 每个新 shell 都要执行一次
 cd src-tauri
-cargo test                     # 476 个测试
+cargo test                     # 502 个测试
 cargo check --all-targets      # 期望零警告
 cargo build
 ```
@@ -42,7 +42,7 @@ cargo build
 | 缓存 | `src-tauri/src/cache/` | 缓存键、策略、存储与 LRU 淘汰 |
 | 接管 | `src-tauri/src/takeover/` | 客户端配置的保序补丁与原子写入 |
 | 存储 | `src-tauri/src/storage/` | SQLite 连接、迁移、各领域读写 |
-| 命令 | `src-tauri/src/commands/` | Tauri 命令层（39 个） |
+| 命令 | `src-tauri/src/commands/` | Tauri 命令层（41 个） |
 | 前端 | `src/` | 8 个页面 + shadcn/ui 组件 |
 
 ## 改什么去哪里
@@ -51,7 +51,7 @@ cargo build
 |---|---|
 | **加一个新协议**（如 Gemini） | `protocol/dto.rs` 加 `Protocol` 变体 → 新建 `protocol/<name>/`（request/response/stream/mod）→ `protocol/codec.rs::CodecRegistry::new` 注册 → 按需加 `gateway/router.rs` 路由 |
 | **加一个新客户端接管** | `takeover/clients.rs` 加 `ClientId` 变体 + `config_paths()` + `plan_apply()`；`config/paths.rs` 加路径函数 |
-| **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → `upstream/channel.rs::prepare` 的鉴权分支 → `commands/providers.rs::probe` 同步 |
+| **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → 同文件 `Provider::auth_header()`（**鉴权头的唯一构造点**，出站转发、连通探测、拉模型列表都走它） |
 | **改计费公式** | `billing/engine.rs::settle`（唯一真源）→ 对应更新其测试；倍率字段在 `billing/pricing.rs` |
 | **加一种路由匹配条件** | `routing/rule_item.rs` 加 `RuleItem` 变体（`matches` + `describe` + 测试）→ 前端 `src/components/routing/RuleEditor.tsx` |
 | **加一种路由动作** | `routing/rule.rs::RouteAction`（注意 `is_final` 的归类）→ `routing/engine.rs::route` 的 match → 前端 `ruleSummary.ts` |

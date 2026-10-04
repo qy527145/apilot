@@ -273,6 +273,15 @@ pub async fn list_models(pool: &SqlitePool, provider_id: i64) -> AppResult<Vec<P
 }
 
 /// 全量替换某渠道的模型映射。
+///
+/// 同时把 `providers.model_mapping` 派生成「入站名 → 上游名」写回去，这是本次改动的关键：
+/// 请求改写（`Provider::upstream_model`）和网关 `GET /v1/models` 读的都是那一列，
+/// 而 `provider_models` 表只负责"该渠道声明支持哪些模型"。两边各写各的会让人以为
+/// 映射生效了，实际请求仍按原名发出去。
+///
+/// 同名条目也写进 mapping（而不是只在有差异时写）——`/v1/models` 广告的就是
+/// `model_mapping.keys()`，只写差异项会让纯 DeepSeek 这类"入站名 == 上游名"的
+/// 配置探测不到任何模型。
 pub async fn set_models(
     pool: &SqlitePool,
     provider_id: i64,
@@ -285,6 +294,7 @@ pub async fn set_models(
         .execute(&mut *tx)
         .await?;
 
+    let mut mapping: IndexMap<String, String> = IndexMap::new();
     for (model, upstream) in models {
         sqlx::query(
             "INSERT INTO provider_models (provider_id, model, upstream_model, client_group,
@@ -296,10 +306,40 @@ pub async fn set_models(
         .bind(upstream)
         .execute(&mut *tx)
         .await?;
+
+        mapping.insert(model.clone(), upstream.clone().unwrap_or_else(|| model.clone()));
+    }
+
+    let json = serde_json::to_string(&mapping)?;
+    let affected = sqlx::query("UPDATE providers SET model_mapping = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(&json)
+        .bind(now_ms())
+        .bind(provider_id)
+        .execute(&mut *tx)
+        .await?;
+    if affected.rows_affected() == 0 {
+        return Err(AppError::ProviderNotFound(provider_id.to_string()));
     }
 
     tx.commit().await?;
     Ok(())
+}
+
+/// 是否有「启用且声明过模型」的渠道。
+///
+/// 接管客户端前必须至少有一个 —— 否则客户端会把请求打到网关上然后全线报错，
+/// 用户却在客户端里看不到"其实还没配渠道"这个真实原因。
+pub async fn has_declared_models(pool: &SqlitePool) -> AppResult<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM providers p
+         WHERE p.enabled = 1
+           AND EXISTS (SELECT 1 FROM provider_models m
+                       WHERE m.provider_id = p.id AND m.enabled = 1)
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// 声明自己支持某模型的所有启用渠道，按 priority 降序。
@@ -504,5 +544,76 @@ mod tests {
 
         let list = channels_for_model(&p, "m").await.unwrap();
         assert_eq!(list[0].tag, "high", "priority 高的排前面");
+    }
+
+    #[tokio::test]
+    async fn set_models_syncs_into_provider_model_mapping() {
+        let p = pool().await;
+        let c = upsert(&p, &input("sync")).await.unwrap();
+
+        set_models(
+            &p,
+            c.id,
+            &[
+                ("claude-sonnet-4-5".into(), Some("deepseek-chat".into())),
+                // 同名条目也要进 mapping —— /v1/models 广告的就是它的 keys。
+                ("deepseek-reasoner".into(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let after = get(&p, c.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.upstream_model("claude-sonnet-4-5"),
+            "deepseek-chat",
+            "面板里填的上游名必须真的参与请求改写"
+        );
+        assert_eq!(after.upstream_model("deepseek-reasoner"), "deepseek-reasoner");
+        assert_eq!(after.model_mapping.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_models_with_empty_list_restores_wildcard() {
+        let p = pool().await;
+        let c = upsert(&p, &input("clear")).await.unwrap();
+        set_models(&p, c.id, &[("m".into(), None)]).await.unwrap();
+
+        // 清空声明 == 恢复"通吃"，这也是用户撤销操作的路径。
+        set_models(&p, c.id, &[]).await.unwrap();
+
+        let after = get(&p, c.id).await.unwrap().unwrap();
+        assert!(after.model_mapping.is_empty());
+        assert_eq!(channels_for_model(&p, "随便什么").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_models_on_missing_provider_is_an_error() {
+        let p = pool().await;
+        assert!(set_models(&p, 999, &[("m".into(), None)]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn has_declared_models_tracks_enabled_declared_channels() {
+        let p = pool().await;
+        assert!(!has_declared_models(&p).await.unwrap(), "没有渠道时未就绪");
+
+        let c = upsert(&p, &input("wild")).await.unwrap();
+        assert!(
+            !has_declared_models(&p).await.unwrap(),
+            "只建渠道但没声明模型的渠道是通吃的，仍视为未就绪"
+        );
+
+        set_models(&p, c.id, &[("m".into(), None)]).await.unwrap();
+        assert!(has_declared_models(&p).await.unwrap());
+
+        let mut off = input("wild");
+        off.id = Some(c.id);
+        off.enabled = false;
+        upsert(&p, &off).await.unwrap();
+        assert!(
+            !has_declared_models(&p).await.unwrap(),
+            "停用的渠道不算数"
+        );
     }
 }

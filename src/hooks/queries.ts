@@ -15,6 +15,7 @@ export const qk = {
   cacheStats: ["cache_stats"] as const,
   cachePolicy: ["cache_policy"] as const,
   clients: ["clients"] as const,
+  takeoverReadiness: ["takeover_readiness"] as const,
   logs: (key: string) => ["logs", key] as const,
   requestDetail: (id: string) => ["request_detail", id] as const,
   billingTotals: (key: string) => ["billing_totals", key] as const,

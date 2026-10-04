@@ -68,6 +68,7 @@ pub fn run() {
             commands::providers::test_provider,
             commands::providers::list_provider_models,
             commands::providers::set_provider_models,
+            commands::providers::fetch_provider_models,
             // --- 路由 ---
             commands::routing::list_route_rules,
             commands::routing::upsert_route_rule,
@@ -97,6 +98,7 @@ pub fn run() {
             commands::takeover::preview_takeover,
             commands::takeover::apply_takeover,
             commands::takeover::restore_client,
+            commands::takeover::takeover_readiness,
             // --- 日志 ---
             commands::logs::query_logs,
             commands::logs::get_request_detail,

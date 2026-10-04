@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
+import { AlertTriangle, Eye, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
 import { PageShell } from "@/components/layout/PageShell";
+import type { ViewKey } from "@/components/layout/nav";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -28,7 +29,11 @@ import { qk } from "@/hooks/queries";
 import { api, type ClientDetect } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-export default function ClientsPage() {
+export default function ClientsPage({
+  onNavigate,
+}: {
+  onNavigate: (view: ViewKey) => void;
+}) {
   const qc = useQueryClient();
   const [preview, setPreview] = useState<{ client: ClientDetect; diff: string } | null>(
     null,
@@ -41,11 +46,18 @@ export default function ClientsPage() {
     retry: 1,
   });
 
+  // 就绪判定在后端：前端只负责把「缺哪一步」说清楚，不自己复刻一套规则。
+  const { data: readiness } = useQuery({
+    queryKey: qk.takeoverReadiness,
+    queryFn: api.takeoverReadiness,
+    retry: 1,
+  });
+  const blocked = readiness ? !readiness.ready : false;
+
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: qk.clients });
     qc.invalidateQueries({ queryKey: qk.logs("") });
   };
-
   const apply = useMutation({
     mutationFn: (client: string) => api.applyTakeover(client),
     onSuccess: (res) => {
@@ -91,6 +103,22 @@ export default function ClientsPage() {
         </Button>
       }
     >
+      {blocked && (
+        <div className="border-amber-500/40 bg-amber-500/10 flex items-start gap-3 rounded-md border p-3">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
+          <div className="flex-1 space-y-1">
+            <p className="text-sm font-medium">暂时不能接管</p>
+            <p className="text-muted-foreground text-xs">
+              {readiness?.reason}
+              。接管前先备好渠道和模型，客户端才不会一上来就报错。
+            </p>
+          </div>
+          <Button size="sm" variant="outline" onClick={() => onNavigate("providers")}>
+            去渠道管理
+          </Button>
+        </div>
+      )}
+
       <Card className="py-0">
         <CardContent className="p-0">
           {isLoading ? (
@@ -171,7 +199,8 @@ export default function ClientsPage() {
                         ) : (
                           <Button
                             size="sm"
-                            disabled={!c.detected || apply.isPending}
+                            disabled={!c.detected || blocked || apply.isPending}
+                            title={blocked ? readiness?.reason ?? undefined : undefined}
                             onClick={() => apply.mutate(c.id)}
                           >
                             <ShieldCheck className="size-4" />

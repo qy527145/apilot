@@ -9,7 +9,7 @@ use super::outbound::{
     Outbound, PreparedRequest, UpstreamBody, UpstreamError, UpstreamResponse,
 };
 use crate::protocol::dto::Protocol;
-use crate::storage::models::{AuthStyle, Provider};
+use crate::storage::models::Provider;
 
 /// 不向上游转发的请求头。
 ///
@@ -122,20 +122,10 @@ impl Outbound for Channel {
         let mut headers = forwardable_headers(incoming);
 
         // 注入该渠道的鉴权头。
-        if let Some(key) = self.provider.api_key.as_deref() {
-            if !key.is_empty() {
-                let (name, value) = match self.provider.auth_style {
-                    AuthStyle::Bearer => ("authorization", format!("Bearer {key}")),
-                    AuthStyle::XApiKey => ("x-api-key", key.to_string()),
-                    AuthStyle::None => ("", String::new()),
-                };
-                if !name.is_empty() {
-                    let hv = HeaderValue::from_str(&value).map_err(|e| {
-                        UpstreamError::Build(format!("鉴权头含非法字符: {e}"))
-                    })?;
-                    headers.insert(HeaderName::from_static(name), hv);
-                }
-            }
+        if let Some((name, value)) = self.provider.auth_header() {
+            let hv = HeaderValue::from_str(&value)
+                .map_err(|e| UpstreamError::Build(format!("鉴权头含非法字符: {e}")))?;
+            headers.insert(HeaderName::from_static(name), hv);
         }
 
         // 渠道级自定义头，优先级最高，可覆盖上面的一切。
@@ -233,7 +223,7 @@ fn classify_reqwest_error(e: &reqwest::Error) -> UpstreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::models::ProviderKind;
+    use crate::storage::models::{AuthStyle, ProviderKind};
     use indexmap::IndexMap;
 
     fn provider(kind: ProviderKind, auth: AuthStyle) -> Provider {

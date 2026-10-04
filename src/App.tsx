@@ -56,7 +56,7 @@ function Shell() {
       />
       <main className="min-w-0 flex-1">
         {view === "overview" && <OverviewPage onNavigate={setView} />}
-        {view === "clients" && <ClientsPage />}
+        {view === "clients" && <ClientsPage onNavigate={setView} />}
         {view === "providers" && <ProvidersPage />}
         {view === "routing" && <RoutingPage />}
         {view === "traffic" && <TrafficPage />}

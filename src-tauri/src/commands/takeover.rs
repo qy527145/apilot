@@ -60,6 +60,15 @@ pub async fn apply_takeover(
     client: String,
 ) -> AppResult<TakeoverResult> {
     let id = ClientId::parse(&client).ok_or(AppError::UnknownClient(client.clone()))?;
+
+    // 先确认"接管之后请求真的能通"，再动用户的配置文件。
+    // 顺序反过来就会出现：配置文件被改了、客户端里每条请求都报错，
+    // 而真正的原因（还没配渠道和模型）在客户端里完全看不到。
+    let readiness = readiness_of(shell.inner()).await?;
+    if !readiness.ready {
+        return Err(AppError::NoUsableModel);
+    }
+
     let base_url = gateway_base_url(&shell)?;
 
     let engine = TakeoverEngine::new();
@@ -105,4 +114,42 @@ pub async fn restore_client(
 /// 会让用户以为"接管成功但模型坏了"，不如直接报错。
 fn gateway_base_url(shell: &Arc<AppShell>) -> AppResult<String> {
     shell.gateway.base_url().ok_or(AppError::GatewayNotRunning)
+}
+
+/// 接管前的就绪状态。
+///
+/// 前端拿它来决定「接管」按钮是否可点、以及提示用户缺哪一步 ——
+/// 判定逻辑留在后端，避免前后端各写一份规则后悄悄漂移。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TakeoverReadiness {
+    pub gateway_running: bool,
+    pub has_models: bool,
+    pub ready: bool,
+    /// 未就绪的原因，直接展示给用户；就绪时为 `None`。
+    pub reason: Option<String>,
+}
+
+async fn readiness_of(shell: &Arc<AppShell>) -> AppResult<TakeoverReadiness> {
+    let gateway_running = shell.gateway.base_url().is_some();
+    let has_models = crate::storage::providers::has_declared_models(&shell.db).await?;
+
+    let reason = if !gateway_running {
+        Some("网关未运行，请先在「设置」或概览页启动网关".to_string())
+    } else if !has_models {
+        Some("还没有可用的模型：请先在「渠道管理」添加上游渠道并指定要使用的模型".to_string())
+    } else {
+        None
+    };
+
+    Ok(TakeoverReadiness {
+        gateway_running,
+        has_models,
+        ready: reason.is_none(),
+        reason,
+    })
+}
+
+#[tauri::command]
+pub async fn takeover_readiness(shell: State<'_, Arc<AppShell>>) -> AppResult<TakeoverReadiness> {
+    readiness_of(shell.inner()).await
 }

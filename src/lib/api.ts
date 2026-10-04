@@ -287,6 +287,14 @@ export interface ProviderModel {
   upstream_model?: string | null;
 }
 
+/** 接管前置条件。判定在后端，前端只负责展示缺了哪一步。 */
+export interface TakeoverReadiness {
+  gateway_running: boolean;
+  has_models: boolean;
+  ready: boolean;
+  reason?: string | null;
+}
+
 /* ================================================================== */
 /* 错误处理                                                            */
 /* ================================================================== */
@@ -358,6 +366,9 @@ export const api = {
     call<ProviderModel[]>("list_provider_models", { providerId }),
   setProviderModels: (providerId: number, models: ProviderModel[]) =>
     call<null>("set_provider_models", { providerId, models }),
+  /** 拉取上游 `GET {base_url}/v1/models`，返回模型 id 列表。 */
+  fetchProviderModels: (id: number) =>
+    call<string[]>("fetch_provider_models", { id }),
 
   /* ---- routing: rules ---- */
   listRouteRules: () => call<RouteRule[]>("list_route_rules"),
@@ -400,6 +411,7 @@ export const api = {
   /* ---- clients takeover ---- */
   detectClients: () => call<ClientDetect[]>("detect_clients"),
   takeoverStatus: () => call<ClientDetect[]>("takeover_status"),
+  takeoverReadiness: () => call<TakeoverReadiness>("takeover_readiness"),
   previewTakeover: (client: string) =>
     call<string>("preview_takeover", { client }),
   applyTakeover: (client: string) =>

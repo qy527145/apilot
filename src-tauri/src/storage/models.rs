@@ -106,6 +106,20 @@ impl Provider {
             .unwrap_or(model)
     }
 
+    /// 该渠道要注入上游的鉴权头；不该注入时返回 `None`。
+    ///
+    /// 出站转发（`upstream/channel.rs::prepare`）和探测 / 拉取模型
+    /// （`commands/providers.rs`）都走这里，避免「加了一种鉴权方式只改了其中一处」——
+    /// 那种漏改会表现为"测试连通失败但真发请求能过"，很难排查。
+    pub fn auth_header(&self) -> Option<(&'static str, String)> {
+        let key = self.api_key.as_deref().filter(|k| !k.is_empty())?;
+        match self.auth_style {
+            AuthStyle::Bearer => Some(("authorization", format!("Bearer {key}"))),
+            AuthStyle::XApiKey => Some(("x-api-key", key.to_string())),
+            AuthStyle::None => None,
+        }
+    }
+
     /// 拼接出站 URL。`path` 形如 `/v1/messages`。
     ///
     /// base_url 可能已经带 `/v1` 后缀（用户常这么填），需要去重，
@@ -204,6 +218,38 @@ mod tests {
         p.model_mapping.insert("gpt-4o".into(), "deepseek-chat".into());
         assert_eq!(p.upstream_model("gpt-4o"), "deepseek-chat");
         assert_eq!(p.upstream_model("other"), "other");
+    }
+
+    #[test]
+    fn auth_header_covers_every_style() {
+        let mut p = provider("https://x");
+
+        p.auth_style = AuthStyle::Bearer;
+        p.api_key = Some("sk-1".into());
+        assert_eq!(
+            p.auth_header(),
+            Some(("authorization", "Bearer sk-1".into()))
+        );
+
+        p.auth_style = AuthStyle::XApiKey;
+        assert_eq!(p.auth_header(), Some(("x-api-key", "sk-1".into())));
+
+        // none 表示鉴权由 extra_headers 或上游自身负责，不能凭空塞一个头。
+        p.auth_style = AuthStyle::None;
+        assert_eq!(p.auth_header(), None);
+    }
+
+    #[test]
+    fn auth_header_is_none_without_usable_key() {
+        let mut p = provider("https://x");
+        p.auth_style = AuthStyle::Bearer;
+
+        p.api_key = None;
+        assert_eq!(p.auth_header(), None);
+
+        // 空字符串是前端"留空表示不修改"残留的形态，等同于没配。
+        p.api_key = Some(String::new());
+        assert_eq!(p.auth_header(), None);
     }
 
     #[test]

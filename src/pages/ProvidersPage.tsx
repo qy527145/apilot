@@ -228,7 +228,10 @@ export default function ProvidersPage() {
                       {isOpen && (
                         <TableRow>
                           <TableCell colSpan={9} className="bg-muted/20 p-0">
-                            <ModelMappingPanel providerId={p.id} />
+                            <ModelMappingPanel
+                              providerId={p.id}
+                              providerName={p.name}
+                            />
                           </TableCell>
                         </TableRow>
                       )}

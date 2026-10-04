@@ -48,6 +48,11 @@ pub enum AppError {
     #[error("未识别的客户端: {0}")]
     UnknownClient(String),
 
+    #[error(
+        "还没有可用的模型：请先在「渠道管理」添加上游渠道，并从上游获取或手工指定至少一个模型，再接管客户端"
+    )]
+    NoUsableModel,
+
     #[error("{0}")]
     Msg(String),
 }
@@ -71,6 +76,7 @@ impl AppError {
             Self::ProviderNotFound(_) => "provider_not_found",
             Self::SelectorNotFound(_) => "selector_not_found",
             Self::UnknownClient(_) => "unknown_client",
+            Self::NoUsableModel => "no_usable_model",
             Self::Msg(_) => "error",
         }
     }

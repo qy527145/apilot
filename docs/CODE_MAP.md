@@ -201,8 +201,8 @@ quota           += tool_call_surcharge × 工具调用次数
 |---|---|
 | `migrations.rs` | **手写 DDL 数组**（不用 sqlx 编译期宏），按 `PRAGMA user_version` 增量执行 |
 | `db.rs` | 连接池 + PRAGMA（WAL / foreign_keys / busy_timeout）；`open_memory()` 供测试 |
-| `models.rs` | `Provider`、`ProviderKind`、`AuthStyle`、`ProviderModel` |
-| `providers.rs` | 渠道 CRUD、模型映射、**`channels_for_model`**（故障转移的候选来源） |
+| `models.rs` | `Provider`、`ProviderKind`、`AuthStyle`、`ProviderModel`。**`Provider::auth_header()`** 是鉴权头的唯一构造点 |
+| `providers.rs` | 渠道 CRUD、模型映射、**`channels_for_model`**（故障转移的候选来源）、`has_declared_models`（接管前置条件） |
 | `routing.rs` | 路由规则 / selector / 兜底配置的读写；`ensure_default_selector` |
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
 | `logs.rs` | 请求明细 + 捕获原文；`query`（动态过滤）、`get_detail`、`prune_captures` / `prune_logs` |
@@ -210,6 +210,14 @@ quota           += tool_call_surcharge × 工具调用次数
 
 **迁移规则**：`MIGRATIONS` 数组**只追加，不修改已发布的条目**。
 每条用 `IF NOT EXISTS` 保证幂等，版本号是下标。
+
+**模型声明的两张表分工**（容易踩坑）：
+- `provider_models` 是**真源**：声明「该渠道支持哪些入站模型」，驱动 `channels_for_model`
+  的候选筛选。没有行的渠道视为通吃。
+- `providers.model_mapping` 是它的**派生读模型**：请求改写（`Provider::upstream_model`）
+  和网关 `GET /v1/models` 都读这里。`set_models` 在同一个事务里把前者同步过来。
+  手工 `upsert_provider` **不会**反向写 `provider_models` —— 否则在渠道对话框点一次保存
+  就会把用户在映射面板里逐条编好的声明冲掉。
 
 ---
 
@@ -241,11 +249,11 @@ apilot://cache             → CacheStats
 |---|---|---|
 | `app.rs` | 3 | `app_info`、`get_settings`、`update_settings` |
 | `gateway.rs` | 3 | `gateway_start` / `stop` / `status` |
-| `providers.rs` | 6 | 渠道 CRUD、`test_provider`、模型映射；同文件的 **`probe()`** 是普通函数而非命令，被路由页复用 |
+| `providers.rs` | 7 | 渠道 CRUD、`test_provider`、模型映射、`fetch_provider_models`（拉上游 `/v1/models`）；同文件的 **`probe()`** 是普通函数而非命令，被路由页复用 |
 | `routing.rs` | 10 | 规则 CRUD + 排序、selector CRUD + **`switch_selector`**（热切换）、`run_urltest` |
 | `billing.rs` | 6 | 单价 CRUD、`billing_summary` / `totals` / `timeseries` |
 | `cache.rs` | 4 | `cache_stats`、`clear_cache`、策略读写 |
-| `takeover.rs` | 5 | `detect_clients`、`takeover_status`、`preview_takeover`、`apply_takeover`、`restore_client` |
+| `takeover.rs` | 6 | `detect_clients`、`takeover_status`、`takeover_readiness`（接管前置条件）、`preview_takeover`、`apply_takeover`、`restore_client` |
 | `logs.rs` | 2 | `query_logs`、`get_request_detail` |
 
 **命令注册**：全部在 `lib.rs` 的 `generate_handler!` 里，用**完整路径**。
@@ -275,7 +283,7 @@ apilot://cache             → CacheStats
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
 | `providers` | `tag` 唯一 | 渠道：base_url、鉴权、模型映射、权重、超时 |
-| `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃** |
+| `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃**。`set_models` 会把声明同步派生成 `providers.model_mapping`（见下） |
 | `route_rules` | `id` | 规则链，按 `sort_index` 求值；`items` / `action` 存 JSON |
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |
 | `route_config` | 单行 `id=1` | 兜底 selector |
@@ -296,13 +304,14 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 | 位置 | 内容 |
 |---|---|
-| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 39 个命令的类型化封装 + 统一错误处理 |
+| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 41 个命令的类型化封装 + 统一错误处理 |
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
 | `src/pages/*.tsx` | 8 个页面：Overview / Clients / Providers / Routing / Traffic / Billing / Cache / Settings |
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
+| `src/components/providers/` | 渠道对话框与预设、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
 | `src/components/traffic/` | 请求详情对话框（原始报文、流式文本、Headers） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
