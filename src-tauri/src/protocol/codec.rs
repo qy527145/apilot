@@ -244,6 +244,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_responses_lite_tools_survive_conversion_to_chat() {
+        // 这条链路是真实的 Codex 场景：客户端说 Responses，渠道是 DeepSeek 这类
+        // 只说 Chat Completions 的服务商。工具藏在 additional_tools 条目里，
+        // 一旦在解码阶段丢掉，上游收到的请求就没有 tools，Codex 直接瘫掉。
+        let r = CodecRegistry::new();
+        let raw = r#"{"model":"gpt-5.6-sol","tools":null,"input":[
+            {"type":"additional_tools","role":"developer","tools":[
+                {"type":"function","name":"shell","parameters":{"type":"object"}}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]}
+        ]}"#;
+
+        let out = r
+            .convert_request(
+                Protocol::OpenAiResponses,
+                Protocol::OpenAiChat,
+                raw.as_bytes(),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        let tools = v["tools"].as_array().expect("转换后必须带上 tools");
+        assert_eq!(tools[0]["function"]["name"], "shell");
+        assert_eq!(v["messages"][0]["content"][0]["text"], "list files");
+    }
+
+    #[test]
     fn extract_error_message_handles_common_shapes() {
         let r = CodecRegistry::new();
         let c = r.codec(Protocol::AnthropicMessages);

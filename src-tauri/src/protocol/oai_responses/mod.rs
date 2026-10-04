@@ -116,6 +116,15 @@ fn decode_request(raw: &[u8]) -> Result<UnifiedRequest, ConvertError> {
         }
     }
 
+    // 顶层 tools 必须先于 input 解析：Codex 的 Responses Lite 格式会把工具塞进
+    // input 里的 `additional_tools` 条目，那些条目要追加到这里已经建好的列表上。
+    if let Some(tools) = obj.get("tools").and_then(|t| t.as_array()) {
+        req.tools = tools.iter().filter_map(decode_tool).collect();
+    }
+    if let Some(tc) = obj.get("tool_choice") {
+        req.tool_choice = decode_tool_choice(tc);
+    }
+
     // input 可以是字符串（单轮），也可以是 item 数组。
     match obj.get("input") {
         Some(Value::String(s)) => {
@@ -127,13 +136,6 @@ fn decode_request(raw: &[u8]) -> Result<UnifiedRequest, ConvertError> {
             }
         }
         _ => {}
-    }
-
-    if let Some(tools) = obj.get("tools").and_then(|t| t.as_array()) {
-        req.tools = tools.iter().filter_map(decode_tool).collect();
-    }
-    if let Some(tc) = obj.get("tool_choice") {
-        req.tool_choice = decode_tool_choice(tc);
     }
 
     for (k, val) in obj {
@@ -210,10 +212,33 @@ fn decode_item(item: &Value, req: &mut UnifiedRequest) -> Result<(), ConvertErro
             Ok(())
         }
         Some("reasoning") => Ok(()),
-        Some(other) => Err(ConvertError::decode_request(
-            P,
-            format!("未知的 input item 类型: {other}"),
-        )),
+        // Codex 的 Responses Lite 格式（GPT-5.6 一类的模型走这个）把工具 schema 放在
+        // input 里当成一条会话条目发，同时把顶层 tools 置空。丢掉它 = 模型手里一个
+        // 工具都没有，Codex 直接瘫掉；所以必须把里面的工具捞出来并进 req.tools。
+        Some("additional_tools") => {
+            if let Some(tools) = item.get("tools").and_then(|t| t.as_array()) {
+                for t in tools {
+                    if let Some(def) = decode_tool(t) {
+                        // 与顶层 tools 重名时保留先到的，避免同名工具被两个 schema 打架。
+                        if !req.tools.iter().any(|existing| existing.name == def.name) {
+                            req.tools.push(def);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        // 没建模的条目类型只跳过、不报错。
+        //
+        // 解码是路由前的必经步骤（见 gateway/pipeline.rs 第 1 步），同协议直通时
+        // 转发的是原始字节、IR 只用于统计，所以这里丢掉的内容并不影响那种场景；
+        // 而一旦报错，整条请求 400 —— 每来一种新条目类型（web_search_call、
+        // local_shell_call、item_reference……）都会让网关在客户端升级后全线崩掉，
+        // 代价远大于"转码时少了一段我们本来也表达不了的内容"。
+        Some(other) => {
+            tracing::warn!(item_type = %other, "跳过未建模的 Responses input 条目");
+            Ok(())
+        }
     }
 }
 
@@ -666,6 +691,85 @@ mod tests {
         let req = decode_request(br#"{"model":"gpt-5","input":"hi"}"#).unwrap();
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].concat_text(), "hi");
+    }
+
+    #[test]
+    fn lifts_additional_tools_items_into_request_tools() {
+        // Codex Responses Lite：顶层 tools 为 null，工具 schema 塞在 input 里。
+        // 不捞出来的话转成 Chat 时模型手上一个工具都没有。
+        let req = decode_request(
+            br#"{"model":"gpt-5.6-sol","tools":null,"input":[
+                {"type":"additional_tools","role":"developer","tools":[
+                    {"type":"function","name":"shell","description":"run","parameters":{"type":"object"}},
+                    {"type":"function","name":"update_plan","parameters":{"type":"object"}}
+                ]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["shell", "update_plan"]);
+        assert_eq!(req.tools[0].description.as_deref(), Some("run"));
+        // 载体条目本身不该变成一条消息。
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].concat_text(), "go");
+    }
+
+    #[test]
+    fn additional_tools_are_appended_after_top_level_tools() {
+        let req = decode_request(
+            br#"{"model":"m",
+                "tools":[{"type":"function","name":"top","parameters":{"type":"object"}}],
+                "input":[{"type":"additional_tools","role":"developer","tools":[
+                    {"type":"function","name":"extra","parameters":{"type":"object"}}]}]}"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["top", "extra"]);
+    }
+
+    #[test]
+    fn duplicate_tool_names_keep_the_first_definition() {
+        let req = decode_request(
+            r#"{"model":"m",
+                "tools":[{"type":"function","name":"dup","description":"first","parameters":{"type":"object"}}],
+                "input":[{"type":"additional_tools","role":"developer","tools":[
+                    {"type":"function","name":"dup","description":"later","parameters":{"type":"object"}}]}]}"#
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].description.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn unmodeled_input_items_are_skipped_not_fatal() {
+        // 新条目类型不该让整条请求 400 —— 同协议直通时转发的是原始字节，
+        // 这里丢掉的内容并不影响那类请求。
+        let req = decode_request(
+            br#"{"model":"m","input":[
+                {"type":"web_search_call","id":"ws_1","status":"completed"},
+                {"type":"local_shell_call","call_id":"c1"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].concat_text(), "hi");
+    }
+
+    #[test]
+    fn additional_tools_without_tools_array_is_harmless() {
+        // 坏数据（缺 tools / tools 不是数组）只当空处理，不能 panic 也不能报错。
+        for body in [
+            &br#"{"model":"m","input":[{"type":"additional_tools","role":"developer"}]}"#[..],
+            &br#"{"model":"m","input":[{"type":"additional_tools","tools":"nope"}]}"#[..],
+            &br#"{"model":"m","input":[{"type":"additional_tools","tools":[{"no_name":1},null]}]}"#[..],
+        ] {
+            let req = decode_request(body).unwrap();
+            assert!(req.tools.is_empty(), "坏数据不该产出工具: {req:?}");
+        }
     }
 
     #[test]
