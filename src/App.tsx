@@ -9,6 +9,7 @@ import { useAppInfo, useGatewayStatus } from "@/hooks/queries";
 import OverviewPage from "@/pages/OverviewPage";
 import ClientsPage from "@/pages/ClientsPage";
 import ProvidersPage from "@/pages/ProvidersPage";
+import ModelsPage from "@/pages/ModelsPage";
 import RoutingPage from "@/pages/RoutingPage";
 import TrafficPage from "@/pages/TrafficPage";
 import BillingPage from "@/pages/BillingPage";
@@ -58,6 +59,7 @@ function Shell() {
         {view === "overview" && <OverviewPage onNavigate={setView} />}
         {view === "clients" && <ClientsPage onNavigate={setView} />}
         {view === "providers" && <ProvidersPage />}
+        {view === "models" && <ModelsPage onNavigate={setView} />}
         {view === "routing" && <RoutingPage />}
         {view === "traffic" && <TrafficPage />}
         {view === "billing" && <BillingPage />}

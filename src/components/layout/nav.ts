@@ -2,6 +2,7 @@ import type { LucideIcon } from "lucide-react";
 import {
   Activity,
   BarChart3,
+  Boxes,
   Database,
   GitBranch,
   LayoutDashboard,
@@ -14,6 +15,7 @@ export type ViewKey =
   | "overview"
   | "clients"
   | "providers"
+  | "models"
   | "routing"
   | "traffic"
   | "billing"
@@ -45,6 +47,12 @@ export const NAV_ITEMS: NavItem[] = [
     label: "渠道管理",
     icon: Server,
     description: "上游 LLM 渠道与模型映射",
+  },
+  {
+    key: "models",
+    label: "模型",
+    icon: Boxes,
+    description: "各渠道声明的模型与协议可达性",
   },
   {
     key: "routing",

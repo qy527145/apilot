@@ -308,7 +308,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
-| `src/pages/*.tsx` | 8 个页面：Overview / Clients / Providers / Routing / Traffic / Billing / Cache / Settings |
+| `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings |
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
