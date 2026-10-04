@@ -87,6 +87,10 @@ src-tauri/src/
 src/            前端（React 19 + Tailwind v4 + shadcn/ui）
 ```
 
+更细的模块索引、请求全链路追踪与「改什么去哪里」的任务路由表见
+**[docs/CODE_MAP.md](docs/CODE_MAP.md)**；给 AI 协作者用的精简导航与项目铁律见
+**[CLAUDE.md](CLAUDE.md)**。
+
 ### 关键设计取舍
 
 **单一 IR，而不是两两转换器。** 三个协议各自实现一对编解码器，任意两种协议之间的转换都走 `decode(A) → encode(B)`。N 个协议只需 2N 个编解码器，而不是 N² 个。
