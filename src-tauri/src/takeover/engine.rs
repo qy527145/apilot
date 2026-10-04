@@ -118,6 +118,21 @@ impl TakeoverEngine {
         self.backup_path_for(path).exists()
     }
 
+    /// 删除某文件的备份（含 `.source` 旁挂文件）。
+    ///
+    /// 备份已不存在时视为成功 —— 还原路径可能被并发或重复调用。
+    fn remove_backup(&self, path: &Path) -> AppResult<()> {
+        let backup = self.backup_path_for(path);
+        match std::fs::remove_file(&backup) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // 旁挂文件只是给人看的，删不掉也不该让还原失败。
+        let _ = std::fs::remove_file(backup.with_extension("source"));
+        Ok(())
+    }
+
     /// 原子写入：同目录临时文件 → fsync → rename。
     pub fn write_atomic(&self, path: &Path, content: &[u8]) -> AppResult<()> {
         if let Some(parent) = path.parent() {
@@ -188,9 +203,12 @@ impl TakeoverEngine {
                 // 没备份过说明我们从没改过它，不该凭空"还原"成别的东西。
                 continue;
             };
-            self.write_atomic(path, &original)?;
-            restored += 1;
             backup_path.get_or_insert_with(|| self.backup_path_for(path).display().to_string());
+            self.write_atomic(path, &original)?;
+            // 文件已回到原始字节，备份再无价值；必须删掉它 ——
+            // `is_taken_over` 的判据就是"备份存在"，留着它 UI 永远显示"已接管"。
+            self.remove_backup(path)?;
+            restored += 1;
         }
 
         let message = if restored == 0 {
@@ -441,6 +459,66 @@ mod tests {
 
         e.restore("codex", &[f.clone()]).unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), b"secret", "被删的文件也要能还原");
+    }
+
+    #[test]
+    fn restore_clears_taken_over_state() {
+        let dir = TempDir::new().unwrap();
+        let e = engine(&dir);
+        let f = dir.path().join("settings.json");
+        std::fs::write(&f, br#"{"user":"original"}"#).unwrap();
+
+        let plan = TakeoverPlan {
+            client: "claude".into(),
+            files: vec![],
+        };
+        e.commit(
+            &plan,
+            &[FilePatch {
+                path: f.clone(),
+                content: Some(br#"{"taken":"over"}"#.to_vec()),
+            }],
+        )
+        .unwrap();
+        assert!(e.is_taken_over(&f));
+
+        e.restore("claude", &[f.clone()]).unwrap();
+
+        // 备份必须一并删除，否则 UI 永远停在"已接管"（按钮切不回来）。
+        assert!(!e.is_taken_over(&f), "还原后不应再算作已接管");
+        assert!(e.original_content(&f).unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_removes_the_source_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let e = engine(&dir);
+        let f = dir.path().join("cfg.json");
+        std::fs::write(&f, b"orig").unwrap();
+        e.ensure_backup(&f).unwrap();
+
+        let source = e.backup_path_for(&f).with_extension("source");
+        assert!(source.exists());
+
+        e.restore("c", &[f.clone()]).unwrap();
+        assert!(!source.exists(), "旁挂的 .source 也要一并清掉");
+    }
+
+    #[test]
+    fn restore_leaves_unrelated_backups_alone() {
+        let dir = TempDir::new().unwrap();
+        let e = engine(&dir);
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.json");
+        std::fs::write(&a, b"a-orig").unwrap();
+        std::fs::write(&b, b"b-orig").unwrap();
+        e.ensure_backup(&a).unwrap();
+        e.ensure_backup(&b).unwrap();
+
+        e.restore("c", &[a.clone()]).unwrap();
+
+        assert!(!e.is_taken_over(&a));
+        assert!(e.is_taken_over(&b), "另一个文件的备份不该被连带删除");
     }
 
     #[test]

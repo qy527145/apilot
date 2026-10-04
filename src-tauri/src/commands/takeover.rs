@@ -7,6 +7,7 @@ use tauri::State;
 use crate::error::{AppError, AppResult};
 use crate::shell::AppShell;
 use crate::takeover::clients::{self, ClientId, ClientInfo};
+use crate::takeover::diff;
 use crate::takeover::engine::{TakeoverEngine, TakeoverPlan, TakeoverResult};
 use crate::takeover::patch;
 
@@ -22,39 +23,35 @@ pub fn takeover_status() -> Vec<ClientInfo> {
 
 /// 预览接管会做什么，但不写盘。
 ///
-/// 前端拿到的是改动前后的完整内容，可以直接做 diff 展示 ——
+/// 返回各文件的 unified diff 文本；前端直接按行着色即可 ——
 /// 让用户在点「接管」之前先看清要改什么，是这类工具该有的基本尊重。
 #[tauri::command]
-pub fn preview_takeover(
-    shell: State<'_, Arc<AppShell>>,
-    client: String,
-) -> AppResult<Vec<PreviewedFile>> {
+pub fn preview_takeover(shell: State<'_, Arc<AppShell>>, client: String) -> AppResult<String> {
     let id = ClientId::parse(&client).ok_or(AppError::UnknownClient(client))?;
     let base_url = gateway_base_url(&shell)?;
 
     let patches = id.plan_apply(&base_url)?;
 
-    Ok(patches
-        .into_iter()
-        .map(|p| PreviewedFile {
-            path: p.path.display().to_string(),
-            old_content: patch::read_optional(&p.path)
-                .ok()
-                .flatten()
-                .map(|b| String::from_utf8_lossy(&b).to_string()),
-            new_content: p
-                .content
-                .as_ref()
-                .map(|b| String::from_utf8_lossy(b).to_string()),
-        })
-        .collect())
-}
+    let mut out = String::new();
+    for p in patches {
+        let old = patch::read_optional(&p.path)?
+            .map(|b| String::from_utf8_lossy(&b).to_string());
+        let new = p
+            .content
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).to_string());
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PreviewedFile {
-    pub path: String,
-    pub old_content: Option<String>,
-    pub new_content: Option<String>,
+        let section = diff::unified_diff(&p.path.display().to_string(), old.as_deref(), new.as_deref());
+        if section.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&section);
+    }
+
+    Ok(out)
 }
 
 #[tauri::command]

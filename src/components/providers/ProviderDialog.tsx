@@ -31,6 +31,7 @@ import {
   type ProviderInput,
   type ProviderKind,
 } from "@/lib/api";
+import { PROVIDER_PRESETS, type ProviderPreset } from "./presets";
 
 const KIND_LABELS: Record<ProviderKind, string> = {
   anthropic: "Anthropic",
@@ -124,6 +125,18 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
     setForm((f) => ({ ...f, [key]: value }));
 
+  // 预设只覆盖"服务商身份"相关的字段；api_key 留空由用户自己填，
+  // 免得切预设时把已经敲好的密钥冲掉。
+  const applyPreset = (p: ProviderPreset) =>
+    setForm((f) => ({
+      ...f,
+      name: p.name,
+      tag: p.tag,
+      kind: p.kind,
+      base_url: p.base_url,
+      auth_style: p.auth_style,
+    }));
+
   const submit = () => {
     if (!form.tag.trim()) return setError("请填写渠道 tag");
     if (!form.name.trim()) return setError("请填写渠道名称");
@@ -169,6 +182,27 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
         </DialogHeader>
 
         <div className="grid gap-4">
+          {!provider && (
+            <div className="space-y-2">
+              <Label className="text-muted-foreground text-xs">
+                快速填充常用服务商
+              </Label>
+              <div className="flex flex-wrap gap-2">
+                {PROVIDER_PRESETS.map((p) => (
+                  <Button
+                    key={p.id}
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => applyPreset(p)}
+                  >
+                    {p.label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="space-y-2">
               <Label>名称</Label>
