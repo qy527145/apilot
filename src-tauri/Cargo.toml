@@ -1,0 +1,117 @@
+[package]
+name = "apilot"
+version = "0.1.0"
+description = "Apilot — 本地 LLM API 智能网关助手"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "apilot_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
+# --- 序列化 ---
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] } # 保序：接管写入时不能打乱用户文件
+
+# --- 异步运行时（复用 Tauri 自带 tokio，不另建 runtime）---
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "time",
+  "sync",
+  "signal",
+  "net",
+  "io-util",
+  "fs",
+] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# --- HTTP 网关 ---
+axum = { version = "0.8", features = ["json", "macros", "ws"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "server", "client-legacy"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "stream",
+  "gzip",
+  "brotli",
+  "deflate",
+  "zstd",
+  "socks",
+] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd"] }
+url = "2"
+
+# --- 存储 ---
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "sqlite",
+  "chrono",
+  "uuid",
+  "json",
+  "migrate",
+] }
+
+# --- 并发原语 ---
+arc-swap = "1"
+dashmap = "5"
+parking_lot = "0.12"
+
+# --- 工具 ---
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+base64 = "0.22"
+regex = "1"
+once_cell = "1"
+dirs = "5"
+tempfile = "3"
+glob = "0.3"
+strum = { version = "0.28", features = ["derive"] }
+indexmap = { version = "2", features = ["serde"] }
+toml = "0.8"
+toml_edit = "0.22"
+notify = "8"
+notify-debouncer-full = "0.7"
+
+# --- 错误与日志 ---
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+# 不用 panic = "abort"：网关后台流式任务 panic 时需要 backtrace 才能定位。
+# 参考 cc-switch 的做法，同样改为 unwind。
+panic = "unwind"
+strip = true

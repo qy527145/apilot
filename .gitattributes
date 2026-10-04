@@ -1,0 +1,14 @@
+# 默认按文本处理并在仓库内存为 LF。Windows 上 Git 的 autocrlf 会把 .sh
+# 也转成 CRLF，那样 bash 执行时会因为行尾的 \r 报错。
+* text=auto eol=lf
+
+# Windows 专属脚本必须保留 CRLF，否则 cmd / PowerShell 解析异常。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源不做行尾转换。
+*.png binary
+*.ico binary
+*.icns binary
+*.svg text eol=lf

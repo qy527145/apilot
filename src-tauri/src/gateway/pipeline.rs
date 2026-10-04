@@ -1,0 +1,1181 @@
+//! 请求全链路编排。
+//!
+//! ```text
+//! 解码 → 路由决策 → 选渠道 → 查缓存 → 协议转换 → 出站 → 响应 → 记账 → 落库
+//! ```
+//!
+//! 记账统一在 [`Recorder`] 里收口：无论成功、失败、流式中断还是客户端断连，
+//! 都从同一条路径写日志与聚合，避免某个分支漏账。
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::body::Bytes;
+use axum::response::{IntoResponse, Response};
+use http::HeaderMap;
+
+use crate::billing::engine::BillingEngine;
+use crate::billing::session::BillingSession;
+use crate::cache::{cache_key, policy::is_cacheable, store::CacheEntry};
+use crate::protocol::codec::ConvertError;
+use crate::protocol::dto::{
+    ContentBlock, FinishReason, Protocol, UnifiedRequest, UnifiedResponse, UnifiedUsage,
+    UsageSource,
+};
+use crate::protocol::shared::tokens::estimate_request_tokens;
+use crate::routing::{RouteMetadata, RouteOutcome};
+use crate::shell::AppShell;
+use crate::storage::logs::{CaptureRecord, RequestLogRecord};
+use crate::upstream::outbound::{Outbound, UpstreamBody, UpstreamError};
+
+use super::stream::{translate_stream, StreamOutcome, StreamTimeouts};
+
+/// 从请求头 / 路径识别调用方。
+///
+/// 接管时我们会往客户端配置里写入标识头，因此它是最可靠的来源；
+/// 其次看 User-Agent，最后落到 `unknown`。
+pub fn detect_client(headers: &HeaderMap, path: &str) -> String {
+    if let Some(v) = headers.get("x-apilot-client").and_then(|v| v.to_str().ok()) {
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+
+    let ua = headers
+        .get(http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ua.contains("claude-cli") || ua.contains("claude-code") || ua.contains("anthropic") {
+        return "claude-code".into();
+    }
+    if ua.contains("codex") {
+        return "codex".into();
+    }
+    if ua.contains("gemini") {
+        return "gemini-cli".into();
+    }
+    if ua.contains("cursor") {
+        return "cursor".into();
+    }
+
+    // 兜底：按协议路径推断，至少让统计能区分流量来源。
+    match Protocol::from_path(path) {
+        Some(Protocol::AnthropicMessages) => "claude-code".into(),
+        Some(Protocol::OpenAiResponses) => "codex".into(),
+        _ => "unknown".into(),
+    }
+}
+
+/// 一次请求的记账收口。
+struct Recorder {
+    shell: Arc<AppShell>,
+    record: RequestLogRecord,
+    session: BillingSession,
+    capture: Option<CaptureRecord>,
+    finished: bool,
+}
+
+impl Recorder {
+    fn finish(&mut self, status: i32, usage: UnifiedUsage, ttfb_ms: Option<i64>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        let settings = self.shell.settings();
+
+        self.record.status_code = status;
+        self.record.ttfb_ms = ttfb_ms;
+        if let Some(ms) = ttfb_ms {
+            // 只有成功的请求才计入 TTFB 分位：失败的往往是立刻返回的错误，
+            // 混进去会把中位数拉低到没有参考价值。
+            if status < 400 {
+                self.shell.traffic.record_ttfb(ms);
+            }
+        }
+        self.record.usage_source = match usage.source {
+            UsageSource::Upstream => "upstream".into(),
+            UsageSource::LocalEstimate => "local".into(),
+        };
+        self.record.input_tokens = usage.input_tokens;
+        self.record.output_tokens = usage.output_tokens;
+        self.record.cache_read_tokens = usage.cache_read_tokens;
+        self.record.cache_creation_tokens = usage.cache_creation_tokens;
+        self.record.reasoning_tokens = usage.reasoning_tokens;
+
+        // 冗余存一份美元金额：查询与图表都直接用它，不必每条都在前端换算。
+        // 必须在写库前算好 —— 只给事件副本算的话，落库的那份永远是 0。
+        self.record.cost_usd = crate::billing::quota::quota_to_usd(self.record.quota);
+
+        let _ = self.session.settle(self.record.quota);
+        // 估算偏差：预扣用的本地估算 vs 上游真实 usage。正值表示低估。
+        // 让用户在监控页能看到"估算靠不靠谱"，而不是只能看到最终账单。
+        if let Some(drift) = self.session.estimate_drift() {
+            if drift != 0 {
+                self.record.other["estimate_drift"] =
+                    serde_json::json!(drift);
+            }
+        }
+
+        let shell = self.shell.clone();
+        let rec = self.record.clone();
+        let capture = self.capture.take();
+
+        // 记账不该阻塞响应返回，放到后台任务里做。
+        tauri::async_runtime::spawn(async move {
+            shell.aggregates.record(&rec);
+            if let Err(e) = crate::storage::logs::insert(&shell.db, &rec).await {
+                tracing::warn!("写请求日志失败: {e}");
+            }
+
+            if settings.capture_enabled {
+                if let Some(mut c) = capture {
+                    c.request_id = rec.request_id.clone();
+                    c.ts = rec.ts;
+                    if let Err(e) = crate::storage::logs::save_capture(&shell.db, &c).await {
+                        tracing::warn!("写捕获失败: {e}");
+                    }
+                    let _ = crate::storage::logs::prune_captures(
+                        &shell.db,
+                        settings.capture_max_entries as i64,
+                    )
+                    .await;
+                }
+            }
+
+            shell.events.request(&rec);
+        });
+    }
+
+    fn fail(&mut self, status: i32, message: impl Into<String>) {
+        // 失败请求退回预扣：不能因为上游抖动就把预估的额度记成实际花费。
+        let _ = self.session.refund();
+        self.record.error_message = Some(message.into());
+        self.finish(status, UnifiedUsage::default(), None);
+    }
+}
+
+/// 处理一次网关请求。
+pub async fn handle(
+    shell: Arc<AppShell>,
+    protocol: Protocol,
+    path: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let _active = shell.traffic.begin_request();
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let client = detect_client(&headers, &path);
+    let request_body_for_capture = body.clone();
+
+    // ---- 1. 解码入站请求 ----
+    let codec_in = shell.codecs.codec(protocol);
+    let req = match codec_in.decode_request(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            shell.traffic.record_failure();
+            tracing::warn!(%client, "请求解码失败: {e}");
+            return error_response(protocol, 400, "请求解析失败", &e.to_string());
+        }
+    };
+
+    let mut recorder = Recorder {
+        shell: shell.clone(),
+        record: RequestLogRecord {
+            request_id: request_id.clone(),
+            ts: crate::util::now_ms(),
+            client: client.clone(),
+            protocol_in: protocol.as_str().to_string(),
+            protocol_out: protocol.as_str().to_string(),
+            model: req.model.clone(),
+            request_model: req.model.clone(),
+            is_stream: req.stream,
+            latency_ms: 0,
+            ..Default::default()
+        },
+        session: BillingSession::deferred(),
+        capture: Some(CaptureRecord {
+            request_id: request_id.clone(),
+            ts: crate::util::now_ms(),
+            method: "POST".into(),
+            path: path.clone(),
+            request_headers: headers_to_json(&headers),
+            request_body: Some(request_body_for_capture.to_vec()),
+            ..Default::default()
+        }),
+        finished: false,
+    };
+
+    // ---- 2. 路由决策 ----
+    let est_tokens = estimate_request_tokens(&req);
+    let mut meta = RouteMetadata::new(req.model.clone(), protocol, path.clone(), headers.clone());
+    meta.client = client.clone();
+    meta.stream = req.stream;
+    meta.est_input_tokens = est_tokens;
+
+    // 预扣估算：拿本地 token 估算 + max_tokens 当输出上界。它**不参与真实计费**，
+    // 只用来记下"估算与实际的偏差"，让用户在监控页看到估算靠不靠谱。
+    let price_for_estimate = shell.pricing.load().get(&req.model);
+    let est_usage = UnifiedUsage {
+        input_tokens: est_tokens,
+        output_tokens: req.max_tokens.unwrap_or(0) as u64,
+        source: UsageSource::LocalEstimate,
+        ..Default::default()
+    };
+    recorder.session = BillingSession::new(
+        BillingEngine::settle(&est_usage, &price_for_estimate, 0).total_quota,
+    );
+
+    let outcome = shell.router.route(&mut meta);    let selector_tag = match outcome {
+        RouteOutcome::Reject { reason, .. } => {
+            shell.traffic.record_failure();
+            recorder.fail(403, &reason);
+            return error_response(protocol, 403, "请求被路由规则拒绝", &reason);
+        }
+        RouteOutcome::Final { selector, .. } => selector,
+    };
+
+    // 模型名可能被非终结动作改写。
+    let upstream_model = meta.model.clone();
+
+    // ---- 3. 选定渠道 ----
+    let primary = match shell.selectors.resolve(&selector_tag) {
+        Some(o) => o,
+        None => {
+            shell.traffic.record_failure();
+            let msg = format!("selector「{selector_tag}」没有可用的渠道，请先在「路由」页配置");
+            recorder.fail(503, &msg);
+            return error_response(protocol, 503, "没有可用渠道", &msg);
+        }
+    };
+
+    // ---- 4. 缓存查找 ----
+    let policy = shell.cache.policy();
+    let cacheable = is_cacheable(&req, &policy);
+    let key = cacheable.then(|| cache_key(protocol, &req));
+
+    if let Some(key) = &key {
+        match shell.cache.get(&shell.db, key).await {
+            Ok(Some(entry)) => {
+                return serve_from_cache(
+                    shell,
+                    protocol,
+                    &req,
+                    entry,
+                    recorder,
+                    started,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("读缓存失败: {e}"),
+        }
+    }
+
+    // ---- 5. 出站 ----
+    let candidates = build_candidates(&shell, &primary, &upstream_model).await;
+
+    let mut last_error: Option<UpstreamError> = None;
+
+    for (idx, outbound) in candidates.iter().enumerate() {
+        let is_last = idx + 1 == candidates.len();
+
+        match try_outbound(
+            &shell,
+            outbound,
+            &req,
+            &body,
+            &upstream_model,
+            &headers,
+            &mut recorder,
+            protocol,
+            cacheable,
+            key.clone(),
+            started,
+        )
+        .await
+        {
+            Ok(resp) => return resp,
+            Err(e) => {
+                let retryable = e.is_retryable();
+                tracing::warn!(
+                    provider = outbound.tag(),
+                    error = %e,
+                    retryable,
+                    "上游请求失败"
+                );
+                if !retryable || is_last {
+                    last_error = Some(e);
+                    break;
+                }
+                last_error = Some(e);
+                // 换下一个渠道重试。
+                continue;
+            }
+        }
+    }
+
+    // ---- 全部失败 ----
+    shell.traffic.record_failure();
+    let err = last_error
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "没有可用的上游渠道".to_string());
+    recorder.fail(502, &err);
+    error_response(protocol, 502, "上游请求失败", &err)
+}
+
+/// 组装候选渠道：首选 + 同模型的其他渠道（用于故障转移）。
+async fn build_candidates(
+    shell: &Arc<AppShell>,
+    primary: &Arc<dyn Outbound>,
+    model: &str,
+) -> Vec<Arc<dyn Outbound>> {
+    let mut out = vec![primary.clone()];
+
+    // 只在首选失败时才会用到后面的；用户没配多渠道路由时列表就只有首选。
+    if let Ok(providers) = crate::storage::providers::channels_for_model(&shell.db, model).await {
+        for p in providers {
+            if p.tag == primary.tag() {
+                continue;
+            }
+            if let Some(o) = shell.registry.get(&p.tag) {
+                out.push(o);
+            }
+        }
+    }
+
+    out
+}
+
+/// 针对单个渠道执行一次完整请求。
+#[allow(clippy::too_many_arguments)]
+async fn try_outbound(
+    shell: &Arc<AppShell>,
+    outbound: &Arc<dyn Outbound>,
+    req: &UnifiedRequest,
+    raw_body: &Bytes,
+    upstream_model: &str,
+    headers: &HeaderMap,
+    recorder: &mut Recorder,
+    protocol_in: Protocol,
+    cacheable: bool,
+    cache_key: Option<String>,
+    started: Instant,
+) -> Result<Response, UpstreamError> {
+    let wire = outbound.wire();
+    recorder.record.protocol_out = wire.as_str().to_string();
+    recorder.record.provider_tag = Some(outbound.tag().to_string());
+    recorder.record.channel_kind = Some(outbound.provider().kind.as_str().to_string());
+
+    // 渠道级模型映射：入站模型名 → 上游真实模型名。
+    let mapped_model = outbound.provider().upstream_model(upstream_model).to_string();
+
+    let needs_conversion = protocol_in != wire;
+
+    // ---- 组装出站请求体 ----
+    let out_body: Bytes = if needs_conversion {
+        // 跨协议：用 IR 重新编码成渠道的线协议。
+        let mut to_send = req.clone();
+        to_send.model = mapped_model.clone();
+        to_send.stream = req.stream;
+
+        // 思考签名无法跨协议保真，剥离以免上游报 Invalid signature。
+        strip_unportable_thinking(&mut to_send);
+
+        let codec = shell.codecs.codec(wire);
+        match codec.encode_request(&to_send) {
+            Ok(b) => Bytes::from(b),
+            Err(e) => {
+                return Err(UpstreamError::Build(format!("请求编码为 {wire} 失败: {e}")))
+            }
+        }
+    } else {
+        // 同协议：尽量保留原始字节，只把 model 换成映射后的名字。
+        // 走原始 body 而不是重新序列化 IR —— 后者会丢掉未建模的字段。
+        patch_model_field(raw_body, &mapped_model)
+    };
+
+    let prepared = outbound.prepare(headers, out_body.clone(), req.stream)?;
+
+    let resp = outbound.dial(prepared).await?;
+    let status = resp.status;
+
+    if !status.is_success() {
+        // 非成功状态：把响应体读完，提取错误信息。
+        let body = match resp.body {
+            UpstreamBody::Buffered(b) => b,
+            UpstreamBody::Stream(_) => Bytes::new(),
+        };
+        let msg = shell.codecs.codec(wire).extract_error_message(&body);
+        shell.traffic.record_failure();
+        recorder.fail(status.as_u16() as i32, &msg);
+        return Err(UpstreamError::Status {
+            status: status.as_u16(),
+            body: msg,
+        });
+    }
+
+    // ---- 流式 ----
+    if req.stream {
+        let decoder = shell.codecs.codec(wire).new_stream_decoder();
+        // 同协议走直通（不重编码），异协议才用编码器。
+        let encoder = needs_conversion.then(|| shell.codecs.codec(protocol_in).new_stream_encoder());
+
+        let upstream_stream = match resp.body {
+            UpstreamBody::Stream(s) => s,
+            // 客户端要流式但上游给了完整响应：按一次性响应处理。
+            UpstreamBody::Buffered(b) => {
+                return finish_buffered(
+                    shell, protocol_in, wire, &b, resp.headers, recorder, status, needs_conversion,
+                    cacheable, cache_key, started, &mapped_model,
+                )
+                .await;
+            }
+        };
+
+        let settings = shell.settings();
+        let timeouts = StreamTimeouts {
+            first_byte: std::time::Duration::from_millis(settings.first_byte_timeout_ms),
+            idle: std::time::Duration::from_millis(settings.idle_timeout_ms),
+        };
+
+        let shell_cb = shell.clone();
+        let request_id = recorder.record.request_id.clone();
+        let client = recorder.record.client.clone();
+        let model = req.model.clone();
+        let provider_tag = outbound.tag().to_string();
+        let channel_kind = Some(outbound.provider().kind.as_str().to_string());
+        let protocol_in = protocol_in;
+        let price = shell.pricing.load().get(&req.model);
+        let tool_calls = count_tool_uses(&req.messages);
+        let started_at = started;
+        let key_for_cache = cache_key.clone();
+
+        let body = translate_stream(
+            upstream_stream,
+            decoder,
+            encoder,
+            timeouts,
+            move |outcome| {
+                finalize_stream(
+                    shell_cb,
+                    request_id,
+                    client,
+                    model,
+                    provider_tag,
+                    protocol_in,
+                    wire,
+                    channel_kind,
+                    price,
+                    tool_calls,
+                    started_at,
+                    outcome,
+                    key_for_cache,
+                    cacheable,
+                );
+            },
+        );
+
+        let mut response_headers = resp.headers.clone();
+        // 我们可能改写了内容，长度与编码都不再由上游保证。
+        response_headers.remove(http::header::CONTENT_LENGTH);
+        response_headers.remove(http::header::CONTENT_ENCODING);
+        response_headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        response_headers.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+
+        return Ok((status, response_headers, body).into_response());
+    }
+
+    // ---- 非流式 ----
+    let buffered = match resp.body {
+        UpstreamBody::Buffered(b) => b,
+        UpstreamBody::Stream(mut s) => {
+            use futures::StreamExt;
+            let mut acc = Vec::new();
+            while let Some(chunk) = s.next().await {
+                match chunk {
+                    Ok(b) => acc.extend_from_slice(&b),
+                    Err(e) => {
+                        return Err(UpstreamError::Io(format!("读取上游响应失败: {e}")))
+                    }
+                }
+            }
+            Bytes::from(acc)
+        }
+    };
+
+    finish_buffered(
+        shell,
+        protocol_in,
+        wire,
+        &buffered,
+        resp.headers,
+        recorder,
+        status,
+        needs_conversion,
+        cacheable,
+        cache_key,
+        started,
+        &mapped_model,
+    )
+    .await
+}
+
+/// 处理非流式（或上游一次性返回的）响应。
+#[allow(clippy::too_many_arguments)]
+async fn finish_buffered(
+    shell: &Arc<AppShell>,
+    protocol_in: Protocol,
+    wire: Protocol,
+    body: &Bytes,
+    headers: http::HeaderMap,
+    recorder: &mut Recorder,
+    status: http::StatusCode,
+    needs_conversion: bool,
+    cacheable: bool,
+    cache_key: Option<String>,
+    started: Instant,
+    _mapped_model: &str,
+) -> Result<Response, UpstreamError> {
+    // 上游响应先解码，用于取 usage 与（必要时）重编码。
+    // `decoded_from_sse` 记录"这份响应是从 SSE 还原出来的" —— 那种情况下
+    // 即使入站与出站协议相同，也必须重新编码：原始字节是 SSE 正文，
+    // 直接透传会把 event: 行喂给一个要 JSON 的客户端。
+    let mut decoded_from_sse = false;
+    let decoded = match shell.codecs.codec(wire).decode_response(body) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            // 解不出 JSON 有两种可能：上游真的坏了（透传原文保可用），
+            // 或者它无视 stream=false 一律回了 SSE（很常见，需要解成完整响应）。
+            let is_sse = headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_ascii_lowercase().contains("text/event-stream"))
+                .unwrap_or(false);
+
+            if is_sse {
+                match decode_sse_as_response(shell, wire, body) {
+                    Some(v) => {
+                        tracing::info!("上游无视 stream=false 返回了 SSE，已解析为完整响应");
+                        decoded_from_sse = true;
+                        Some(v)
+                    }
+                    None => {
+                        tracing::warn!("上游响应解码失败，改为透传原文: {e}");
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!("上游响应解码失败，改为透传原文: {e}");
+                None
+            }
+        }
+    };
+
+    // 从 SSE 还原出来的响应必须走编码路径。
+    let needs_conversion = needs_conversion || decoded_from_sse;
+
+    let Some((decoded, usage)) = decoded else {
+        // 完全解不出来：把原文交给客户端，至少让功能可用，同时把用量记成未知。
+        recorder.record.quota = 0;
+        recorder.finish(status.as_u16() as i32, UnifiedUsage::default(), Some(0));
+        return Ok(build_response(status, headers, body.clone()));
+    };
+
+    // 计费
+    let price = shell.pricing.load().get(&recorder.record.model);
+    let tool_calls = decoded
+        .content
+        .iter()
+        .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        .count() as u32;
+    let breakdown = BillingEngine::settle(&usage, &price, tool_calls);
+
+    recorder.record.quota = breakdown.total_quota;
+    recorder.record.saved_quota = breakdown.cache_saved_quota;
+
+    let latency = started.elapsed().as_millis() as i64;
+    recorder.record.latency_ms = latency;
+
+    // 写缓存：把这次的结果存下来供后续相同请求复用。
+    if cacheable {
+        if let Some(key) = cache_key {
+            if let Ok(entry) = CacheEntry::from_response(
+                key,
+                protocol_in,
+                recorder.record.model.clone(),
+                recorder.record.provider_tag.clone(),
+                &decoded,
+                &usage,
+                breakdown.total_quota,
+                shell.cache.policy().ttl_secs,
+            ) {
+                if let Err(e) = shell.cache.put(&shell.db, &entry).await {
+                    tracing::warn!("写缓存失败: {e}");
+                }
+            }
+        }
+    }
+
+    // 非流式没有独立的 TTFB，用整体耗时近似（对客户端而言等价）。
+    recorder.finish(status.as_u16() as i32, usage.clone(), Some(latency));
+
+    if let Some(c) = recorder.capture.as_mut() {
+        c.response_headers = headers_to_json(&headers);
+    }
+
+    // 客户端要流式，但上游给的是完整响应（有些中转会无视 stream=true）：
+    // 用编码器把结果"假装"成流，客户端的解码路径就不必区分这两种情况。
+    if recorder.record.is_stream {
+        let encoder = shell.codecs.codec(protocol_in).new_stream_encoder();
+        let mut sse_headers = HeaderMap::new();
+        sse_headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        sse_headers.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+        return Ok((
+            status,
+            sse_headers,
+            super::stream::stream_from_response(decoded, usage, encoder, |_| {}),
+        )
+            .into_response());
+    }
+
+    let out_bytes = if needs_conversion {
+        match shell.codecs.codec(protocol_in).encode_response(&decoded, &usage) {
+            Ok(b) => Bytes::from(b),
+            Err(e) => {
+                tracing::warn!("响应编码为 {protocol_in} 失败: {e}");
+                body.clone()
+            }
+        }
+    } else {
+        body.clone()
+    };
+
+    if let Some(c) = recorder.capture.as_mut() {
+        c.response_body = Some(out_bytes.to_vec());
+    }
+
+    Ok(build_response(status, headers, out_bytes))
+}
+
+/// 流结束后的收尾：计费、写缓存、补捕获。
+#[allow(clippy::too_many_arguments)]
+fn finalize_stream(
+    shell: Arc<AppShell>,
+    request_id: String,
+    client: String,
+    model: String,
+    provider_tag: String,
+    protocol_in: Protocol,
+    protocol_out: Protocol,
+    channel_kind: Option<String>,
+    price: crate::billing::pricing::ModelPricing,
+    tool_calls: u32,
+    started: Instant,
+    outcome: StreamOutcome,
+    cache_key: Option<String>,
+    cacheable: bool,
+) {
+    let latency = started.elapsed().as_millis() as i64;
+    let ttfb = outcome.ttfb.map(|d| d.as_millis() as i64);
+    let status_code = if outcome.error.is_some() { 502 } else { 200 };
+
+    if let Some(ms) = ttfb {
+        if outcome.error.is_none() {
+            shell.traffic.record_ttfb(ms);
+        }
+    }
+
+    let breakdown = BillingEngine::settle(&outcome.usage, &price, tool_calls);
+
+    tauri::async_runtime::spawn(async move {
+        // 流式结果只有拿到完整内容才值得缓存 —— 中断的流缓存下来会永远返回残缺答案。
+        if cacheable && outcome.error.is_none() && !outcome.content.is_empty() {
+            if let Some(key) = cache_key {
+                let resp = UnifiedResponse {
+                    id: request_id.clone(),
+                    model: model.clone(),
+                    content: outcome.content.clone(),
+                    finish_reason: outcome
+                        .finish_reason
+                        .clone()
+                        .unwrap_or(FinishReason::Stop),
+                };
+                if let Ok(entry) = CacheEntry::from_response(
+                    key,
+                    // 缓存键是按入站协议算的，条目也必须记入站协议，
+                    // 否则命中后会用错编码器。
+                    protocol_in,
+                    model.clone(),
+                    Some(provider_tag.clone()),
+                    &resp,
+                    &outcome.usage,
+                    breakdown.total_quota,
+                    shell.cache.policy().ttl_secs,
+                ) {
+                    let _ = shell.cache.put(&shell.db, &entry).await;
+                }
+            }
+        }
+
+        let rec = RequestLogRecord {
+            request_id: request_id.clone(),
+            ts: crate::util::now_ms(),
+            client,
+            protocol_in: protocol_in.as_str().to_string(),
+            protocol_out: protocol_out.as_str().to_string(),
+            provider_tag: Some(provider_tag),
+            channel_kind,
+            model: model.clone(),
+            request_model: model.clone(),
+            is_stream: true,
+            status_code,
+            error_message: outcome.error.clone(),
+            input_tokens: outcome.usage.input_tokens,
+            output_tokens: outcome.usage.output_tokens,
+            cache_read_tokens: outcome.usage.cache_read_tokens,
+            cache_creation_tokens: outcome.usage.cache_creation_tokens,
+            reasoning_tokens: outcome.usage.reasoning_tokens,
+            usage_source: match outcome.usage.source {
+                UsageSource::Upstream => "upstream".into(),
+                UsageSource::LocalEstimate => "local".into(),
+            },
+            quota: breakdown.total_quota,
+            cost_usd: crate::billing::quota::quota_to_usd(breakdown.total_quota),
+            latency_ms: latency,
+            ttfb_ms: ttfb,
+            cache_hit: false,
+            saved_quota: breakdown.cache_saved_quota,
+            other: serde_json::json!({
+                "stream_events": outcome.events,
+            }),
+        };
+
+        shell.aggregates.record(&rec);
+        if let Err(e) = crate::storage::logs::insert(&shell.db, &rec).await {
+            tracing::warn!("写流式请求日志失败: {e}");
+        }
+        shell.events.request(&rec);
+
+        // 把拼接后的文本留进捕获，供监控页展示。
+        if shell.settings().capture_enabled && !outcome.text.is_empty() {
+            let cap = CaptureRecord {
+                request_id: rec.request_id.clone(),
+                ts: rec.ts,
+                stream_text: Some(outcome.text),
+                stream_events: outcome.events as i64,
+                ..Default::default()
+            };
+            if let Err(e) = crate::storage::logs::save_capture(&shell.db, &cap).await {
+                tracing::warn!("写流式捕获失败: {e}");
+            }
+        }
+    });
+}
+
+/// 把一段 SSE 正文解析成完整响应。
+///
+/// 用于兜住一类很常见的中转上游：它们**无视 `stream: false`**，一律回 SSE。
+/// 不处理的话，非流式客户端会收到一堆 `event: ...` 文本，直接解析失败。
+pub fn decode_sse_as_response(
+    shell: &Arc<AppShell>,
+    protocol: Protocol,
+    raw: &[u8],
+) -> Option<(UnifiedResponse, UnifiedUsage)> {
+    let mut decoder = shell.codecs.codec(protocol).new_stream_decoder();
+    let mut acc = super::stream::ContentAccumulator::new();
+
+    let mut buf = String::new();
+    let mut remainder = Vec::new();
+    super::sse::append_utf8_safe(&mut buf, &mut remainder, raw);
+
+    let mut id = String::new();
+    let mut model = String::new();
+
+    while let Some(block) = super::sse::take_sse_block(&mut buf) {
+        let Some(ev) = super::sse::parse_event(&block) else {
+            continue;
+        };
+        let Ok(deltas) = decoder.on_event(&ev) else {
+            continue;
+        };
+        for d in &deltas {
+            if let crate::protocol::dto::UnifiedDelta::MessageStart {
+                id: mid,
+                model: mmodel,
+            } = d
+            {
+                if !mid.is_empty() {
+                    id = mid.clone();
+                }
+                if !mmodel.is_empty() {
+                    model = mmodel.clone();
+                }
+            }
+            acc.apply(d);
+        }
+    }
+    for d in decoder.finish() {
+        acc.apply(&d);
+    }
+
+    let content = acc.finish();
+    let usage = decoder.usage();
+
+    // 什么都没解出来说明这压根不是 SSE，交给调用方走原来的透传路径。
+    if content.is_empty() && usage.is_empty() {
+        return None;
+    }
+
+    if id.is_empty() {
+        id = format!("apilot_{}", uuid::Uuid::new_v4().simple());
+    }
+
+    Some((
+        UnifiedResponse {
+            id,
+            model,
+            content,
+            // 流式增量里带 stop_reason，但 `StreamDecoder` 没把它暴露出来。
+            // 这里保守地用 Stop —— 客户端拿到的正文是完整的，只是终止原因
+            // 可能不如上游标注的精确；比起让整个非流式请求失败，这个取舍划算。
+            finish_reason: FinishReason::Stop,
+        },
+        usage,
+    ))
+}
+
+/// 命中缓存时直接构造响应。
+async fn serve_from_cache(
+    shell: Arc<AppShell>,
+    protocol: Protocol,
+    req: &UnifiedRequest,
+    entry: CacheEntry,
+    mut recorder: Recorder,
+    started: Instant,
+) -> Response {
+    let response = match entry.response() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("缓存条目损坏: {e}");
+            recorder.fail(500, "缓存条目损坏");
+            return error_response(protocol, 500, "缓存条目损坏", &e.to_string());
+        }
+    };
+
+    let quota_saved = entry.quota;
+    recorder.record.cache_hit = true;
+    recorder.record.saved_quota = quota_saved;
+    recorder.record.quota = 0;
+    recorder.record.provider_tag = None;
+    recorder.record.latency_ms = started.elapsed().as_millis() as i64;
+
+    let usage = entry.usage.clone();
+
+    if req.stream {
+        let encoder = shell.codecs.codec(protocol).new_stream_encoder();
+        let shell_cb = shell.clone();
+        let mut rec = recorder.record.clone();
+        rec.client = recorder.record.client.clone();
+
+        let body = super::stream::stream_from_response(response, usage, encoder, move |outcome| {
+            let mut r = rec.clone();
+            r.output_tokens = outcome.usage.output_tokens;
+            r.ts = crate::util::now_ms();
+            let shell2 = shell_cb.clone();
+            tauri::async_runtime::spawn(async move {
+                shell2.aggregates.record(&r);
+                let _ = crate::storage::logs::insert(&shell2.db, &r).await;
+                shell2.events.request(&r);
+            });
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+        headers.insert("x-apilot-cache", http::HeaderValue::from_static("hit"));
+
+        return (http::StatusCode::OK, headers, body).into_response();
+    }
+
+    let body = match shell.codecs.codec(protocol).encode_response(&response, &usage) {
+        Ok(b) => Bytes::from(b),
+        Err(e) => {
+            return error_response(protocol, 500, "缓存响应编码失败", &e.to_string())
+        }
+    };
+
+    recorder.finish(200, usage, Some(0));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    headers.insert("x-apilot-cache", http::HeaderValue::from_static("hit"));
+
+    build_response(http::StatusCode::OK, headers, body)
+}
+
+// ---------------------------------------------------------------------------
+// 工具
+// ---------------------------------------------------------------------------
+
+/// 把原始 JSON 里的 `model` 字段换成映射后的名字，其余字节尽量保留。
+fn patch_model_field(original: &[u8], mapped: &str) -> Bytes {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(original) else {
+        return Bytes::from(original.to_vec());
+    };
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("model".into(), serde_json::json!(mapped));
+    }
+    serde_json::to_vec(&v)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::from(original.to_vec()))
+}
+
+/// 剥离无法跨协议保真的思考块。
+///
+/// Anthropic 的 `signature` 由上游签名，转到别的协议再转回来必然失效，
+/// 回传会让上游 400。与其带着坏签名过去，不如明确丢掉。
+fn strip_unportable_thinking(req: &mut UnifiedRequest) {
+    for msg in &mut req.messages {
+        msg.content.retain(|b| {
+            !matches!(
+                b,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            )
+        });
+    }
+    if let Some(r) = &mut req.reasoning {
+        r.budget_tokens = None;
+    }
+}
+
+fn count_tool_uses(messages: &[crate::protocol::dto::UnifiedMessage]) -> u32 {
+    messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        .count() as u32
+}
+
+fn build_response(status: http::StatusCode, headers: HeaderMap, body: Bytes) -> Response {
+    let mut builder = Response::builder().status(status);
+    if let Some(h) = builder.headers_mut() {
+        for (k, v) in headers.iter() {
+            // 长度与编码由我们自己重算，不沿用上游的。
+            if k == http::header::CONTENT_LENGTH || k == http::header::CONTENT_ENCODING {
+                continue;
+            }
+            h.insert(k, v.clone());
+        }
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
+}
+
+fn error_response(
+    protocol: Protocol,
+    status: u16,
+    title: &str,
+    detail: &str,
+) -> Response {
+    let code = http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+
+    // 各协议的错误体结构不同；按客户端预期返回，它才能正确展示。
+    let payload = match protocol {
+        Protocol::AnthropicMessages => serde_json::json!({
+            "type": "error",
+            "error": { "type": "api_error", "message": format!("{title}: {detail}") },
+        }),
+        _ => serde_json::json!({
+            "error": { "message": format!("{title}: {detail}"), "type": "api_error" },
+        }),
+    };
+
+    (code, axum::Json(payload)).into_response()
+}
+
+fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in headers.iter() {
+        // 鉴权头可能含密钥，绝不落库。
+        if k.as_str().eq_ignore_ascii_case("authorization")
+            || k.as_str().eq_ignore_ascii_case("x-api-key")
+        {
+            map.insert(k.to_string(), serde_json::json!("<已隐去>"));
+            continue;
+        }
+        map.insert(
+            k.to_string(),
+            serde_json::json!(v.to_str().unwrap_or("<binary>")),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
+#[allow(dead_code)]
+fn convert_err(e: ConvertError) -> UpstreamError {
+    UpstreamError::Build(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn explicit_client_header_wins() {
+        let h = headers_with(&[("x-apilot-client", "codex"), ("user-agent", "claude-cli/1.0")]);
+        assert_eq!(detect_client(&h, "/v1/messages"), "codex");
+    }
+
+    #[test]
+    fn user_agent_is_used_when_header_absent() {
+        let h = headers_with(&[("user-agent", "claude-cli/2.1.0 (external)")]);
+        assert_eq!(detect_client(&h, "/v1/messages"), "claude-code");
+
+        let h = headers_with(&[("user-agent", "codex_cli_rs/0.9")]);
+        assert_eq!(detect_client(&h, "/v1/responses"), "codex");
+    }
+
+    #[test]
+    fn path_is_the_last_resort() {
+        let h = HeaderMap::new();
+        assert_eq!(detect_client(&h, "/v1/messages"), "claude-code");
+        assert_eq!(detect_client(&h, "/v1/responses"), "codex");
+        assert_eq!(detect_client(&h, "/v1/chat/completions"), "unknown");
+    }
+
+    #[test]
+    fn empty_client_header_falls_through() {
+        let h = headers_with(&[("x-apilot-client", "")]);
+        assert_eq!(detect_client(&h, "/v1/messages"), "claude-code");
+    }
+
+    #[test]
+    fn model_field_is_patched_preserving_other_fields() {
+        let raw = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"custom_field":42}"#;
+        let out = patch_model_field(raw, "deepseek-chat");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(v["model"], "deepseek-chat");
+        assert_eq!(v["custom_field"], 42, "其余字段必须原样保留");
+        assert_eq!(v["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn patch_model_on_invalid_json_returns_original() {
+        let raw = b"not json";
+        assert_eq!(&patch_model_field(raw, "x")[..], raw);
+    }
+
+    #[test]
+    fn thinking_is_stripped_for_cross_protocol() {
+        let mut req = UnifiedRequest::new("m");
+        req.messages = vec![crate::protocol::dto::UnifiedMessage::new(
+            crate::protocol::dto::Role::Assistant,
+            vec![
+                ContentBlock::Thinking {
+                    text: "想了很久".into(),
+                    signature: Some("sig".into()),
+                },
+                ContentBlock::text("答案"),
+            ],
+        )];
+        req.reasoning = Some(crate::protocol::dto::ReasoningConfig {
+            enabled: true,
+            budget_tokens: Some(8000),
+            effort: None,
+        });
+
+        strip_unportable_thinking(&mut req);
+
+        assert_eq!(req.messages[0].content.len(), 1, "思考块应被剥离");
+        assert_eq!(req.messages[0].content[0].as_text(), Some("答案"));
+        assert!(req.reasoning.as_ref().unwrap().budget_tokens.is_none());
+    }
+
+    #[test]
+    fn auth_headers_are_redacted_in_capture() {
+        let h = headers_with(&[
+            ("authorization", "Bearer sk-secret"),
+            ("x-api-key", "sk-also-secret"),
+            ("content-type", "application/json"),
+        ]);
+        let v = headers_to_json(&h);
+
+        assert_eq!(v["authorization"], "<已隐去>");
+        assert_eq!(v["x-api-key"], "<已隐去>");
+        assert_eq!(v["content-type"], "application/json");
+        assert!(
+            !v.to_string().contains("sk-secret"),
+            "密钥绝不能出现在捕获里"
+        );
+    }
+
+    #[test]
+    fn tool_use_counting() {
+        use crate::protocol::dto::{Role, UnifiedMessage};
+        let msgs = vec![UnifiedMessage::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::ToolUse {
+                    id: "a".into(),
+                    name: "f".into(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "b".into(),
+                    name: "g".into(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::text("x"),
+            ],
+        )];
+        assert_eq!(count_tool_uses(&msgs), 2);
+    }
+
+    #[test]
+    fn error_response_shape_matches_protocol() {
+        let r = error_response(Protocol::AnthropicMessages, 400, "T", "D");
+        assert_eq!(r.status(), http::StatusCode::BAD_REQUEST);
+
+        let r = error_response(Protocol::OpenAiChat, 503, "T", "D");
+        assert_eq!(r.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+}

@@ -1,0 +1,4 @@
+# 本机 Windows 的 schannel 无法访问证书吊销服务器（CRYPT_E_REVOCATION_OFFLINE），
+# 会导致 cargo 的一切 HTTPS 请求失败。关掉吊销检查即可正常拉取依赖。
+[http]
+check-revoke = false
