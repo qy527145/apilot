@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, Copy, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { JsonViewer, tryParseJson } from "@/components/common/JsonViewer";
 import { ResponseView, RequestView } from "@/components/traffic/InspectViews";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,11 +27,9 @@ import {
   type UnifiedUsage,
 } from "@/lib/api";
 import {
-  cn,
   formatMs,
   formatNumber,
   formatTime,
-  prettyJson,
   quotaToUsd,
 } from "@/lib/utils";
 
@@ -416,9 +415,8 @@ function Headline({
 }) {
   const [showHeaders, setShowHeaders] = useState(false);
   const count = Object.keys(headers ?? {}).length;
-  const headersText = rawMode
-    ? JSON.stringify(headers ?? {})
-    : JSON.stringify(headers ?? {}, null, 2);
+  // Headers 本身就是个 JSON 对象，格式化视图直接用树，与正文一致。
+  const headersText = JSON.stringify(headers ?? {}, null, 2);
 
   return (
     <div className="space-y-1">
@@ -491,17 +489,42 @@ function RawBody({
         </span>
         <CopyButton text={text} />
       </div>
-      {/* 原始模式用 `pre`：不折行、横向滚动，否则分不清哪些空白是报文里真有的。 */}
-      <pre
-        className={cn(
-          "bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs",
-          rawMode ? "whitespace-pre" : "whitespace-pre-wrap",
-        )}
-      >
-        {rawMode ? text : prettyJson(text)}
-      </pre>
+      {rawMode ? (
+        // 原始模式用 `pre`：不折行、横向滚动，否则分不清哪些空白是报文里真有的。
+        <pre className="bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre">
+          {text}
+        </pre>
+      ) : (
+        <FormattedBody text={text} />
+      )}
     </div>
   );
+}
+
+/**
+ * 格式化视图。是 JSON 就给可折叠的树，不是就退回纯文本。
+ *
+ * SSE 事件流、上游返回的 HTML 错误页都不是 JSON —— 那种情况硬塞进 JSON 树
+ * 只会报错，所以退回纯文本并说明原因，而不是显示一片空白。
+ */
+function FormattedBody({ text }: { text: string }) {
+  const parsed = tryParseJson(text);
+
+  if (parsed === undefined) {
+    return (
+      <div className="space-y-1">
+        <p className="text-muted-foreground text-[11px]">
+          这段不是 JSON（可能是 SSE 事件流或纯文本），按原文显示。切到「原始」
+          可以看未经折行的版本。
+        </p>
+        <pre className="bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre-wrap">
+          {text}
+        </pre>
+      </div>
+    );
+  }
+
+  return <JsonViewer value={parsed} />;
 }
 
 function CopyButton({ text }: { text: string }) {
