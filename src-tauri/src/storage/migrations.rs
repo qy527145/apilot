@@ -231,6 +231,29 @@ ALTER TABLE captures ADD COLUMN client_stream_raw   BLOB;
 -- 原始帧超过上限被截断时置 1。界面必须如实标出来，否则用户会以为拿到的是全部。
 ALTER TABLE captures ADD COLUMN stream_raw_truncated INTEGER NOT NULL DEFAULT 0;
 "#,
+    // --- v4: 以「模型」为单位选渠道 ---
+    //
+    // 让"同一个模型在多个渠道都有时走哪个"成为模型页可配的东西，而不是只能靠
+    // 渠道自身的 priority 与 selector 热切换去推。
+    r#"
+-- 每个模型的渠道选择策略。没有行 = 完全交给 selector 与路由规则（现有行为）。
+CREATE TABLE IF NOT EXISTS model_policies (
+  model           TEXT PRIMARY KEY,        -- 客户端可见的模型名
+  strategy        TEXT NOT NULL DEFAULT 'priority',  -- priority | latency | weight
+  active_provider TEXT,                    -- 手动切换到的渠道 tag；NULL = 按策略自动
+  updated_at      INTEGER NOT NULL
+);
+
+-- 把 provider_models 的 priority/weight 从"建了但从没被读过"变成真源。
+--
+-- 关键的一步是**按所属渠道的优先级/权重回填一次**：channels_for_model 从此按
+-- 每模型的值排序（COALESCE 到渠道的值），回填之后既有配置的排序结果与改动前
+-- 逐条一致。不回填的话，所有已有行的 0/1 会把用户设过的渠道优先级整个抹平 ——
+-- 那种改动不会报错，只会让流量悄悄换了渠道。
+UPDATE provider_models SET
+  priority = COALESCE((SELECT p.priority FROM providers p WHERE p.id = provider_models.provider_id), priority),
+  weight   = COALESCE((SELECT p.weight   FROM providers p WHERE p.id = provider_models.provider_id), weight);
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -242,7 +265,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 4);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

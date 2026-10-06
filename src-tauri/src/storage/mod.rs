@@ -4,6 +4,7 @@ pub mod aggregates;
 pub mod db;
 pub mod logs;
 pub mod migrations;
+pub mod model_policies;
 pub mod models;
 pub mod pricing;
 pub mod providers;

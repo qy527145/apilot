@@ -46,6 +46,12 @@ pub struct AppShell {
     pub events: Arc<EventBus>,
     pub gateway: Arc<crate::gateway::server::GatewayServer>,
 
+    /// 最近一次测速的延迟（provider_tag → 毫秒）。
+    ///
+    /// 只活在内存里：它是易变的遥测数据，重启后重新测即可，落库反而会让人
+    /// 对着几天前的数字做决策。由「测速」命令写入，供按延迟选渠道的策略读取。
+    pub probe_latency: Arc<dashmap::DashMap<String, i64>>,
+
     started_at: i64,
 }
 
@@ -108,6 +114,7 @@ impl AppShell {
             traffic: Arc::new(TrafficStats::new()),
             events: Arc::new(EventBus::new(app)),
             gateway: Arc::new(crate::gateway::server::GatewayServer::new()),
+            probe_latency: Arc::new(dashmap::DashMap::new()),
             started_at: now_ms(),
         });
 

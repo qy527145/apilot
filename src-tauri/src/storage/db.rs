@@ -173,15 +173,41 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // 老库里的渠道设过一个非默认的优先级。
         sqlx::query(
-            "INSERT INTO providers (tag, name, kind, base_url, created_at, updated_at)
-             VALUES ('p', 'P', 'openai_chat', 'https://x', 0, 0)",
+            "INSERT INTO providers (tag, name, kind, base_url, priority, weight, created_at, updated_at)
+             VALUES ('p', 'P', 'openai_chat', 'https://x', 7, 3, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // v1 时代 provider_models 的 priority/weight 是建表默认的 0/1，
+        // 排序用的是渠道自己的值。
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model, upstream_model, client_group,
+                 priority, weight, enabled)
+             VALUES (1, 'm', NULL, '*', 0, 1, 1)",
         )
         .execute(&pool)
         .await
         .unwrap();
 
         migrate(&pool).await.unwrap();
+
+        // v4 的回填：每模型的 priority/weight 要变成所属渠道当时的值。
+        // 不回填的话，0/1 会把用户设过的渠道优先级整个抹平 ——
+        // 那种改动不报错，只会让流量悄悄换了渠道。
+        let (priority, weight): (i64, i64) =
+            sqlx::query_as("SELECT priority, weight FROM provider_models WHERE model = 'm'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (priority, weight),
+            (7, 3),
+            "每模型的值应回填成升级那一刻所属渠道的值，排序结果才与改动前一致"
+        );
 
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&pool)

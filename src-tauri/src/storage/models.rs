@@ -242,6 +242,80 @@ impl Provider {
     }
 }
 
+/// 某模型在多个渠道都有时，怎么决定走哪个。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelStrategy {
+    /// 按每模型的优先级（高者先），失败换下一个。默认 —— 行为最好预测。
+    Priority,
+    /// 按最近一次测速的延迟（低者先）；没测过的排最后。
+    Latency,
+    /// 按权重加权随机选主渠道，其余按优先级依次兜底。用于分流。
+    Weight,
+}
+
+impl ModelStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::Latency => "latency",
+            Self::Weight => "weight",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "latency" => Self::Latency,
+            "weight" => Self::Weight,
+            _ => Self::Priority,
+        }
+    }
+}
+
+impl Default for ModelStrategy {
+    fn default() -> Self {
+        Self::Priority
+    }
+}
+
+/// 一个模型的渠道选择策略。
+///
+/// **没有这一行 = 完全交给 selector 与路由规则** —— 这是全部旧行为得以保持的界线：
+/// 不在模型页碰过的模型，路由结果与改动前逐条一致。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPolicyRecord {
+    pub model: String,
+    pub strategy: ModelStrategy,
+    /// 手动切换到的渠道 tag。设了就无视策略，直接用它。
+    pub active_provider: Option<String>,
+}
+
+/// 一条候选渠道。`priority` / `weight` 是**这个模型在**该渠道上的值，
+/// 不是渠道自身的 —— 模型页调的就是它们。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCandidate {
+    pub provider_tag: String,
+    pub provider_name: String,
+    pub upstream_model: Option<String>,
+    pub priority: i64,
+    pub weight: i64,
+    pub enabled: bool,
+    /// 最近一次测速的延迟；没测过是 `None`。
+    #[serde(default)]
+    pub latency_ms: Option<i64>,
+}
+
+/// 模型页要的一整条：模型名 + 它的候选渠道 + 策略。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCatalogEntry {
+    pub model: String,
+    pub candidates: Vec<ModelCandidate>,
+    /// `None` 表示这个模型交回 selector 与路由规则管。
+    pub policy: Option<ModelPolicyRecord>,
+    /// 当前会走哪个渠道（策略 + active_provider 算出来的结果）。
+    pub primary: Option<String>,
+}
+
 /// 某模型在某渠道下的可用性条目（等价于 new-api 的 abilities）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderModel {

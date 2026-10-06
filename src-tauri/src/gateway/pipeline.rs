@@ -363,26 +363,73 @@ pub async fn handle(
     error_response(protocol, 502, "上游请求失败", &err)
 }
 
-/// 组装候选渠道：首选 + 同模型的其他渠道（用于故障转移）。
+/// 组装候选渠道：主渠道 + 其余（用于故障转移）。
+///
+/// 主渠道由谁决定，取决于这个模型有没有在模型页配过策略：
+///
+/// - **配过** → 按 `model_policies` 的策略排序，第一个当主渠道。
+///   这就是"像切换代理一样切换模型/渠道"的落点。
+/// - **没配过** → 沿用 `selector` 选出来的那个（现有行为，一键不动）。
+///
+/// 这条界线是整个方案不破坏既有配置的基础，改动时别把它弄丢了。
 async fn build_candidates(
     shell: &Arc<AppShell>,
     primary: &Arc<dyn Outbound>,
     model: &str,
     protocol_in: Protocol,
 ) -> Vec<Arc<dyn Outbound>> {
-    let mut out = vec![primary.clone()];
+    let channels = crate::storage::providers::candidate_channels(&shell.db, model)
+        .await
+        .unwrap_or_default();
 
-    // 只在首选失败时才会用到后面的；用户没配多渠道路由时列表就只有首选。
-    if let Ok(providers) = crate::storage::providers::channels_for_model(&shell.db, model).await {
-        for p in providers {
-            if p.tag == primary.tag() {
-                continue;
+    let policy = crate::storage::model_policies::get(&shell.db, model)
+        .await
+        .ok()
+        .flatten();
+
+    let mut out = match policy {
+        Some(ref p) => {
+            // 延迟策略要有测速结果；没测过的候选在 order() 里会被排到最后。
+            let ranked: Vec<crate::routing::model_select::Candidate> = channels
+                .iter()
+                .map(|c| crate::routing::model_select::Candidate {
+                    tag: c.provider.tag.clone(),
+                    priority: c.priority,
+                    weight: c.weight,
+                    latency_ms: shell.probe_latency.get(&c.provider.tag).map(|v| *v),
+                })
+                .collect();
+
+            let ordered =
+                crate::routing::model_select::order(Some(p), ranked, crate::util::rand_unit());
+
+            let mut cs: Vec<Arc<dyn Outbound>> = Vec::new();
+            for tag in ordered {
+                if let Some(o) = shell.registry.get(&tag) {
+                    cs.push(o);
+                }
             }
-            if let Some(o) = shell.registry.get(&p.tag) {
-                out.push(o);
+
+            // 模型页配的渠道一个都用不了（全被停用/删了）时不要就此失败，
+            // 落回 selector 选出的那个，让请求还有救。
+            if cs.is_empty() {
+                vec![primary.clone()]
+            } else {
+                cs
             }
         }
-    }
+        None => {
+            let mut cs = vec![primary.clone()];
+            for c in &channels {
+                if c.provider.tag != primary.tag() {
+                    if let Some(o) = shell.registry.get(&c.provider.tag) {
+                        cs.push(o);
+                    }
+                }
+            }
+            cs
+        }
+    };
 
     prefer_native_protocol(&mut out, primary, protocol_in);
     out

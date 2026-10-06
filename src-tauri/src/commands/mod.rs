@@ -9,6 +9,7 @@ pub mod billing;
 pub mod cache;
 pub mod gateway;
 pub mod logs;
+pub mod models;
 pub mod providers;
 pub mod routing;
 pub mod takeover;

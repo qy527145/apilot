@@ -70,6 +70,15 @@ pub fn run() {
             commands::providers::list_provider_models,
             commands::providers::set_provider_models,
             commands::providers::fetch_provider_models,
+            // --- 模型（模型视角：这个模型在哪些渠道上有、优先走哪个） ---
+            commands::models::get_model_policy,
+            commands::models::list_model_catalog,
+            commands::models::list_model_options,
+            commands::models::upsert_model_policy,
+            commands::models::reset_model_policy,
+            commands::models::switch_model_channel,
+            commands::models::set_model_candidates,
+            commands::models::probe_model_candidates,
             // --- 路由 ---
             commands::routing::list_route_rules,
             commands::routing::upsert_route_rule,

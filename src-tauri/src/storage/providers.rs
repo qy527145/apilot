@@ -280,16 +280,50 @@ pub async fn list_models(pool: &SqlitePool, provider_id: i64) -> AppResult<Vec<P
         .collect())
 }
 
-/// 全量替换某渠道的模型映射。
+/// 把 `providers.model_mapping` 从该渠道的 `provider_models` 行重新派生一遍。
 ///
-/// 同时把 `providers.model_mapping` 派生成「入站名 → 上游名」写回去，这是本次改动的关键：
-/// 请求改写（`Provider::upstream_model`）和网关 `GET /v1/models` 读的都是那一列，
-/// 而 `provider_models` 表只负责"该渠道声明支持哪些模型"。两边各写各的会让人以为
-/// 映射生效了，实际请求仍按原名发出去。
+/// 「入站名 → 上游名」那份派生读模型是请求改写（`Provider::upstream_model`）与
+/// 网关 `GET /v1/models` 的依据，而 `provider_models` 才是真源。
+/// **凡改动后者的地方都必须调它** —— 漏调的后果是"模型页显示映射生效了，
+/// 实际请求仍按原名发出去"，而且不会报错。
 ///
-/// 同名条目也写进 mapping（而不是只在有差异时写）——`/v1/models` 广告的就是
-/// `model_mapping.keys()`，只写差异项会让纯 DeepSeek 这类"入站名 == 上游名"的
-/// 配置探测不到任何模型。
+/// 同名条目也写进 mapping（不是只写有差异的）：`/v1/models` 广告的就是
+/// `model_mapping.keys()`，只写差异项会让纯 DeepSeek 这类"入站名 == 上游名"
+/// 的配置探测不到任何模型。
+async fn rebuild_model_mapping(
+    conn: &mut sqlx::SqliteConnection,
+    provider_id: i64,
+) -> AppResult<()> {
+    let rows = sqlx::query(
+        "SELECT model, upstream_model FROM provider_models WHERE provider_id = ?1 ORDER BY model ASC",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut mapping: IndexMap<String, String> = IndexMap::new();
+    for r in &rows {
+        let model: String = r.get("model");
+        let upstream: Option<String> = r.get("upstream_model");
+        mapping.insert(model.clone(), upstream.unwrap_or(model));
+    }
+
+    let json = serde_json::to_string(&mapping)?;
+    sqlx::query("UPDATE providers SET model_mapping = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(&json)
+        .bind(now_ms())
+        .bind(provider_id)
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(())
+}
+
+/// 全量替换某渠道的模型映射（渠道视角：这个渠道提供哪些模型）。
+///
+/// 写的优先级/权重直接取该渠道自己的值 —— 每模型的 priority/weight 是
+/// `channels_for_model` 的排序依据，默认应当等于渠道级的值，
+/// 否则"没单独配过"的模型会因为 0/1 的默认值被排到别的渠道后面。
 pub async fn set_models(
     pool: &SqlitePool,
     provider_id: i64,
@@ -297,40 +331,168 @@ pub async fn set_models(
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
 
+    let (base_priority, base_weight): (i64, i64) = sqlx::query_as(
+        "SELECT priority, weight FROM providers WHERE id = ?1",
+    )
+    .bind(provider_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::ProviderNotFound(provider_id.to_string()))?;
+
     sqlx::query("DELETE FROM provider_models WHERE provider_id = ?1")
         .bind(provider_id)
         .execute(&mut *tx)
         .await?;
 
-    let mut mapping: IndexMap<String, String> = IndexMap::new();
     for (model, upstream) in models {
         sqlx::query(
             "INSERT INTO provider_models (provider_id, model, upstream_model, client_group,
                  priority, weight, enabled)
-             VALUES (?1, ?2, ?3, '*', 0, 1, 1)",
+             VALUES (?1, ?2, ?3, '*', ?4, ?5, 1)",
         )
         .bind(provider_id)
         .bind(model)
         .bind(upstream)
+        .bind(base_priority)
+        .bind(base_weight)
         .execute(&mut *tx)
         .await?;
-
-        mapping.insert(model.clone(), upstream.clone().unwrap_or_else(|| model.clone()));
     }
 
-    let json = serde_json::to_string(&mapping)?;
-    let affected = sqlx::query("UPDATE providers SET model_mapping = ?1, updated_at = ?2 WHERE id = ?3")
-        .bind(&json)
-        .bind(now_ms())
-        .bind(provider_id)
+    rebuild_model_mapping(&mut *tx, provider_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 一条候选渠道（模型视角：这个模型在某个渠道上叫什么、排第几）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCandidateRow {
+    pub provider_tag: String,
+    pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default = "default_weight")]
+    pub weight: i64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// 按**模型**维度写候选渠道。
+///
+/// 与 [`set_models`] 是同一张表的两个视角：那边是"这个渠道提供哪些模型"，
+/// 这边是"这个模型在哪些渠道上有"。两者都全量替换自己负责的那一维，
+/// 最后都由 `rebuild_model_mapping` 把派生列修回来，所以不会互相覆盖。
+pub async fn set_model_candidates(
+    pool: &SqlitePool,
+    model: &str,
+    rows: &[ModelCandidateRow],
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+
+    // 先记下所有涉及到的渠道：既要删旧的，也要（在改完后）重建派生列。
+    let mut touched: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT provider_id FROM provider_models WHERE model = ?1",
+    )
+    .bind(model)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    sqlx::query("DELETE FROM provider_models WHERE model = ?1")
+        .bind(model)
         .execute(&mut *tx)
         .await?;
-    if affected.rows_affected() == 0 {
-        return Err(AppError::ProviderNotFound(provider_id.to_string()));
+
+    for row in rows {
+        let provider_id: i64 = sqlx::query_scalar("SELECT id FROM providers WHERE tag = ?1")
+            .bind(&row.provider_tag)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::ProviderNotFound(row.provider_tag.clone()))?;
+
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model, upstream_model, client_group,
+                 priority, weight, enabled)
+             VALUES (?1, ?2, ?3, '*', ?4, ?5, ?6)",
+        )
+        .bind(provider_id)
+        .bind(model)
+        .bind(&row.upstream_model)
+        .bind(row.priority)
+        .bind(row.weight)
+        .bind(row.enabled as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        if !touched.contains(&provider_id) {
+            touched.push(provider_id);
+        }
+    }
+
+    // 增删都动过 `provider_models`，所以每个涉及的渠道都要重建。
+    for provider_id in touched {
+        rebuild_model_mapping(&mut *tx, provider_id).await?;
     }
 
     tx.commit().await?;
     Ok(())
+}
+
+/// 某个模型在所有渠道上的候选，**含被停用的**。
+///
+/// 与 [`candidate_channels`] 是两种用途，别合并：
+/// - 那个给路由用，只返回启用中的渠道，且按优先级排好序；
+/// - 这个给模型页展示用，必须把停用的也带出来 —— 否则用户停用一个渠道之后
+///   它在模型页里直接消失，就再也启用不回来了。
+pub async fn candidates_for_model(
+    pool: &SqlitePool,
+    model: &str,
+) -> AppResult<Vec<ProviderModelCandidate>> {
+    let rows = sqlx::query(
+        "SELECT p.tag, p.name, m.upstream_model, m.priority, m.weight,
+                (m.enabled = 1 AND p.enabled = 1) AS effective_enabled
+         FROM provider_models m
+         JOIN providers p ON p.id = m.provider_id
+         WHERE m.model = ?1
+         ORDER BY m.priority DESC, m.weight DESC, p.id ASC",
+    )
+    .bind(model)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| ProviderModelCandidate {
+            provider_tag: r.get("tag"),
+            provider_name: r.get("name"),
+            upstream_model: r.get("upstream_model"),
+            priority: r.get("priority"),
+            weight: r.get("weight"),
+            // 渠道停用或这一条被停用，都算不可用 —— 界面只关心"它现在会不会被选中"。
+            enabled: r.get::<i64, _>("effective_enabled") != 0,
+        })
+        .collect())
+}
+
+/// 模型页看到的一条候选渠道（读模型）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelCandidate {
+    pub provider_tag: String,
+    pub provider_name: String,
+    pub upstream_model: Option<String>,
+    pub priority: i64,
+    pub weight: i64,
+    pub enabled: bool,
+}
+
+/// 所有被声明过的模型名（去重、排序）。
+pub async fn all_declared_models(pool: &SqlitePool) -> AppResult<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar("SELECT DISTINCT model FROM provider_models")
+        .fetch_all(pool)
+        .await?;
+    let mut models = rows;
+    models.sort();
+    models.dedup();
+    Ok(models)
 }
 
 /// 是否有「启用且声明过模型」的渠道。
@@ -354,9 +516,40 @@ pub async fn has_declared_models(pool: &SqlitePool) -> AppResult<bool> {
 ///
 /// 没在 `provider_models` 里声明任何模型的渠道视为"通吃"，也会被返回 ——
 /// 否则用户新建渠道后必须手工录入模型才能用，体验很差。
-pub async fn channels_for_model(pool: &SqlitePool, model: &str) -> AppResult<Vec<Provider>> {
+/// 候选渠道 + 它在**这个模型上**的优先级/权重。
+///
+/// 排序要用的是每模型的值（模型页调的就是它们），而 `Provider` 上带的是渠道级的
+/// 那两个，取值口径不同，所以必须一起返回，不能让调用方自己去猜。
+#[derive(Debug, Clone)]
+pub struct CandidateChannel {
+    pub provider: Provider,
+    pub priority: i64,
+    pub weight: i64,
+}
+
+/// 提供该模型的启用渠道，按优先级排好序。
+///
+/// 排序用的是 **`provider_models` 上的每模型 priority/weight**（迁移 v4 已把
+/// 既有行按渠道的值回填了一次，所以老配置的顺序与改动前一致），
+/// 没声明过模型的"通吃"渠道回落到渠道自身的值。
+///
+/// 子查询而不是 JOIN：`SELECT_COLUMNS` 里的列名没有限定前缀，与 `provider_models`
+/// 一起查会撞上同名的 `id`。
+pub async fn candidate_channels(
+    pool: &SqlitePool,
+    model: &str,
+) -> AppResult<Vec<CandidateChannel>> {
     let rows = sqlx::query(&format!(
-        "SELECT {SELECT_COLUMNS} FROM providers p
+        "SELECT {SELECT_COLUMNS},
+                COALESCE(
+                  (SELECT m.priority FROM provider_models m
+                   WHERE m.provider_id = p.id AND m.model = ?1 AND m.enabled = 1),
+                  p.priority) AS eff_priority,
+                COALESCE(
+                  (SELECT m.weight FROM provider_models m
+                   WHERE m.provider_id = p.id AND m.model = ?1 AND m.enabled = 1),
+                  p.weight) AS eff_weight
+         FROM providers p
          WHERE p.enabled = 1
            AND (
              NOT EXISTS (SELECT 1 FROM provider_models m WHERE m.provider_id = p.id)
@@ -365,12 +558,29 @@ pub async fn channels_for_model(pool: &SqlitePool, model: &str) -> AppResult<Vec
                WHERE m.provider_id = p.id AND m.model = ?1 AND m.enabled = 1
              )
            )
-         ORDER BY p.priority DESC, p.weight DESC, p.id ASC"
+         ORDER BY eff_priority DESC, eff_weight DESC, p.id ASC"
     ))
     .bind(model)
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(row_to_provider).collect())
+
+    Ok(rows
+        .iter()
+        .map(|r| CandidateChannel {
+            provider: row_to_provider(r),
+            priority: r.get("eff_priority"),
+            weight: r.get("eff_weight"),
+        })
+        .collect())
+}
+
+/// 提供该模型的启用渠道（只要渠道本身）。
+pub async fn channels_for_model(pool: &SqlitePool, model: &str) -> AppResult<Vec<Provider>> {
+    Ok(candidate_channels(pool, model)
+        .await?
+        .into_iter()
+        .map(|c| c.provider)
+        .collect())
 }
 
 #[cfg(test)]
@@ -624,5 +834,167 @@ mod tests {
             !has_declared_models(&p).await.unwrap(),
             "停用的渠道不算数"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 按模型维度选渠道
+    // -----------------------------------------------------------------------
+
+    async fn add(p: &SqlitePool, tag: &str, priority: i64) -> i64 {
+        let mut i = input(tag);
+        i.priority = priority;
+        upsert(p, &i).await.unwrap().id
+    }
+
+    fn cand(tag: &str, upstream: Option<&str>, priority: i64) -> ModelCandidateRow {
+        ModelCandidateRow {
+            provider_tag: tag.into(),
+            upstream_model: upstream.map(String::from),
+            priority,
+            weight: 1,
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_model_candidates_writes_across_providers() {
+        let p = pool().await;
+        add(&p, "a", 0).await;
+        add(&p, "b", 0).await;
+
+        set_model_candidates(
+            &p,
+            "m",
+            &[cand("a", Some("up-a"), 10), cand("b", None, 5)],
+        )
+        .await
+        .unwrap();
+
+        let got = candidates_for_model(&p, "m").await.unwrap();
+        assert_eq!(got.len(), 2);
+        // 按优先级降序返回。
+        assert_eq!(got[0].provider_tag, "a");
+        assert_eq!(got[0].upstream_model.as_deref(), Some("up-a"));
+        assert_eq!(got[1].provider_tag, "b");
+        assert_eq!(got[1].upstream_model, None, "留空表示与入站名同名");
+    }
+
+    #[tokio::test]
+    async fn set_model_candidates_rebuilds_every_affected_providers_mapping() {
+        // model_mapping 是派生读模型：请求改写与 GET /v1/models 都读它。
+        // 漏了重建的表现是"模型页显示改好了，实际仍按原名发出去"，且不报错。
+        let p = pool().await;
+        add(&p, "a", 0).await;
+        add(&p, "b", 0).await;
+
+        set_model_candidates(&p, "m", &[cand("a", None, 0), cand("b", None, 0)])
+            .await
+            .unwrap();
+        for tag in ["a", "b"] {
+            let provider = get_by_tag(&p, tag).await.unwrap().unwrap();
+            assert!(
+                provider.model_mapping.contains_key("m"),
+                "{tag} 的派生映射应包含 m"
+            );
+        }
+
+        // 把 b 从这个模型上摘掉，它的映射要跟着少掉 m。
+        set_model_candidates(&p, "m", &[cand("a", None, 0)])
+            .await
+            .unwrap();
+
+        let a = get_by_tag(&p, "a").await.unwrap().unwrap();
+        let b = get_by_tag(&p, "b").await.unwrap().unwrap();
+        assert!(a.model_mapping.contains_key("m"));
+        assert!(
+            !b.model_mapping.contains_key("m"),
+            "被摘掉 m 的渠道不该还留着这条映射"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_model_candidates_touches_only_the_named_model() {
+        // 是全量替换**这一个模型**的候选，不能顺手把同渠道的别的模型删掉。
+        let p = pool().await;
+        add(&p, "a", 0).await;
+
+        set_model_candidates(&p, "m1", &[cand("a", None, 0)]).await.unwrap();
+        set_model_candidates(&p, "m2", &[cand("a", None, 0)]).await.unwrap();
+        set_model_candidates(&p, "m1", &[]).await.unwrap();
+
+        assert!(candidates_for_model(&p, "m1").await.unwrap().is_empty());
+        assert_eq!(candidates_for_model(&p, "m2").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_model_candidates_rejects_an_unknown_provider() {
+        let p = pool().await;
+        let err = set_model_candidates(&p, "m", &[cand("nope", None, 0)]).await;
+        assert!(err.is_err());
+        // 事务回滚：不该留下半条。
+        assert!(candidates_for_model(&p, "m").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn channels_for_model_orders_by_the_per_model_priority() {
+        let p = pool().await;
+        // 渠道自身的优先级是 a > b，但模型页把 m 在 b 上排得更靠前。
+        add(&p, "a", 10).await;
+        add(&p, "b", 1).await;
+
+        set_model_candidates(&p, "m", &[cand("a", None, 1), cand("b", None, 9)])
+            .await
+            .unwrap();
+
+        let order: Vec<String> = channels_for_model(&p, "m")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.tag)
+            .collect();
+        assert_eq!(order, vec!["b", "a"], "模型的优先级应盖过渠道自身的");
+    }
+
+    #[tokio::test]
+    async fn channels_for_model_keeps_provider_order_for_undeclared_ones() {
+        // 没声明过模型的"通吃"渠道回落到渠道自身的优先级。
+        let p = pool().await;
+        add(&p, "wild-low", 1).await;
+        add(&p, "wild-high", 9).await;
+
+        let order: Vec<String> = channels_for_model(&p, "anything")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.tag)
+            .collect();
+        assert_eq!(order, vec!["wild-high", "wild-low"]);
+    }
+
+    #[tokio::test]
+    async fn set_models_inherits_the_provider_priority() {
+        // 渠道视角写模型时，每模型的值要取渠道自己的 ——
+        // 否则新声明的模型会带着 0/1 的默认值被排到别的渠道后面。
+        let p = pool().await;
+        add(&p, "a", 42).await;
+
+        set_models(&p, 1, &[("m".into(), None)]).await.unwrap();
+
+        let rows = candidates_for_model(&p, "m").await.unwrap();
+        assert_eq!(rows[0].priority, 42, "没单独配过的模型应继承渠道的优先级");
+    }
+
+    #[tokio::test]
+    async fn all_declared_models_is_the_distinct_sorted_union() {
+        let p = pool().await;
+        add(&p, "a", 0).await;
+        add(&p, "b", 0).await;
+
+        set_model_candidates(&p, "z", &[cand("a", None, 0)]).await.unwrap();
+        set_model_candidates(&p, "a", &[cand("a", None, 0), cand("b", None, 0)])
+            .await
+            .unwrap();
+
+        assert_eq!(all_declared_models(&p).await.unwrap(), vec!["a", "z"]);
     }
 }

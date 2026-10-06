@@ -23,6 +23,23 @@ pub fn hour_bucket(ts_secs: i64) -> i64 {
     ts_secs - ts_secs.rem_euclid(3600)
 }
 
+/// [0, 1) 的伪随机数。
+///
+/// 只给「加权随机选渠道」用 —— 那不是安全用途，所以不引 `rand` 依赖，
+/// 拿时钟与一个计数器哈希一下就够了。
+pub fn rand_unit() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV 偏移量
+    for byte in now_ms().to_le_bytes().iter().chain(n.to_le_bytes().iter()) {
+        h ^= *byte as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    (h >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// 把可能含敏感信息的 key 打码，用于日志与前端展示。
 pub fn mask_secret(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();

@@ -3,6 +3,7 @@
 pub mod engine;
 pub mod metadata;
 pub mod model_policy;
+pub mod model_select;
 pub mod rule;
 pub mod rule_item;
 pub mod selector;
