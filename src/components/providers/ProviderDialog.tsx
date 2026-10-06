@@ -261,26 +261,31 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
         </DialogHeader>
 
         <div className="grid gap-4">
-          {!provider && (
-            <div className="space-y-2">
-              <Label className="text-muted-foreground text-xs">
-                快速填充常用服务商
-              </Label>
-              <div className="flex flex-wrap gap-2">
-                {PROVIDER_PRESETS.map((p) => (
-                  <Button
-                    key={p.id}
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => applyPreset(p)}
-                  >
-                    {p.label}
-                  </Button>
-                ))}
-              </div>
+          {/*
+           * 编辑时也保留预设：老渠道是在"协议声明"这个功能存在之前建的，
+           * 它们清一色只有 kind 一种协议、路径也没填过。要把它改成"这家其实
+           * 支持三种协议"，手工勾选 + 抄路径很容易抄错，一键套用可靠得多。
+           */}
+          <div className="space-y-2">
+            <Label className="text-muted-foreground text-xs">
+              {provider
+                ? "套用预设（会覆盖名称、tag、base url、鉴权与协议声明）"
+                : "快速填充常用服务商"}
+            </Label>
+            <div className="flex flex-wrap gap-2">
+              {PROVIDER_PRESETS.map((p) => (
+                <Button
+                  key={p.id}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => applyPreset(p)}
+                >
+                  {p.label}
+                </Button>
+              ))}
             </div>
-          )}
+          </div>
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="space-y-2">
