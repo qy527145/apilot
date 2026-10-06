@@ -42,6 +42,69 @@ interface Props {
 /** 三种查看方式。表达的是"我在核对报文"还是"我在看语义"，与具体是哪一段无关。 */
 type ViewMode = "visual" | "formatted" | "raw";
 
+/**
+ * 响应侧「原始」视图取哪份数据。
+ *
+ * 流式要呈现的是**完整的 SSE 事件流**，不是拼接后的模型回答 —— 后者丢了事件
+ * 结构，排查时看不出上游到底发了哪些事件、终止帧长什么样。
+ *
+ * 直通时客户端收到的就是上游字节，所以客户端侧直接复用上游帧；后端正是因此
+ * 不重复存第二份。
+ *
+ * 按优先级取，而不是按"是不是流式"二选一：客户端要了流、上游却回了一整个 JSON
+ * 的情况很常见（有些中转会无视 `stream`），那时 `is_stream` 为真但没有 SSE 帧，
+ * 该显示的就是那份完整响应体。
+ */
+function rawOf(
+  d: RequestDetail,
+  side: "client" | "upstream",
+): { raw: string | null; rawNote?: string } {
+  const own = side === "client" ? d.client_stream_raw : d.upstream_stream_raw;
+  if (own) {
+    return {
+      raw: own,
+      rawNote: side === "client" ? "重编码后发给客户端的 SSE 帧" : "上游发出的 SSE 帧",
+    };
+  }
+
+  if (side === "client" && d.upstream_stream_raw) {
+    return { raw: d.upstream_stream_raw, rawNote: "直通：与上游 SSE 帧逐字节相同" };
+  }
+
+  const body = side === "client" ? d.response_body : d.upstream_response_body;
+  if (body) {
+    return {
+      raw: body,
+      rawNote: d.is_stream ? "上游无视 stream 参数，回了完整响应" : undefined,
+    };
+  }
+
+  // 改动之前的旧日志没有原始帧，只有拼接后的文本 —— 给出来但要说清它是什么。
+  if (d.stream_text) {
+    return {
+      raw: d.stream_text,
+      rawNote: "该请求未保存原始 SSE 帧（改动前的旧日志），以下是拼接后的文本",
+    };
+  }
+
+  return { raw: null };
+}
+
+/**
+ * 响应侧「格式化」视图取哪份数据。
+ *
+ * 流式没有完整响应体，但落库了由增量重建出的 IR（`response_content`）——
+ * 那才是这次响应的完整形态，比整块显示"未捕获"有用得多。
+ */
+function formattedOf(d: RequestDetail, side: "client" | "upstream"): string | null {
+  return (
+    (side === "client"
+      ? d.response_body
+      : d.upstream_response_body) ?? d.response_content ?? null
+  );
+}
+
+
 export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
   const [view, setView] = useState<ViewMode>("visual");
 
@@ -141,13 +204,8 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
                       headline: `HTTP ${data.status_code}`,
                       protocol: data.protocol_in,
                       headers: data.response_headers,
-                      formatted: data.response_body,
-                      raw: data.client_stream_raw ?? data.stream_text,
-                      rawNote: data.is_stream
-                        ? data.client_stream_raw
-                          ? "上游 SSE 帧的重编码结果"
-                          : "直通，与上游帧相同；这里显示拼接后的文本"
-                        : undefined,
+                      formatted: formattedOf(data, "client"),
+                      ...rawOf(data, "client"),
                       error: data.views.client_response?.error,
                       decoded: data.views.client_response?.value,
                       usage: data.views.client_response?.usage,
@@ -163,11 +221,8 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
                           : "未请求上游",
                       protocol: data.protocol_out,
                       headers: data.upstream_response_headers,
-                      formatted: data.upstream_response_body,
-                      raw: data.upstream_stream_raw,
-                      rawNote: data.is_stream
-                        ? "上游发出的原始 SSE 帧"
-                        : undefined,
+                      formatted: formattedOf(data, "upstream"),
+                      ...rawOf(data, "upstream"),
                       error: data.views.upstream_response?.error,
                       decoded: data.views.upstream_response?.value,
                       usage: data.views.upstream_response?.usage,
