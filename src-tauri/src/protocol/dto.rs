@@ -481,6 +481,27 @@ impl UnifiedDelta {
 mod tests {
     use super::*;
 
+    /// 空的集合字段会**整个消失**，而不是序列化成空数组。
+    ///
+    /// 这条契约是给前端用的：`UnifiedRequest` 里 `system` / `tools` / `stop` 都带
+    /// `skip_serializing_if`，TS 侧若把它们当成必有的数组去 `.map()`，会在
+    /// "这次请求没带工具"这种最常见的场景下直接崩掉。前端类型因此标成可选。
+    #[test]
+    fn empty_collections_are_omitted_from_the_wire_format() {
+        let req = UnifiedRequest::new("m");
+        let v = serde_json::to_value(&req).unwrap();
+
+        for k in ["system", "tools", "stop"] {
+            assert!(
+                v.get(k).is_none(),
+                "{k} 为空时不该出现在 JSON 里，否则前端会以为它一定是数组"
+            );
+        }
+        // 这两个即使取默认值也必须在，界面上「对话上下文 0 条」要能显示出来。
+        assert!(v.get("messages").is_some());
+        assert!(v.get("stream").is_some());
+    }
+
     #[test]
     fn protocol_json_name_matches_frontend_contract() {
         // JSON 名字必须与 `as_str()`、DB 里的 protocol_in / protocol_out / channel_kind 列、

@@ -68,6 +68,7 @@
 | `oai_responses/` | OpenAI Responses，同结构（`mod.rs` 内含 request+response） |
 | `shared/tokens.rs` | 无上游 usage 时的本地 token 估算（按 CJK / 拉丁字符分档） |
 | `shared/tools.rs` | 工具调用的跨协议处理（分片 JSON 累积、结果拍平） |
+| `inspect.rs` | 把**捕获的报文**解成 IR，供监控页做语义化展示。解四个方向（入站在此协议、出站协议各一份请求与响应），流式响应从 `captures.response_content` 还原。解码失败只填 `error`，不抛错 |
 
 **关键约定**：`UnifiedUsage.input_tokens` 是**不含缓存的 fresh 输入**。
 Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prompt_tokens` **含**
@@ -79,6 +80,11 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 **未建模字段进 `extra`**（`IndexMap`，保序）原样透传。把字段列进每个 codec 的
 `KNOWN_TOP_LEVEL` 等于承诺「编码时会写回去」，漏写就是静默丢数据 —— 加字段时注意。
+
+**空集合字段会整个消失**：`UnifiedRequest` 的 `system` / `tools` / `stop` 带
+`skip_serializing_if`，为空时 JSON 里没有这个键（不是空数组）。前端若当成必有数组去
+`.map()`，会在"这次请求没带工具"这种最常见的场景下崩掉。
+→ 有测试守着：`dto.rs::empty_collections_are_omitted_from_the_wire_format`。
 
 ---
 
@@ -212,7 +218,7 @@ quota           += tool_call_surcharge × 工具调用次数
 | `providers.rs` | 渠道 CRUD、模型映射、**`channels_for_model`**（故障转移的候选来源）、`has_declared_models`（接管前置条件） |
 | `routing.rs` | 路由规则 / selector / 兜底配置的读写；`ensure_default_selector` |
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
-| `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站）；`query`（动态过滤）、`get_detail`、`clear_all`、`prune_captures` / `prune_logs` |
+| `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站）；`query`（动态过滤）、`get_detail`、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧 |
 | `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` |
 
 **迁移规则**：`MIGRATIONS` 数组**只追加，不修改已发布的条目**。
@@ -319,7 +325,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明）、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
-| `src/components/traffic/` | 请求详情对话框：按方向分 5 个 tab（客户端→Apilot / Apilot→上游 / 上游→Apilot / Apilot→客户端 / 流式文本） |
+| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应」两段，内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
 只会在运行时静默失败。

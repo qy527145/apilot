@@ -60,6 +60,7 @@ cargo build
 | **加一种路由动作** | `routing/rule.rs::RouteAction`（注意 `is_final` 的归类）→ `routing/engine.rs::route` 的 match → 前端 `ruleSummary.ts` |
 | **加一个 Tauri 命令** | 在 `commands/<域>.rs` 写 → `lib.rs` 的 `generate_handler!` 用**完整路径**（不能 re-export）→ 前端 `src/lib/api.ts` |
 | **改缓存策略** | `cache/policy.rs::is_cacheable` + `cache/key.rs`（键必须覆盖所有影响输出的因素） |
+| **改监控详情的可视化** | `protocol/inspect.rs`（把捕获报文解成 IR，只解码不搬运）+ `src/components/traffic/InspectViews.tsx`（渲染 IR）。**不要新建视图模型** —— IR 已经协议无关且字段齐备 |
 | **改 SSE 处理** | `gateway/sse.rs`（原语）→ `gateway/stream.rs`（转发管线） |
 | **加数据库表/字段** | `storage/migrations.rs` **追加**一条迁移（不要改已发布的），同步 `docs/CODE_MAP.md` |
 | **改前端页面** | `src/pages/<Name>Page.tsx` + `src/lib/api.ts` 的类型与封装 |

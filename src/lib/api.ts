@@ -295,6 +295,131 @@ export interface ClearResult {
   captures: number;
 }
 
+/* ------------------------ 请求 / 响应的语义化视图 ------------------------ */
+
+/**
+ * 协议无关的 IR。与后端 `protocol/dto.rs` 的 serde 形状一一对应。
+ *
+ * 三个协议（含跨协议转换后的报文）解码后都落到这套结构上，所以下面这些组件
+ * 只需要写一份渲染逻辑。
+ */
+export type Role = "system" | "user" | "assistant" | "tool";
+
+export type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; media_type: string; data: string }
+  | { type: "tool_use"; id: string; name: string; input: unknown }
+  | {
+      type: "tool_result";
+      tool_use_id: string;
+      content: ContentBlock[];
+      is_error: boolean;
+    }
+  | { type: "thinking"; text: string; signature?: string | null }
+  | { type: "redacted_thinking"; data: string };
+
+export interface UnifiedMessage {
+  role: Role;
+  content: ContentBlock[];
+}
+
+export interface ToolDef {
+  name: string;
+  description?: string | null;
+  /** 统一成 JSON Schema；OpenAI 与 Anthropic 的表述差异由后端抹平。 */
+  input_schema: unknown;
+}
+
+export type ToolChoice =
+  | { type: "auto" }
+  | { type: "none" }
+  | { type: "required" }
+  | { type: "tool"; name: string };
+
+export type FinishReason =
+  | { type: "stop" }
+  | { type: "length" }
+  | { type: "tool_use" }
+  | { type: "content_filter" }
+  | { type: "other"; value: string };
+
+export interface UnifiedRequest {
+  model: string;
+  stream: boolean;
+  /**
+   * Anthropic 放在顶层、OpenAI 放在 messages 里；IR 统一为顶层。
+   *
+   * ⚠️ 后端对这几个空的集合用了 `skip_serializing_if`，**空时字段会整个消失**，
+   * 不是空数组。所以这里是可选的，用的时候必须 `?? []`。
+   */
+  system?: ContentBlock[];
+  messages: UnifiedMessage[];
+  tools?: ToolDef[];
+  tool_choice?: ToolChoice | null;
+  temperature?: number | null;
+  top_p?: number | null;
+  max_tokens?: number | null;
+  stop?: string[];
+  reasoning?: {
+    enabled: boolean;
+    budget_tokens?: number | null;
+    effort?: string | null;
+  } | null;
+  /** 协议原生但未建模的字段，原样带过来。 */
+  [extra: string]: unknown;
+}
+
+export interface UnifiedResponse {
+  id: string;
+  model: string;
+  content: ContentBlock[];
+  finish_reason: FinishReason;
+}
+
+export interface UnifiedUsage {
+  /** **不含缓存的** fresh 输入。各协议已折算到这个口径。 */
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  source: "upstream" | "local_estimate";
+}
+
+export interface DecodedRequest {
+  protocol: string;
+  value?: UnifiedRequest | null;
+  /** 解不出来时的原因，直接展示；界面据此退回原始视图。 */
+  error?: string | null;
+}
+
+export interface DecodedResponse {
+  protocol: string;
+  value?: UnifiedResponse | null;
+  usage?: UnifiedUsage | null;
+  error?: string | null;
+}
+
+/**
+ * 一次请求在四个方向上的语义化视图。
+ *
+ * `value` 为 null 表示该方向没有捕获或解不出来（看 `error`）；
+ * 整个字段为 null 表示压根没有这一侧的报文。
+ */
+export interface DetailViews {
+  /** 客户端 → Apilot */
+  inbound_request?: DecodedRequest | null;
+  /** Apilot → 上游（转换过的报文在这一份里才是真实形态） */
+  upstream_request?: DecodedRequest | null;
+  /** 上游 → Apilot */
+  upstream_response?: DecodedResponse | null;
+  /** Apilot → 客户端 */
+  client_response?: DecodedResponse | null;
+  /** 流式响应：由增量重建，是流式请求唯一能看到思考与工具调用的地方 */
+  streamed_response?: DecodedResponse | null;
+}
+
 export interface RequestDetail extends RequestLog {
   /* --- 入站：客户端 → Apilot --- */
   method: string;
@@ -312,6 +437,16 @@ export interface RequestDetail extends RequestLog {
   response_body?: string | null;
   stream_text?: string | null;
   stream_events: number;
+  /** 流式响应的结构化内容（IR 的 JSON 文本）。 */
+  response_content?: string | null;
+  /** 上游原始 SSE 帧。 */
+  upstream_stream_raw?: string | null;
+  /** 重编码后发给客户端的原始 SSE 帧；直通时为 null（与上游那份相同）。 */
+  client_stream_raw?: string | null;
+  /** 原始 SSE 帧是否因超过上限被截断。 */
+  stream_raw_truncated: boolean;
+
+  views: DetailViews;
 }
 
 /* --------------------------- 客户端接管 --------------------------- */

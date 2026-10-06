@@ -1,8 +1,9 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, Copy, Loader2 } from "lucide-react";
-import { useState } from "react";
 import { toast } from "sonner";
 
+import { ResponseView, RequestView } from "@/components/traffic/InspectViews";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,8 +15,18 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { qk } from "@/hooks/queries";
-import { api, PROTOCOL_LABEL, type Protocol, type RequestDetail } from "@/lib/api";
 import {
+  api,
+  PROTOCOL_LABEL,
+  type DecodedResponse,
+  type Protocol,
+  type RequestDetail,
+  type UnifiedRequest,
+  type UnifiedResponse,
+  type UnifiedUsage,
+} from "@/lib/api";
+import {
+  cn,
   formatMs,
   formatNumber,
   formatTime,
@@ -28,10 +39,11 @@ interface Props {
   onOpenChange: (open: boolean) => void;
 }
 
+/** 三种查看方式。表达的是"我在核对报文"还是"我在看语义"，与具体是哪一段无关。 */
+type ViewMode = "visual" | "formatted" | "raw";
+
 export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
-  // 原始 / 格式化是全局的：在「Apilot → 上游」切成原始后翻到别的 tab，
-  // 期望的还是原始 —— 这个模式表达的是"我正在核对报文"，与看哪一段无关。
-  const [rawMode, setRawMode] = useState(false);
+  const [view, setView] = useState<ViewMode>("visual");
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: qk.requestDetail(requestId ?? ""),
@@ -43,12 +55,10 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
   return (
     <Dialog open={!!requestId} onOpenChange={onOpenChange}>
       {/*
-       * 弹窗必须有高度上限并把正文做成可滚动区。之前没有上限，
-       * 徽章 + 指标网格 + 若干 tab 一叠就超出视口，底部内容被裁掉且无法滚动。
-       * `min-h-0` 是关键：flex 子项默认 min-height:auto，不加就不会收缩，
-       * 滚动条也不会出现。
+       * 弹窗必须有高度上限并把正文做成可滚动区。`min-h-0` 是关键：
+       * flex 子项默认 min-height:auto，不加就不会收缩，滚动条也不会出现。
        */}
-      <DialogContent className="flex max-h-[85vh] flex-col gap-4 overflow-hidden sm:max-w-5xl">
+      <DialogContent className="flex max-h-[88vh] flex-col gap-4 overflow-hidden sm:max-w-5xl">
         <DialogHeader className="shrink-0">
           <DialogTitle>请求详情</DialogTitle>
           <DialogDescription className="font-mono text-xs">
@@ -79,88 +89,382 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
               </div>
             )}
 
-            <Tabs defaultValue="inbound">
-              <TabsList className="flex-wrap">
-                <TabsTrigger value="inbound">① 客户端 → Apilot</TabsTrigger>
-                <TabsTrigger value="outbound">② Apilot → 上游</TabsTrigger>
-                <TabsTrigger value="upstream-response">③ 上游 → Apilot</TabsTrigger>
-                <TabsTrigger value="client-response">④ Apilot → 客户端</TabsTrigger>
-                <TabsTrigger value="stream">流式文本</TabsTrigger>
-              </TabsList>
+            <Tabs defaultValue="request">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <TabsList>
+                  <TabsTrigger value="request">请求</TabsTrigger>
+                  <TabsTrigger value="response">响应</TabsTrigger>
+                </TabsList>
+                <ViewToggle value={view} onChange={setView} />
+              </div>
 
-              <TabsContent value="inbound">
-                <Exchange
-                  headline={`${data.method || "POST"} ${data.path || "—"}`}
-                  note="客户端原样发来的请求。协议与「协议(入)」一致。"
-                  headers={data.request_headers}
-                  body={data.request_body}
-                  emptyBody="未捕获请求体"
-                  rawMode={rawMode}
-                  onRawModeChange={setRawMode}
+              <TabsContent value="request">
+                <DirectionPane
+                  view={view}
+                  directions={[
+                    {
+                      key: "inbound",
+                      label: "客户端 → Apilot",
+                      headline: `${data.method || "POST"} ${data.path || "—"}`,
+                      protocol: data.protocol_in,
+                      headers: data.request_headers,
+                      formatted: data.request_body,
+                      raw: data.request_body,
+                      error: data.views.inbound_request?.error,
+                      decoded: data.views.inbound_request?.value,
+                      kind: "request",
+                    },
+                    {
+                      key: "upstream",
+                      label: "Apilot → 上游",
+                      headline: data.upstream_url ?? "未请求上游",
+                      protocol: data.protocol_out,
+                      headers: data.upstream_headers,
+                      formatted: data.upstream_body,
+                      raw: data.upstream_body,
+                      error: data.views.upstream_request?.error,
+                      decoded: data.views.upstream_request?.value,
+                      kind: "request",
+                    },
+                  ]}
+                  unavailable="这次没有请求上游，没有出站报文"
                 />
               </TabsContent>
 
-              <TabsContent value="outbound">
-                <Exchange
-                  headline={data.upstream_url ?? "未请求上游"}
-                  note={
-                    data.upstream_url
-                      ? `Apilot 实际发出的请求。协议 ${
-                          PROTOCOL_LABEL[data.protocol_out as Protocol] ??
-                          data.protocol_out
-                        }，模型 ${
-                          data.upstream_model ?? data.model
-                        }。鉴权头已隐去。`
-                      : data.cache_hit
-                        ? "缓存命中，这次没有请求上游。"
-                        : "这次请求没有走到上游。"
-                  }
-                  headers={data.upstream_headers}
-                  body={data.upstream_body}
-                  emptyBody={
-                    data.upstream_url ? "未捕获请求体" : "没有发往上游的请求"
-                  }
-                  rawMode={rawMode}
-                  onRawModeChange={setRawMode}
+              <TabsContent value="response">
+                <DirectionPane
+                  view={view}
+                  directions={[
+                    {
+                      key: "client",
+                      label: "Apilot → 客户端",
+                      headline: `HTTP ${data.status_code}`,
+                      protocol: data.protocol_in,
+                      headers: data.response_headers,
+                      formatted: data.response_body,
+                      raw: data.client_stream_raw ?? data.stream_text,
+                      rawNote: data.is_stream
+                        ? data.client_stream_raw
+                          ? "上游 SSE 帧的重编码结果"
+                          : "直通，与上游帧相同；这里显示拼接后的文本"
+                        : undefined,
+                      error: data.views.client_response?.error,
+                      decoded: data.views.client_response?.value,
+                      usage: data.views.client_response?.usage,
+                      streamed: data.views.streamed_response,
+                      kind: "response",
+                    },
+                    {
+                      key: "upstream",
+                      label: "上游 → Apilot",
+                      headline:
+                        data.upstream_status != null
+                          ? `HTTP ${data.upstream_status}`
+                          : "未请求上游",
+                      protocol: data.protocol_out,
+                      headers: data.upstream_response_headers,
+                      formatted: data.upstream_response_body,
+                      raw: data.upstream_stream_raw,
+                      rawNote: data.is_stream
+                        ? "上游发出的原始 SSE 帧"
+                        : undefined,
+                      error: data.views.upstream_response?.error,
+                      decoded: data.views.upstream_response?.value,
+                      usage: data.views.upstream_response?.usage,
+                      streamed: data.views.streamed_response,
+                      kind: "response",
+                    },
+                  ]}
+                  unavailable="这次没有请求上游，没有上游响应"
                 />
-              </TabsContent>
-
-              <TabsContent value="upstream-response">
-                <Exchange
-                  headline={
-                    data.upstream_status != null
-                      ? `HTTP ${data.upstream_status}`
-                      : "未请求上游"
-                  }
-                  note="上游返回的原始响应。与我们返回给客户端的那份可能不同：跨协议转换时两份内容并不一样，排查上游报错看这一份。"
-                  headers={data.upstream_response_headers}
-                  body={data.upstream_response_body}
-                  emptyBody="未捕获上游响应体（流式响应不缓冲原文，见「流式文本」）"
-                  rawMode={rawMode}
-                  onRawModeChange={setRawMode}
-                />
-              </TabsContent>
-
-              <TabsContent value="client-response">
-                <Exchange
-                  headline={`HTTP ${data.status_code}`}
-                  note="Apilot 最终返回给客户端的内容。同协议直通时与上游响应的正文一致。"
-                  headers={data.response_headers}
-                  body={data.response_body}
-                  emptyBody="未捕获响应体"
-                  rawMode={rawMode}
-                  onRawModeChange={setRawMode}
-                />
-              </TabsContent>
-
-              <TabsContent value="stream">
-                <BareBlock text={data.stream_text || "（无流式文本）"} />
               </TabsContent>
             </Tabs>
+
+            {data.is_stream && data.stream_raw_truncated && (
+              <p className="text-amber-600 text-xs dark:text-amber-400">
+                原始 SSE 帧超过存储上限，已截断 —— 下面的「原始」不是全部内容。
+              </p>
+            )}
           </div>
         )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** 一个方向的报文：标题 + Headers + 三态视图。 */
+interface Direction {
+  key: string;
+  label: string;
+  headline: string;
+  protocol: string;
+  headers: Record<string, string>;
+  /** 格式化视图的源串 */
+  formatted?: string | null;
+  /** 原始视图的源串 */
+  raw?: string | null;
+  rawNote?: string;
+  error?: string | null;
+  /** 解码出的 IR。请求方向是 UnifiedRequest，响应方向是 UnifiedResponse。 */
+  decoded?: UnifiedRequest | UnifiedResponse | null;
+  usage?: UnifiedUsage | null;
+  /** 流式响应：可视化与用量都取自增量重建的结果 */
+  streamed?: DecodedResponse | null;
+  kind: "request" | "response";
+}
+
+function DirectionPane({
+  directions,
+  view,
+  unavailable,
+}: {
+  directions: Direction[];
+  view: ViewMode;
+  unavailable: string;
+}) {
+  const [activeKey, setActiveKey] = useState(directions[0].key);
+  const active = directions.find((d) => d.key === activeKey) ?? directions[0];
+
+  // 两侧都没有报文时不必让人做无意义的选择。
+  const hasAny = directions.some((d) => d.formatted || d.raw || d.decoded);
+  if (!hasAny) {
+    return (
+      <p className="text-muted-foreground py-6 text-center text-xs">
+        {unavailable}
+      </p>
+    );
+  }
+
+  // 流式响应没有完整响应体，可视化与用量都来自增量重建的那份。
+  const decoded = active.streamed?.value ?? active.decoded;
+  const usage = active.streamed?.usage ?? active.usage;
+  const decodeError = active.streamed?.error ?? active.error;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <DirectionToggle
+          directions={directions}
+          activeKey={active.key}
+          onChange={setActiveKey}
+        />
+        {directions.every((d) => d.protocol === directions[0].protocol) &&
+          directions.length > 1 && (
+            <span className="text-muted-foreground text-[11px]">
+              直通，两侧协议一致
+            </span>
+          )}
+      </div>
+
+      <Headline
+        headline={active.headline}
+        protocol={active.protocol}
+        headers={active.headers}
+        rawMode={view === "raw"}
+      />
+
+      {view === "visual" ? (
+        decoded ? (
+          active.kind === "request" ? (
+            <RequestView req={decoded as UnifiedRequest} />
+          ) : (
+            <ResponseView
+              resp={decoded as UnifiedResponse}
+              usage={usage ?? null}
+            />
+          )
+        ) : (
+          <DecodeFailure error={decodeError} />
+        )
+      ) : (
+        <RawBody
+          text={view === "raw" ? active.raw : active.formatted}
+          rawMode={view === "raw"}
+          note={view === "raw" ? active.rawNote : undefined}
+          empty="未捕获报文（可能是缓存命中、路由未走到上游，或未开启捕获）"
+        />
+      )}
+    </div>
+  );
+}
+
+function DirectionToggle({
+  directions,
+  activeKey,
+  onChange,
+}: {
+  directions: Direction[];
+  activeKey: string;
+  onChange: (k: string) => void;
+}) {
+  const usable = directions.filter((d) => d.formatted || d.raw || d.decoded);
+  if (usable.length <= 1) return null;
+
+  return (
+    <div className="flex items-center gap-1">
+      {usable.map((d) => (
+        <Button
+          key={d.key}
+          variant={d.key === activeKey ? "default" : "outline"}
+          size="sm"
+          className="h-6 px-2 text-[11px]"
+          onClick={() => onChange(d.key)}
+        >
+          {d.label}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
+function ViewToggle({
+  value,
+  onChange,
+}: {
+  value: ViewMode;
+  onChange: (v: ViewMode) => void;
+}) {
+  const modes: Array<[ViewMode, string, string]> = [
+    ["visual", "可视化", "按语义展示：对话、系统提示词、工具、回答、思考、token"],
+    ["formatted", "格式化", "把 JSON 排整齐"],
+    ["raw", "原始", "未经任何加工的报文原文"],
+  ];
+
+  return (
+    <div className="flex items-center gap-1">
+      {modes.map(([key, label, hint]) => (
+        <Button
+          key={key}
+          variant={value === key ? "default" : "outline"}
+          size="sm"
+          className="h-6 px-2 text-[11px]"
+          title={hint}
+          onClick={() => onChange(key)}
+        >
+          {label}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
+function Headline({
+  headline,
+  protocol,
+  headers,
+  rawMode,
+}: {
+  headline: string;
+  protocol: string;
+  headers: Record<string, string>;
+  rawMode: boolean;
+}) {
+  const [showHeaders, setShowHeaders] = useState(false);
+  const count = Object.keys(headers ?? {}).length;
+  const headersText = rawMode
+    ? JSON.stringify(headers ?? {})
+    : JSON.stringify(headers ?? {}, null, 2);
+
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-xs break-all">{headline}</span>
+        <Badge variant="outline" className="font-normal">
+          {PROTOCOL_LABEL[protocol as Protocol] ?? protocol}
+        </Badge>
+        {count > 0 && (
+          <button
+            type="button"
+            className="text-muted-foreground hover:text-foreground text-[11px] underline"
+            onClick={() => setShowHeaders((v) => !v)}
+          >
+            Headers ({count})
+          </button>
+        )}
+      </div>
+      {showHeaders && (
+        <div className="space-y-1">
+          <div className="flex justify-end">
+            <CopyButton text={headersText} />
+          </div>
+          <RawBody text={headersText} rawMode={rawMode} empty="（无）" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 解不出可视化时的说明。不默默留白 —— 用户需要知道为什么，以及还能看什么。 */
+function DecodeFailure({ error }: { error?: string | null }) {
+  return (
+    <div className="bg-muted/30 space-y-1 rounded-md border p-3 text-xs">
+      <p className="font-medium">这份报文没法按语义解析</p>
+      <p className="text-muted-foreground break-words">
+        {error ?? "没有可解析的报文。"}
+      </p>
+      <p className="text-muted-foreground">
+        切到「格式化」或「原始」看原文。常见原因：报文是上游返回的错误体、
+        流被中途截断，或它本来就不是这个协议的格式。
+      </p>
+    </div>
+  );
+}
+
+function RawBody({
+  text,
+  rawMode,
+  note,
+  empty = "未捕获",
+}: {
+  text?: string | null;
+  rawMode: boolean;
+  note?: string;
+  empty?: string;
+}) {
+  if (!text) {
+    return (
+      <p className="text-muted-foreground py-6 text-center text-xs">{empty}</p>
+    );
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-muted-foreground text-[11px] tabular-nums">
+          {formatNumber(text.length)} 字符
+          {note ? `（${note}）` : rawMode ? "（未加工）" : "（已格式化）"}
+        </span>
+        <CopyButton text={text} />
+      </div>
+      {/* 原始模式用 `pre`：不折行、横向滚动，否则分不清哪些空白是报文里真有的。 */}
+      <pre
+        className={cn(
+          "bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs",
+          rawMode ? "whitespace-pre" : "whitespace-pre-wrap",
+        )}
+      >
+        {rawMode ? text : prettyJson(text)}
+      </pre>
+    </div>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className="h-6 px-2 text-[11px]"
+      onClick={() => {
+        navigator.clipboard
+          .writeText(text)
+          .then(() => toast.success("已复制到剪贴板"))
+          .catch(() => toast.error("复制失败，请手动选中复制"));
+      }}
+    >
+      <Copy className="size-3" />
+      复制
+    </Button>
   );
 }
 
@@ -238,68 +542,6 @@ function Metrics({ data }: { data: RequestDetail }) {
   );
 }
 
-/** 一个方向的请求/响应：标题行 + headers + body。 */
-function Exchange({
-  headline,
-  note,
-  headers,
-  body,
-  emptyBody,
-  rawMode,
-  onRawModeChange,
-}: {
-  headline: string;
-  note: string;
-  headers: Record<string, string>;
-  body?: string | null;
-  emptyBody: string;
-  rawMode: boolean;
-  onRawModeChange: (v: boolean) => void;
-}) {
-  const headerCount = Object.keys(headers ?? {}).length;
-  const headersRaw = JSON.stringify(headers ?? {});
-
-  return (
-    <div className="space-y-2">
-      <p className="font-mono text-xs break-all">{headline}</p>
-      <p className="text-muted-foreground text-xs">{note}</p>
-      <Tabs defaultValue="body">
-        <TabsList>
-          <TabsTrigger value="body">Body</TabsTrigger>
-          <TabsTrigger value="headers">
-            Headers{headerCount > 0 ? ` (${headerCount})` : ""}
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="body">
-          <JsonBlock
-            raw={body}
-            empty={emptyBody}
-            rawMode={rawMode}
-            onRawModeChange={onRawModeChange}
-          />
-        </TabsContent>
-        <TabsContent value="headers">
-          <div className="space-y-1.5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="text-muted-foreground text-[11px] tabular-nums">
-                {headerCount} 个字段
-              </span>
-              <div className="flex items-center gap-1">
-                <RawToggle raw={rawMode} onChange={onRawModeChange} />
-                <CopyButton text={headersRaw} />
-              </div>
-            </div>
-            <BareBlock
-              text={rawMode ? headersRaw : JSON.stringify(headers ?? {}, null, 2)}
-              pre={rawMode}
-            />
-          </div>
-        </TabsContent>
-      </Tabs>
-    </div>
-  );
-}
-
 function Field({
   label,
   value,
@@ -322,117 +564,6 @@ function Field({
       >
         {value}
       </span>
-    </div>
-  );
-}
-
-/**
- * 内容块统一用原生滚动而不是 Radix ScrollArea。
- * ScrollArea 的 viewport 需要一个确定高度才能滚动，而这里的高度由 flex 容器
- * 决定 —— 那正是详情弹窗溢出、滚不动的直接原因。
- *
- * `pre` 用于原始报文：保持单行与原有空白，横向滚动，不做任何折行重排
- * —— 折行会让人分不清哪些空白是报文里真有的。
- */
-function BareBlock({ text, pre }: { text: string; pre?: boolean }) {
-  return (
-    <pre
-      className={
-        pre
-          ? "bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre"
-          : "bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre-wrap"
-      }
-    >
-      {text}
-    </pre>
-  );
-}
-
-/** 原始 / 格式化的切换按钮。 */
-function RawToggle({
-  raw,
-  onChange,
-}: {
-  raw: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <div className="flex shrink-0 items-center gap-1">
-      <Button
-        variant={raw ? "default" : "outline"}
-        size="sm"
-        className="h-6 px-2 text-[11px]"
-        onClick={() => onChange(true)}
-      >
-        原始
-      </Button>
-      <Button
-        variant={raw ? "outline" : "default"}
-        size="sm"
-        className="h-6 px-2 text-[11px]"
-        onClick={() => onChange(false)}
-      >
-        格式化
-      </Button>
-    </div>
-  );
-}
-
-function CopyButton({ text }: { text: string }) {
-  return (
-    <Button
-      variant="ghost"
-      size="sm"
-      className="h-6 px-2 text-[11px]"
-      onClick={() => {
-        navigator.clipboard
-          .writeText(text)
-          .then(() => toast.success("已复制到剪贴板"))
-          .catch(() => toast.error("复制失败，请手动选中复制"));
-      }}
-    >
-      <Copy className="size-3" />
-      复制
-    </Button>
-  );
-}
-
-/**
- * 报文正文。默认展示格式化后的 JSON，可切到「原始」看未经任何加工的字符串。
- *
- * 之所以需要这个切换：格式化会重排键序、补缩进，看结构方便；但要核对
- * "客户端到底发了什么"、或者怀疑哪一步改动了报文时，只有原始串说得清。
- */
-function JsonBlock({
-  raw,
-  empty,
-  rawMode,
-  onRawModeChange,
-}: {
-  raw?: string | null;
-  empty: string;
-  rawMode: boolean;
-  onRawModeChange: (v: boolean) => void;
-}) {
-  if (!raw) {
-    return (
-      <p className="text-muted-foreground py-6 text-center text-xs">{empty}</p>
-    );
-  }
-
-  return (
-    <div className="space-y-1.5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-muted-foreground text-[11px] tabular-nums">
-          {raw.length} 字符
-          {rawMode ? "（未加工）" : "（已格式化）"}
-        </span>
-        <div className="flex items-center gap-1">
-          <RawToggle raw={rawMode} onChange={onRawModeChange} />
-          <CopyButton text={raw} />
-        </div>
-      </div>
-      <BareBlock text={rawMode ? raw : prettyJson(raw)} pre={rawMode} />
     </div>
   );
 }
