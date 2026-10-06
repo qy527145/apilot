@@ -102,6 +102,7 @@ pub fn run() {
             // --- 日志 ---
             commands::logs::query_logs,
             commands::logs::get_request_detail,
+            commands::logs::clear_logs,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

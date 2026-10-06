@@ -10,6 +10,7 @@
 ## 目录
 
 - [请求全链路](#请求全链路) — 一次请求经过哪些文件
+- [协议兼容矩阵](PROTOCOL_MATRIX.md) — 什么时候直通、什么时候转换、转换丢什么
 - [后端模块](#后端模块)
   - [protocol — 协议 IR 与编解码](#protocol--协议-ir-与编解码6409-行)
   - [gateway — 反向代理与请求管线](#gateway--反向代理与请求管线3364-行)
@@ -94,8 +95,14 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 **两个关键分支**：
 - `needs_conversion` 为 false 时转发**原始字节**（只旁路统计），避免无谓的字段丢失。
+  是否为 false 由 `Outbound::wire_for(入站协议)` 决定 —— 渠道声明了该协议就直通。
 - 但若响应是从 SSE 还原的（`decoded_from_sse`），即使协议相同也必须重新编码 ——
   原始字节是 SSE 正文，透传会把 `event:` 行喂给要 JSON 的客户端。
+
+**两个方向的追踪**：入站在 `handle` 建 `CaptureRecord`，出站在 `try_outbound` 里
+`prepare()` 之后补 `UpstreamTrace`（URL / headers / body / 上游状态码 / 上游原始响应）。
+流式路径没有 `Recorder::finish`，收尾在 `finalize_stream`，所以入站那份捕获必须
+显式 take 过去合并 —— 直接新建一条空捕获会被 `INSERT OR REPLACE` 覆盖成空值。
 
 **记账收口**：无论成功、失败、流式中断还是客户端断连，都从 `Recorder::finish` / `fail`
 同一条路径写日志与聚合，避免某个分支漏账。
@@ -201,11 +208,11 @@ quota           += tool_call_surcharge × 工具调用次数
 |---|---|
 | `migrations.rs` | **手写 DDL 数组**（不用 sqlx 编译期宏），按 `PRAGMA user_version` 增量执行 |
 | `db.rs` | 连接池 + PRAGMA（WAL / foreign_keys / busy_timeout）；`open_memory()` 供测试 |
-| `models.rs` | `Provider`、`ProviderKind`、`AuthStyle`、`ProviderModel`。**`Provider::auth_header()`** 是鉴权头的唯一构造点 |
+| `models.rs` | `Provider`、`ProviderKind`、`AuthStyle`、`ProviderModel`、`ProtocolEndpoint`。**`Provider::auth_header()`** 是鉴权头的唯一构造点；`wire_for()` 决定直通还是转换，`endpoint` / `endpoint_verbatim` 是出站 URL 的拼接点 |
 | `providers.rs` | 渠道 CRUD、模型映射、**`channels_for_model`**（故障转移的候选来源）、`has_declared_models`（接管前置条件） |
 | `routing.rs` | 路由规则 / selector / 兜底配置的读写；`ensure_default_selector` |
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
-| `logs.rs` | 请求明细 + 捕获原文；`query`（动态过滤）、`get_detail`、`prune_captures` / `prune_logs` |
+| `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站）；`query`（动态过滤）、`get_detail`、`clear_all`、`prune_captures` / `prune_logs` |
 | `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` |
 
 **迁移规则**：`MIGRATIONS` 数组**只追加，不修改已发布的条目**。
@@ -254,7 +261,7 @@ apilot://cache             → CacheStats
 | `billing.rs` | 6 | 单价 CRUD、`billing_summary` / `totals` / `timeseries` |
 | `cache.rs` | 4 | `cache_stats`、`clear_cache`、策略读写 |
 | `takeover.rs` | 6 | `detect_clients`、`takeover_status`、`takeover_readiness`（接管前置条件）、`preview_takeover`、`apply_takeover`、`restore_client` |
-| `logs.rs` | 2 | `query_logs`、`get_request_detail` |
+| `logs.rs` | 3 | `query_logs`、`get_request_detail`、`clear_logs`（只清明细与捕获，不动 `usage_hourly`） |
 
 **命令注册**：全部在 `lib.rs` 的 `generate_handler!` 里，用**完整路径**。
 `#[tauri::command]` 生成的 `__cmd__*` 宏项不参与 re-export，不能用 `pub use` 转发。
@@ -282,16 +289,16 @@ apilot://cache             → CacheStats
 
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
-| `providers` | `tag` 唯一 | 渠道：base_url、鉴权、模型映射、权重、超时 |
+| `providers` | `tag` 唯一 | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、模型映射、权重、超时 |
 | `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃**。`set_models` 会把声明同步派生成 `providers.model_mapping`（见下） |
 | `route_rules` | `id` | 规则链，按 `sort_index` 求值；`items` / `action` 存 JSON |
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |
 | `route_config` | 单行 `id=1` | 兜底 selector |
-| `request_logs` | `request_id` 唯一 | 请求明细：token、quota、耗时、**TTFB**、缓存命中、估算偏差 |
-| `usage_hourly` | `(bucket_ts, client, provider_tag, model)` | 小时聚合，SUM 后 upsert |
+| `request_logs` | `request_id` 唯一 | 请求明细：token、quota、耗时、**TTFB**、缓存命中、估算偏差；以及**方向信息**：入站 `path`、出站 `upstream_url` / `upstream_model` / `upstream_status` |
+| `usage_hourly` | `(bucket_ts, client, provider_tag, model)` | 小时聚合，SUM 后 upsert。**`clear_logs` 不动它** —— 它是计费口径的历史账目 |
 | `model_pricing` | `model` | 单价系数 |
 | `response_cache` | `key`（sha256） | 缓存条目：响应体、usage、原额度、命中数 |
-| `captures` | `request_id` | 请求/响应原文 + 流式拼接文本（**鉴权头已隐去**） |
+| `captures` | `request_id` | **两个方向的原文**：入站（客户端→Apilot）与出站（Apilot→上游，含上游 URL / headers / body 与上游原始响应）+ 流式拼接文本（**鉴权头已隐去**） |
 | `settings_kv` | `key` | 设置、单价兜底倍率、缓存计数器 |
 
 时间约定：`request_logs.ts` 是 **unix 毫秒**；`usage_hourly.bucket_ts` 是**整点 unix 秒**。
@@ -304,15 +311,15 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 | 位置 | 内容 |
 |---|---|
-| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 41 个命令的类型化封装 + 统一错误处理 |
+| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 42 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
 | `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings |
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
-| `src/components/providers/` | 渠道对话框与预设、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
-| `src/components/traffic/` | 请求详情对话框（原始报文、流式文本、Headers） |
+| `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明）、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
+| `src/components/traffic/` | 请求详情对话框：按方向分 5 个 tab（客户端→Apilot / Apilot→上游 / 上游→Apilot / Apilot→客户端 / 流式文本） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
 只会在运行时静默失败。

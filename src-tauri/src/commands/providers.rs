@@ -417,6 +417,7 @@ mod tests {
             base_url: "https://api.moonshot.cn/v1".into(),
             api_key: None,
             auth_style: AuthStyle::Bearer,
+            protocols: Vec::new(),
             extra_headers: Default::default(),
             param_override: None,
             model_mapping: Default::default(),

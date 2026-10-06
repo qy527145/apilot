@@ -73,18 +73,29 @@ pub trait Outbound: Send + Sync {
     /// 路由与 selector 引用的标识。
     fn tag(&self) -> &str;
 
-    /// 该渠道说哪种线协议。
+    /// 该渠道的**首选**线协议。探测、拉模型列表，以及入站协议不被支持时的
+    /// 转换目标，都用它。真正发请求时用 [`Outbound::wire_for`]。
     fn wire(&self) -> Protocol;
+
+    /// 针对入站协议，实际该用哪种线协议。
+    ///
+    /// 能同协议就同协议 —— 此时管线走直通（原始字节转发），零转换；
+    /// 对不上才回落到首选协议，由管线做跨协议转换。
+    fn wire_for(&self, incoming: Protocol) -> Protocol;
+
+    /// 该渠道是否原生支持某种协议。
+    fn supports(&self, protocol: Protocol) -> bool;
 
     /// 渠道配置。
     fn provider(&self) -> &Provider;
 
-    /// 组装出站请求：按自身线协议拼 URL、注入鉴权头、应用渠道级 header 覆盖。
+    /// 组装出站请求：按 `wire` 拼 URL、注入鉴权头、应用渠道级 header 覆盖。
     ///
-    /// 出站路径由 `wire()` 决定，与入站路径无关 —— 入站是 Anthropic 协议时，
+    /// 出站路径由 `wire` 决定，与入站路径无关 —— 入站是 Anthropic 协议时，
     /// 发往 OpenAI 渠道就应该走 `/v1/chat/completions`。
     fn prepare(
         &self,
+        wire: Protocol,
         incoming: &http::HeaderMap,
         body: Bytes,
         stream: bool,

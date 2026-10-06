@@ -57,7 +57,7 @@ impl Channel {
         Self { provider, client }
     }
 
-    /// 该渠道的线协议。
+    /// 该渠道的首选线协议。
     pub fn wire_protocol(&self) -> Protocol {
         self.provider.kind.wire_protocol()
     }
@@ -108,17 +108,30 @@ impl Outbound for Channel {
         self.wire_protocol()
     }
 
+    fn wire_for(&self, incoming: Protocol) -> Protocol {
+        self.provider.wire_for(incoming)
+    }
+
+    fn supports(&self, protocol: Protocol) -> bool {
+        self.provider.supports(protocol)
+    }
+
     fn provider(&self) -> &Provider {
         &self.provider
     }
 
     fn prepare(
         &self,
+        wire: Protocol,
         incoming: &http::HeaderMap,
         body: Bytes,
         stream: bool,
     ) -> Result<PreparedRequest, UpstreamError> {
-        let url = self.provider.endpoint(self.wire().default_path());
+        // 调用方理应先用 `wire_for` 挑好协议，但 prepare 是 trait 上的公开方法，
+        // 不能假设。这里再归一一次：否则传一个渠道不支持的协议进来，会拼出一个
+        // 渠道根本没提供的路径（比如给纯 Chat 渠道拼出 /v1/messages）。
+        let wire = self.provider.wire_for(wire);
+        let url = self.provider.endpoint_for(wire);
         let mut headers = forwardable_headers(incoming);
 
         // 注入该渠道的鉴权头。
@@ -223,7 +236,7 @@ fn classify_reqwest_error(e: &reqwest::Error) -> UpstreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::models::{AuthStyle, ProviderKind};
+    use crate::storage::models::{AuthStyle, ProtocolEndpoint, ProviderKind};
     use indexmap::IndexMap;
 
     fn provider(kind: ProviderKind, auth: AuthStyle) -> Provider {
@@ -235,6 +248,7 @@ mod tests {
             base_url: "https://api.example.com".into(),
             api_key: Some("secret-key".into()),
             auth_style: auth,
+            protocols: Vec::new(),
             extra_headers: IndexMap::new(),
             param_override: None,
             model_mapping: IndexMap::new(),
@@ -254,7 +268,7 @@ mod tests {
     #[test]
     fn bearer_auth_sets_authorization_header() {
         let c = channel(ProviderKind::OpenAiChat, AuthStyle::Bearer);
-        let req = c.prepare(&http::HeaderMap::new(), Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &http::HeaderMap::new(), Bytes::new(), false).unwrap();
         assert_eq!(
             req.headers.get("authorization").unwrap(),
             "Bearer secret-key"
@@ -265,7 +279,7 @@ mod tests {
     #[test]
     fn x_api_key_auth_sets_x_api_key_header() {
         let c = channel(ProviderKind::Anthropic, AuthStyle::XApiKey);
-        let req = c.prepare(&http::HeaderMap::new(), Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &http::HeaderMap::new(), Bytes::new(), false).unwrap();
         assert_eq!(req.headers.get("x-api-key").unwrap(), "secret-key");
         assert!(req.headers.get("authorization").is_none());
     }
@@ -281,7 +295,7 @@ mod tests {
         );
         incoming.insert("x-api-key", HeaderValue::from_static("client-key"));
 
-        let req = c.prepare(&incoming, Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &incoming, Bytes::new(), false).unwrap();
         assert_eq!(req.headers.get("x-api-key").unwrap(), "secret-key");
         assert!(req.headers.get("authorization").is_none());
     }
@@ -295,7 +309,7 @@ mod tests {
         incoming.insert("accept-encoding", HeaderValue::from_static("gzip"));
         incoming.insert("host", HeaderValue::from_static("localhost:8787"));
 
-        let req = c.prepare(&incoming, Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &incoming, Bytes::new(), false).unwrap();
         assert!(req.headers.get("connection").is_none());
         assert!(req.headers.get("transfer-encoding").is_none());
         assert!(req.headers.get("accept-encoding").is_none());
@@ -310,7 +324,7 @@ mod tests {
         incoming.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         incoming.insert("anthropic-beta", HeaderValue::from_static("prompt-caching"));
 
-        let req = c.prepare(&incoming, Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &incoming, Bytes::new(), false).unwrap();
         assert_eq!(req.headers.get("content-type").unwrap(), "application/json");
         // Anthropic 要求带版本头，丢了会 400
         assert_eq!(req.headers.get("anthropic-version").unwrap(), "2023-06-01");
@@ -324,7 +338,7 @@ mod tests {
             .insert("x-api-key".into(), "override-key".into());
         let c = Channel::new(p, reqwest::Client::new());
 
-        let req = c.prepare(&http::HeaderMap::new(), Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &http::HeaderMap::new(), Bytes::new(), false).unwrap();
         assert_eq!(req.headers.get("x-api-key").unwrap(), "override-key");
     }
 
@@ -332,16 +346,82 @@ mod tests {
     fn url_follows_own_wire_protocol_not_incoming_path() {
         // 入站是 Anthropic 的 /v1/messages，但渠道是 OpenAI，就该发到 chat/completions
         let c = channel(ProviderKind::OpenAiChat, AuthStyle::Bearer);
-        let req = c.prepare(&http::HeaderMap::new(), Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &http::HeaderMap::new(), Bytes::new(), false).unwrap();
         assert_eq!(req.url, "https://api.example.com/v1/chat/completions");
 
         let c = channel(ProviderKind::Anthropic, AuthStyle::XApiKey);
-        let req = c.prepare(&http::HeaderMap::new(), Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &http::HeaderMap::new(), Bytes::new(), false).unwrap();
         assert_eq!(req.url, "https://api.example.com/v1/messages");
 
         let c = channel(ProviderKind::OpenAiResponses, AuthStyle::Bearer);
-        let req = c.prepare(&http::HeaderMap::new(), Bytes::new(), false).unwrap();
+        let req = c.prepare(c.wire(), &http::HeaderMap::new(), Bytes::new(), false).unwrap();
         assert_eq!(req.url, "https://api.example.com/v1/responses");
+    }
+
+    /// 造一个"同时支持 Anthropic 与 Chat 两种协议"的渠道。
+    fn dual_protocol_channel() -> Channel {
+        let mut p = provider(ProviderKind::Anthropic, AuthStyle::XApiKey);
+        p.protocols = vec![
+            ProtocolEndpoint::plain(Protocol::AnthropicMessages),
+            ProtocolEndpoint::plain(Protocol::OpenAiChat),
+        ];
+        Channel::new(p, reqwest::Client::new())
+    }
+
+    #[test]
+    fn channel_speaks_the_incoming_protocol_when_it_supports_it() {
+        // 客户端说 Anthropic，渠道也支持 Anthropic —— 就该发 /v1/messages，
+        // 让管线走直通。这是"优先同协议"的核心：省一次编解码，也不丢字段。
+        let c = dual_protocol_channel();
+        assert_eq!(c.wire_for(Protocol::AnthropicMessages), Protocol::AnthropicMessages);
+        assert!(c.supports(Protocol::AnthropicMessages));
+        assert!(c.supports(Protocol::OpenAiChat));
+
+        let req = c
+            .prepare(Protocol::AnthropicMessages, &http::HeaderMap::new(), Bytes::new(), false)
+            .unwrap();
+        assert_eq!(req.url, "https://api.example.com/v1/messages");
+    }
+
+    #[test]
+    fn channel_falls_back_to_preferred_protocol_when_unsupported() {
+        // 声明里没有 Responses，才轮到转换 —— 目标是首选协议（Anthropic）。
+        let c = dual_protocol_channel();
+        assert!(!c.supports(Protocol::OpenAiResponses));
+        assert_eq!(c.wire_for(Protocol::OpenAiResponses), Protocol::AnthropicMessages);
+
+        // 转换时发往首选协议的路径。`prepare` 会自己把协议归一，
+        // 所以即使这里传的是不被支持的 Responses，也不会拼出一个假的 /v1/responses。
+        let req = c
+            .prepare(Protocol::OpenAiResponses, &http::HeaderMap::new(), Bytes::new(), false)
+            .unwrap();
+        assert_eq!(req.url, "https://api.example.com/v1/messages");
+    }
+
+    #[test]
+    fn single_protocol_channel_behaves_exactly_as_before() {
+        // 没声明过协议的渠道（老数据、预设）永远只有 kind 那一种，
+        // 任何入站协议都走它 —— 行为与引入 protocols 之前完全一致。
+        let c = channel(ProviderKind::OpenAiChat, AuthStyle::Bearer);
+        assert_eq!(c.wire_for(Protocol::AnthropicMessages), Protocol::OpenAiChat);
+        assert_eq!(c.wire_for(Protocol::OpenAiChat), Protocol::OpenAiChat);
+        assert!(!c.supports(Protocol::AnthropicMessages));
+    }
+
+    #[test]
+    fn per_protocol_path_override_is_used() {
+        // 服务商把接口挂在子路径下时，靠这个覆盖避免拼错 → 404。
+        let mut p = provider(ProviderKind::OpenAiChat, AuthStyle::Bearer);
+        p.protocols = vec![ProtocolEndpoint {
+            protocol: Protocol::OpenAiChat,
+            path: Some("/api/v2/chat".into()),
+        }];
+        let c = Channel::new(p, reqwest::Client::new());
+
+        let req = c
+            .prepare(Protocol::OpenAiChat, &http::HeaderMap::new(), Bytes::new(), false)
+            .unwrap();
+        assert_eq!(req.url, "https://api.example.com/api/v2/chat");
     }
 
     #[test]
@@ -350,7 +430,7 @@ mod tests {
         p.extra_headers
             .insert("bad header name".into(), "v".into());
         let c = Channel::new(p, reqwest::Client::new());
-        assert!(c.prepare(&http::HeaderMap::new(), Bytes::new(), false).is_err());
+        assert!(c.prepare(c.wire(), &http::HeaderMap::new(), Bytes::new(), false).is_err());
     }
 
     #[test]

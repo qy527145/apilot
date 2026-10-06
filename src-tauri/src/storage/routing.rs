@@ -380,6 +380,7 @@ mod tests {
             base_url: "https://x".into(),
             api_key: None,
             auth_style: AuthStyle::XApiKey,
+            protocols: Vec::new(),
             extra_headers: IndexMap::new(),
             param_override: None,
             model_mapping: IndexMap::new(),

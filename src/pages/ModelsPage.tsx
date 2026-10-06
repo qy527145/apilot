@@ -10,25 +10,26 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { qk } from "@/hooks/queries";
-import { api, type ProviderKind } from "@/lib/api";
-
-const KIND_LABEL: Record<ProviderKind, string> = {
-  anthropic: "Anthropic",
-  openai_chat: "OpenAI Chat",
-  openai_responses: "OpenAI Responses",
-};
+import {
+  ALL_PROTOCOLS,
+  api,
+  PROTOCOL_LABEL,
+  type Protocol,
+  type Provider,
+} from "@/lib/api";
 
 /**
- * 该渠道的线协议 → 其余两种协议的名字。
+ * 该渠道能**直通**的协议集合。
  *
- * 一个渠道只有一个线协议，但**三种客户端协议都能访问它**：原生那种走直通，
- * 另外两种由 Apilot 转换。所以这里要显示的是"哪种协议不用转换"。
+ * 库里存空数组表示"只支持 kind 那一种" —— 老数据与预设的语义，
+ * 必须照后端 `Provider::endpoints()` 还原。
  */
-const OTHER_PROTOCOLS: Record<ProviderKind, string[]> = {
-  anthropic: ["OpenAI Chat", "OpenAI Responses"],
-  openai_chat: ["Anthropic", "OpenAI Responses"],
-  openai_responses: ["Anthropic", "OpenAI Chat"],
-};
+const directProtocols = (p: Provider): Protocol[] =>
+  p.protocols?.length ? p.protocols.map((e) => e.protocol) : [p.kind];
+
+/** 三种协议里，这个渠道不直通（需要 Apilot 转换）的那些。 */
+const convertedProtocols = (p: Provider): Protocol[] =>
+  ALL_PROTOCOLS.filter((proto) => !directProtocols(p).includes(proto));
 
 export default function ModelsPage({
   onNavigate,
@@ -115,7 +116,9 @@ export default function ModelsPage({
                     <code className="text-muted-foreground text-xs">
                       {p.tag}
                     </code>
-                    <Badge variant="outline">{KIND_LABEL[p.kind]}</Badge>
+                    <Badge variant="outline">
+                      首选 {PROTOCOL_LABEL[p.kind]}
+                    </Badge>
                     <Badge variant={p.enabled ? "success" : "secondary"}>
                       {p.enabled ? "启用" : "停用"}
                     </Badge>
@@ -129,15 +132,25 @@ export default function ModelsPage({
                     )}
                   </div>
 
-                  <p className="text-muted-foreground text-xs">
+                  <p className="text-muted-foreground flex flex-wrap items-center gap-1.5 text-xs">
                     <Badge
                       variant="success"
-                      className="mr-1.5 align-middle font-normal"
+                      className="font-normal"
                     >
-                      {KIND_LABEL[p.kind]} 直通
+                      直通
                     </Badge>
-                    原样转发，不重编码；{OTHER_PROTOCOLS[p.kind].join(" / ")}{" "}
-                    请求时由 Apilot 转换。
+                    {directProtocols(p)
+                      .map((proto) => PROTOCOL_LABEL[proto])
+                      .join(" / ")}
+                    <span className="text-border">|</span>
+                    <Badge variant="secondary" className="font-normal">
+                      转换
+                    </Badge>
+                    {convertedProtocols(p).length > 0
+                      ? `${convertedProtocols(p)
+                          .map((proto) => PROTOCOL_LABEL[proto])
+                          .join(" / ")} 请求时由 Apilot 转换`
+                      : "该渠道已声明全部三种协议，任何客户端协议都不需要转换"}
                   </p>
                 </CardHeader>
 

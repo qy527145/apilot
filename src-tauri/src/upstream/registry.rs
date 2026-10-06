@@ -98,6 +98,7 @@ mod tests {
             base_url: "https://x.example.com".into(),
             api_key: Some("k".into()),
             auth_style: AuthStyle::XApiKey,
+            protocols: Vec::new(),
             extra_headers: IndexMap::new(),
             param_override: None,
             model_mapping: IndexMap::new(),

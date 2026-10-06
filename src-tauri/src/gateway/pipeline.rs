@@ -193,6 +193,7 @@ pub async fn handle(
             protocol_out: protocol.as_str().to_string(),
             model: req.model.clone(),
             request_model: req.model.clone(),
+            path: path.clone(),
             is_stream: req.stream,
             latency_ms: 0,
             ..Default::default()
@@ -277,7 +278,7 @@ pub async fn handle(
     }
 
     // ---- 5. 出站 ----
-    let candidates = build_candidates(&shell, &primary, &upstream_model).await;
+    let candidates = build_candidates(&shell, &primary, &upstream_model, protocol).await;
 
     let mut last_error: Option<UpstreamError> = None;
 
@@ -333,6 +334,7 @@ async fn build_candidates(
     shell: &Arc<AppShell>,
     primary: &Arc<dyn Outbound>,
     model: &str,
+    protocol_in: Protocol,
 ) -> Vec<Arc<dyn Outbound>> {
     let mut out = vec![primary.clone()];
 
@@ -348,7 +350,24 @@ async fn build_candidates(
         }
     }
 
+    prefer_native_protocol(&mut out, primary, protocol_in);
     out
+}
+
+/// 把候选渠道按「能原生说客户端协议」重排：能直通的不转换。
+///
+/// `sort_by_key` 是稳定排序，同一组内部保持调用方排好的 priority / weight 顺序
+/// —— 只在"协议匹配与否"这一维上重新分组，不推翻用户的优先级配置。
+///
+/// 首选渠道不参与排序：它是 selector 选出来的，位置由用户的路由规则决定，
+/// 不能因为我们更想用别的协议就把它顶掉。
+fn prefer_native_protocol(
+    candidates: &mut [Arc<dyn Outbound>],
+    primary: &Arc<dyn Outbound>,
+    protocol_in: Protocol,
+) {
+    let primary_tag = primary.tag();
+    candidates.sort_by_key(|o| o.tag() != primary_tag && !o.supports(protocol_in));
 }
 
 /// 针对单个渠道执行一次完整请求。
@@ -366,13 +385,15 @@ async fn try_outbound(
     cache_key: Option<String>,
     started: Instant,
 ) -> Result<Response, UpstreamError> {
-    let wire = outbound.wire();
+    // 渠道声明支持入站协议就直接说那种协议（直通），不支持才回落到首选协议做转换。
+    let wire = outbound.wire_for(protocol_in);
     recorder.record.protocol_out = wire.as_str().to_string();
     recorder.record.provider_tag = Some(outbound.tag().to_string());
     recorder.record.channel_kind = Some(outbound.provider().kind.as_str().to_string());
 
     // 渠道级模型映射：入站模型名 → 上游真实模型名。
     let mapped_model = outbound.provider().upstream_model(upstream_model).to_string();
+    recorder.record.upstream_model = Some(mapped_model.clone());
 
     let needs_conversion = protocol_in != wire;
 
@@ -399,10 +420,28 @@ async fn try_outbound(
         patch_model_field(raw_body, &mapped_model)
     };
 
-    let prepared = outbound.prepare(headers, out_body.clone(), req.stream)?;
+    let prepared = outbound.prepare(wire, headers, out_body.clone(), req.stream)?;
+
+    // 记下出站方向。上游报错时（尤其 404）「到底打到了哪个 URL」是唯一能快速
+    // 分辨"base_url 拼错 / 模型名映射错 / 协议选错"的证据，必须在发出去之前就留下。
+    recorder.record.upstream_url = Some(prepared.url.clone());
+    if let Some(c) = recorder.capture.as_mut() {
+        c.upstream.url = prepared.url.clone();
+        // 这里的 headers 含**渠道真实密钥**，headers_to_json 会把鉴权头隐去。
+        c.upstream.headers = headers_to_json(&prepared.headers);
+        c.upstream.body = Some(prepared.body.to_vec());
+    }
 
     let resp = outbound.dial(prepared).await?;
     let status = resp.status;
+
+    // 上游返回的原始状态码单独记：网关可能把它包装成别的码再返回给客户端，
+    // 只留一个数字会让"日志说 404、客户端说 502"这种对不上的情况无从解释。
+    recorder.record.upstream_status = Some(status.as_u16() as i32);
+    if let Some(c) = recorder.capture.as_mut() {
+        c.upstream.status = recorder.record.upstream_status;
+        c.upstream.response_headers = headers_to_json(&resp.headers);
+    }
 
     if !status.is_success() {
         // 非成功状态：把响应体读完，提取错误信息。
@@ -411,6 +450,11 @@ async fn try_outbound(
             UpstreamBody::Stream(_) => Bytes::new(),
         };
         let msg = shell.codecs.codec(wire).extract_error_message(&body);
+        // 上游的错误原文整段留着 —— 服务商通常会在里面写明原因
+        //（"model not found" / "invalid api key"），比我们转述的 msg 有用得多。
+        if let Some(c) = recorder.capture.as_mut() {
+            c.upstream.response_body = Some(body.to_vec());
+        }
         shell.traffic.record_failure();
         recorder.fail(status.as_u16() as i32, &msg);
         return Err(UpstreamError::Status {
@@ -443,41 +487,36 @@ async fn try_outbound(
             idle: std::time::Duration::from_millis(settings.idle_timeout_ms),
         };
 
-        let shell_cb = shell.clone();
-        let request_id = recorder.record.request_id.clone();
-        let client = recorder.record.client.clone();
-        let model = req.model.clone();
-        let provider_tag = outbound.tag().to_string();
-        let channel_kind = Some(outbound.provider().kind.as_str().to_string());
-        let protocol_in = protocol_in;
-        let price = shell.pricing.load().get(&req.model);
-        let tool_calls = count_tool_uses(&req.messages);
-        let started_at = started;
-        let key_for_cache = cache_key.clone();
+        // 流式没有 `Recorder::finish` 这一步，收尾全在 finalize_stream 里做，
+        // 所以把入站捕获和出站追踪都交给它 —— 不 take 走的话，入站那份
+        //（路径、请求头、请求体）会随 recorder 一起被丢掉。
+        let ctx = StreamContext {
+            shell: shell.clone(),
+            request_id: recorder.record.request_id.clone(),
+            client: recorder.record.client.clone(),
+            path: recorder.record.path.clone(),
+            model: req.model.clone(),
+            provider_tag: outbound.tag().to_string(),
+            protocol_in,
+            protocol_out: wire,
+            channel_kind: Some(outbound.provider().kind.as_str().to_string()),
+            price: shell.pricing.load().get(&req.model),
+            tool_calls: count_tool_uses(&req.messages),
+            started,
+            cache_key: cache_key.clone(),
+            cacheable,
+            capture: recorder.capture.take(),
+            upstream_url: recorder.record.upstream_url.clone(),
+            upstream_model: recorder.record.upstream_model.clone(),
+            upstream_status: recorder.record.upstream_status,
+        };
 
         let body = translate_stream(
             upstream_stream,
             decoder,
             encoder,
             timeouts,
-            move |outcome| {
-                finalize_stream(
-                    shell_cb,
-                    request_id,
-                    client,
-                    model,
-                    provider_tag,
-                    protocol_in,
-                    wire,
-                    channel_kind,
-                    price,
-                    tool_calls,
-                    started_at,
-                    outcome,
-                    key_for_cache,
-                    cacheable,
-                );
-            },
+            move |outcome| finalize_stream(ctx, outcome),
         );
 
         let mut response_headers = resp.headers.clone();
@@ -547,6 +586,14 @@ async fn finish_buffered(
     started: Instant,
     _mapped_model: &str,
 ) -> Result<Response, UpstreamError> {
+    // 上游响应头已经由 try_outbound 记进捕获了，这里补上**上游原文**。
+    // 与稍后写进 `response_body`（返回给客户端、可能已重编码）的那份分开存：
+    // 只有两份都在，才看得出协议转换到底改了什么。
+    if let Some(c) = recorder.capture.as_mut() {
+        c.upstream.response_body = Some(body.to_vec());
+        c.upstream.status = Some(status.as_u16() as i32);
+    }
+
     // 上游响应先解码，用于取 usage 与（必要时）重编码。
     // `decoded_from_sse` 记录"这份响应是从 SSE 还原出来的" —— 那种情况下
     // 即使入站与出站协议相同，也必须重新编码：原始字节是 SSE 正文，
@@ -674,12 +721,17 @@ async fn finish_buffered(
     Ok(build_response(status, headers, out_bytes))
 }
 
-/// 流结束后的收尾：计费、写缓存、补捕获。
-#[allow(clippy::too_many_arguments)]
-fn finalize_stream(
+/// 流式收尾所需的全部上下文。
+///
+/// 打包成一个结构体而不是继续加参数：`finalize_stream` 原本就有 13 个入参，
+/// 本次还要再带捕获与出站追踪，散着传下去没人看得懂哪个对应哪个。
+/// `capture` 是从 `Recorder` 里 take 出来的 —— 流式路径没有 `Recorder::finish`，
+/// 不在这里传下去，入站那份（路径、请求头、请求体）就永远丢了。
+struct StreamContext {
     shell: Arc<AppShell>,
     request_id: String,
     client: String,
+    path: String,
     model: String,
     provider_tag: String,
     protocol_in: Protocol,
@@ -688,10 +740,40 @@ fn finalize_stream(
     price: crate::billing::pricing::ModelPricing,
     tool_calls: u32,
     started: Instant,
-    outcome: StreamOutcome,
     cache_key: Option<String>,
     cacheable: bool,
+    capture: Option<CaptureRecord>,
+    upstream_url: Option<String>,
+    upstream_model: Option<String>,
+    upstream_status: Option<i32>,
+}
+
+/// 流结束后的收尾：计费、写缓存、补捕获。
+fn finalize_stream(
+    ctx: StreamContext,
+    outcome: StreamOutcome,
 ) {
+    let StreamContext {
+        shell,
+        request_id,
+        client,
+        path,
+        model,
+        provider_tag,
+        protocol_in,
+        protocol_out,
+        channel_kind,
+        price,
+        tool_calls,
+        started,
+        cache_key,
+        cacheable,
+        capture,
+        upstream_url,
+        upstream_model,
+        upstream_status,
+    } = ctx;
+
     let latency = started.elapsed().as_millis() as i64;
     let ttfb = outcome.ttfb.map(|d| d.as_millis() as i64);
     let status_code = if outcome.error.is_some() { 502 } else { 200 };
@@ -744,6 +826,10 @@ fn finalize_stream(
             channel_kind,
             model: model.clone(),
             request_model: model.clone(),
+            path,
+            upstream_url,
+            upstream_model,
+            upstream_status,
             is_stream: true,
             status_code,
             error_message: outcome.error.clone(),
@@ -773,15 +859,15 @@ fn finalize_stream(
         }
         shell.events.request(&rec);
 
-        // 把拼接后的文本留进捕获，供监控页展示。
-        if shell.settings().capture_enabled && !outcome.text.is_empty() {
-            let cap = CaptureRecord {
-                request_id: rec.request_id.clone(),
-                ts: rec.ts,
-                stream_text: Some(outcome.text),
-                stream_events: outcome.events as i64,
-                ..Default::default()
-            };
+        // 补捕获：入站字段沿用请求进来时建好的那份，再补上流式文本与出站追踪。
+        // 不能新建一条空的 —— `save_capture` 是 INSERT OR REPLACE，那样会把
+        // 入站的路径 / 请求头 / 请求体整条覆盖成空值。
+        if shell.settings().capture_enabled {
+            let mut cap = capture.unwrap_or_default();
+            cap.request_id = rec.request_id.clone();
+            cap.ts = rec.ts;
+            cap.stream_text = Some(outcome.text);
+            cap.stream_events = outcome.events as i64;
             if let Err(e) = crate::storage::logs::save_capture(&shell.db, &cap).await {
                 tracing::warn!("写流式捕获失败: {e}");
             }
@@ -1020,12 +1106,24 @@ fn error_response(
     (code, axum::Json(payload)).into_response()
 }
 
+/// 落库前必须隐去的请求头。
+///
+/// 入站这份带的是客户端的 key，出站那份带的是**渠道真实密钥**（`channel.rs`
+/// 会把上游凭据注入进来）—— 名单漏一个就是明文落库。
+const REDACTED_HEADERS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "proxy-authorization",
+];
+
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (k, v) in headers.iter() {
-        // 鉴权头可能含密钥，绝不落库。
-        if k.as_str().eq_ignore_ascii_case("authorization")
-            || k.as_str().eq_ignore_ascii_case("x-api-key")
+        if REDACTED_HEADERS
+            .iter()
+            .any(|h| k.as_str().eq_ignore_ascii_case(h))
         {
             map.insert(k.to_string(), serde_json::json!("<已隐去>"));
             continue;
@@ -1146,6 +1244,108 @@ mod tests {
             !v.to_string().contains("sk-secret"),
             "密钥绝不能出现在捕获里"
         );
+    }
+
+    #[test]
+    fn every_upstream_auth_header_style_is_redacted() {
+        // 捕获出站方向的 headers 时，里面装的是**渠道真实密钥**：
+        // channel.rs 按 auth_style 注入什么名字，这里就得隐去什么名字。
+        // 名单漏一个 = 密钥明文落库。
+        for name in ["api-key", "x-goog-api-key", "proxy-authorization"] {
+            let h = headers_with(&[(name, "sk-channel-secret")]);
+            let v = headers_to_json(&h);
+            assert_eq!(v[name], "<已隐去>", "{name} 必须被隐去");
+            assert!(!v.to_string().contains("sk-channel-secret"));
+        }
+    }
+
+    /// 只关心"支不支持某种协议"的假渠道，用于验证候选排序。
+    struct FakeOutbound {
+        tag: String,
+        supports: Vec<Protocol>,
+    }
+
+    impl FakeOutbound {
+        fn new(tag: &str, supports: Vec<Protocol>) -> Arc<dyn Outbound> {
+            Arc::new(Self {
+                tag: tag.into(),
+                supports,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Outbound for FakeOutbound {
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+        fn wire(&self) -> Protocol {
+            Protocol::OpenAiChat
+        }
+        fn wire_for(&self, incoming: Protocol) -> Protocol {
+            if self.supports(incoming) {
+                incoming
+            } else {
+                Protocol::OpenAiChat
+            }
+        }
+        fn supports(&self, protocol: Protocol) -> bool {
+            self.supports.contains(&protocol)
+        }
+        fn provider(&self) -> &crate::storage::models::Provider {
+            unimplemented!("排序测试不读渠道配置")
+        }
+        fn prepare(
+            &self,
+            _wire: Protocol,
+            _incoming: &HeaderMap,
+            _body: Bytes,
+            _stream: bool,
+        ) -> Result<crate::upstream::outbound::PreparedRequest, UpstreamError> {
+            unimplemented!("排序测试不发请求")
+        }
+        async fn dial(
+            &self,
+            _req: crate::upstream::outbound::PreparedRequest,
+        ) -> Result<crate::upstream::outbound::UpstreamResponse, UpstreamError> {
+            unimplemented!("排序测试不发请求")
+        }
+    }
+
+    fn tags(cs: &[Arc<dyn Outbound>]) -> Vec<String> {
+        cs.iter().map(|c| c.tag().to_string()).collect()
+    }
+
+    #[test]
+    fn candidates_speaking_the_client_protocol_come_first() {
+        // 首选(selector 选的)不支持 Anthropic，后面两个支持 —— 支持的提到前面，
+        // 但首选仍留在第一位，它的位置是路由规则定的。
+        let primary = FakeOutbound::new("primary", vec![Protocol::OpenAiChat]);
+        let mut cs = vec![
+            primary.clone(),
+            FakeOutbound::new("conv", vec![Protocol::OpenAiChat]),
+            FakeOutbound::new("native", vec![Protocol::AnthropicMessages]),
+        ];
+
+        prefer_native_protocol(&mut cs, &primary, Protocol::AnthropicMessages);
+
+        assert_eq!(tags(&cs), vec!["primary", "native", "conv"]);
+    }
+
+    #[test]
+    fn candidate_order_within_a_group_is_preserved() {
+        // 稳定排序：同组内保持调用方排好的优先级，不能被打乱。
+        let primary = FakeOutbound::new("a-native", vec![Protocol::AnthropicMessages]);
+        let mut cs = vec![
+            primary.clone(),
+            FakeOutbound::new("b-conv", vec![Protocol::OpenAiChat]),
+            FakeOutbound::new("c-native", vec![Protocol::AnthropicMessages]),
+            FakeOutbound::new("d-conv", vec![Protocol::OpenAiChat]),
+        ];
+
+        prefer_native_protocol(&mut cs, &primary, Protocol::AnthropicMessages);
+
+        assert_eq!(tags(&cs), vec!["a-native", "c-native", "b-conv", "d-conv"]);
     }
 
     #[test]

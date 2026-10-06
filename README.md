@@ -18,8 +18,8 @@ Apilot 把这一层收拢到本地网关里，并提供界面管理。
 | 功能 | 说明 |
 |---|---|
 | **客户端接管** | 一键改写入站客户端的 `base_url` 指向本地网关；一键还原到接管前的字节。 |
-| **多协议适配** | OpenAI Chat Completions / Anthropic Messages / OpenAI Responses 三协议**双向转换**，含 SSE 流式。 |
-| **流量监控** | 全量捕获双向请求与响应，解析流式最终文本，记录耗时与 TTFB。 |
+| **多协议适配** | OpenAI Chat Completions / Anthropic Messages / OpenAI Responses 三协议**双向转换**，含 SSE 流式。渠道可声明自己支持哪几种协议，入站协议命中就直通、不命中才转换 —— 兼容矩阵与损耗见 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md)。 |
+| **流量监控** | 全量捕获**双向**请求与响应（客户端→Apilot / Apilot→上游，含上游 URL、映射后的模型名、上游原始状态码），解析流式最终文本，记录耗时与 TTFB。日志可一键清空。 |
 | **动态路由** | sing-box 风格的规则链（顺序求值、终结/非终结动作），配合 selector 实现**无需重启的热切换**。 |
 | **计费统计** | 参考 new-api 的多级倍率模型，按客户端 / 模型 / 服务商多维统计 token 与费用。 |
 | **响应缓存** | 可选的确定性请求缓存，统计命中率与节省费用。 |
@@ -94,6 +94,8 @@ src/            前端（React 19 + Tailwind v4 + shadcn/ui）
 ### 关键设计取舍
 
 **单一 IR，而不是两两转换器。** 三个协议各自实现一对编解码器，任意两种协议之间的转换都走 `decode(A) → encode(B)`。N 个协议只需 2N 个编解码器，而不是 N² 个。
+
+**能直通就不转换。** 渠道声明自己支持哪几种协议；客户端说哪种协议，命中就原样转发原始字节，没命中才走 IR 转换。转换是有损的（思考签名、`cache_control` 断点、未建模字段都会在这一步丢），直通没有这些问题。判定规则、3×3 矩阵与完整损耗清单见 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md)。
 
 **UnifiedUsage 统一到「不含缓存的 fresh 输入」口径。** Anthropic 的 `input_tokens` 本就不含缓存，而 OpenAI / Responses 的 `prompt_tokens` **含**缓存。各 codec 负责折算到这个口径，否则缓存部分会被重复计费 —— 这是本项目最容易踩的坑，有专门的测试守着。
 

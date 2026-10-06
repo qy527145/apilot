@@ -191,6 +191,31 @@ CREATE TABLE IF NOT EXISTS settings_kv (
   updated_at INTEGER NOT NULL
 );
 "#,
+    // --- v2: 日志区分入站 / 出站方向；渠道声明支持的协议 ---
+    //
+    // 动机：原来的日志只记「Apilot 的处理结果」，不记 Apilot 究竟把请求发到了
+    // 哪个 URL、用了哪个模型名。上游报 404 时无从判断是 base_url 拼错了、
+    // 模型映射改错了，还是协议选错了。这几列就是为那类排查加的。
+    r#"
+-- 入站请求路径（客户端打给 Apilot 的）与出站目标地址（Apilot 打给上游的）
+ALTER TABLE request_logs ADD COLUMN path            TEXT NOT NULL DEFAULT '';
+ALTER TABLE request_logs ADD COLUMN upstream_url    TEXT;
+ALTER TABLE request_logs ADD COLUMN upstream_model  TEXT;
+ALTER TABLE request_logs ADD COLUMN upstream_status INTEGER;
+
+-- 捕获表同样补一份出站方向的原文：与我们返回给客户端的那份成对，
+-- 跨协议转换时两者内容不同，必须都留着才能看出转换做了什么。
+ALTER TABLE captures ADD COLUMN upstream_url              TEXT;
+ALTER TABLE captures ADD COLUMN upstream_headers          TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE captures ADD COLUMN upstream_body             BLOB;
+ALTER TABLE captures ADD COLUMN upstream_status           INTEGER;
+ALTER TABLE captures ADD COLUMN upstream_response_headers TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE captures ADD COLUMN upstream_response_body    BLOB;
+
+-- 服务商支持哪些协议、各自的请求路径。
+-- 空数组表示"只支持 kind 那一种"，老数据与预设不必回填。
+ALTER TABLE providers ADD COLUMN protocols TEXT NOT NULL DEFAULT '[]';
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -202,7 +227,27 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
         assert!(!MIGRATIONS[0].trim().is_empty());
+    }
+
+    #[test]
+    fn statement_splitter_can_handle_our_ddl() {
+        // 迁移按 `;` 切分语句，所以每条 DDL 里不能出现字符串内的分号。
+        // 这条测试守着"以后加迁移时别踩这个坑"。
+        for ddl in MIGRATIONS {
+            for stmt in ddl.split(';') {
+                let s = stmt.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                let quotes = s.matches('"').count() + s.matches('\'').count();
+                assert_eq!(
+                    quotes % 2,
+                    0,
+                    "语句里的引号不成对，`;` 可能落在字符串内部: {s}"
+                );
+            }
+        }
     }
 }

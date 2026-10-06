@@ -136,6 +136,83 @@ mod tests {
         }
     }
 
+    /// 模拟"用户机器上已经躺着一个 v1 的库，新版本启动时升级到 v2"。
+    ///
+    /// 这条路径用 `open_memory()` 测不到 —— 它一上来就把所有迁移跑完了。
+    /// 而真实升级里 ALTER TABLE 必须能加在**已有数据**的表上，老行要拿到
+    /// 新列的默认值。加列写错的话，用户一升级就打不开应用，所以单独测。
+    #[tokio::test]
+    async fn upgrading_an_existing_v1_database_keeps_its_rows() {
+        use std::str::FromStr;
+
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true)
+            .disable_statement_logging();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+
+        // 只跑 v1，并把版本号停在 1 —— 这就是老库的样子。
+        for stmt in split_statements(MIGRATIONS[0]) {
+            sqlx::query(&stmt).execute(&pool).await.unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 老库里已经有真实数据，升级必须原样保住。
+        sqlx::query(
+            "INSERT INTO request_logs
+                 (request_id, ts, client, protocol_in, protocol_out, model, request_model)
+             VALUES ('old', 1, 'codex', 'openai_responses', 'openai_chat', 'gpt-5', 'gpt-5')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO providers (tag, name, kind, base_url, created_at, updated_at)
+             VALUES ('p', 'P', 'openai_chat', 'https://x', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let path: String =
+            sqlx::query_scalar("SELECT path FROM request_logs WHERE request_id = 'old'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(path, "", "老日志行应拿到空路径默认值，而不是缺失该列");
+
+        // 老渠道没声明过协议，退化后等价于"只支持 kind 那一种"（见 Provider::endpoints）。
+        let protocols: String =
+            sqlx::query_scalar("SELECT protocols FROM providers WHERE tag = 'p'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(protocols, "[]");
+
+        // 捕获表也要能接受新列（老库里一行捕获都没有，正好验证空表加列）。
+        sqlx::query(
+            "INSERT INTO captures (request_id, ts, method, path) VALUES ('old', 1, 'POST', '/v1/x')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn migrate_is_idempotent() {
         let pool = open_memory().await.unwrap();

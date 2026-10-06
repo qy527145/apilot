@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
-use super::models::{AuthStyle, Provider, ProviderKind, ProviderModel};
+use super::models::{AuthStyle, ProtocolEndpoint, Provider, ProviderKind, ProviderModel};
 use crate::error::{AppError, AppResult};
 use crate::util::now_ms;
 
@@ -21,6 +21,9 @@ pub struct ProviderInput {
     pub api_key: Option<String>,
     #[serde(default = "default_auth_style")]
     pub auth_style: AuthStyle,
+    /// 该服务商支持哪些协议。空表示"只支持 `kind` 那一种"，与老数据行为一致。
+    #[serde(default)]
+    pub protocols: Vec<ProtocolEndpoint>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
     #[serde(default)]
@@ -81,7 +84,7 @@ impl ProviderInput {
 }
 
 const SELECT_COLUMNS: &str = "id, tag, name, kind, base_url, api_key, auth_style, \
-     extra_headers, param_override, model_mapping, weight, priority, enabled, \
+     protocols, extra_headers, param_override, model_mapping, weight, priority, enabled, \
      timeout_ms, created_at, updated_at";
 
 fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Provider {
@@ -98,6 +101,8 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Provider {
         base_url: row.get("base_url"),
         api_key: row.get("api_key"),
         auth_style: AuthStyle::parse(row.get::<String, _>("auth_style").as_str()),
+        // 坏数据退化成空列表（= 只用 kind 那一种协议），不让一条脏 JSON 让整个渠道打不开。
+        protocols: serde_json::from_str(&row.get::<String, _>("protocols")).unwrap_or_default(),
         extra_headers: json_map(row.get("extra_headers")),
         param_override: row
             .get::<Option<String>, _>("param_override")
@@ -155,6 +160,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
     let now = now_ms();
     let extra = serde_json::to_string(&input.extra_headers)?;
     let mapping = serde_json::to_string(&input.model_mapping)?;
+    let protocols = serde_json::to_string(&input.protocols)?;
     let param_override = match &input.param_override {
         Some(v) => Some(serde_json::to_string(v)?),
         None => None,
@@ -165,10 +171,10 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             // 留空 api_key 表示"不改动已存的密钥"，避免前端因为不回显密钥而把 key 抹掉。
             let result = sqlx::query(
                 "UPDATE providers SET tag=?1, name=?2, kind=?3, base_url=?4,
-                     api_key = COALESCE(?5, api_key), auth_style=?6, extra_headers=?7,
-                     param_override=?8, model_mapping=?9, weight=?10, priority=?11,
-                     enabled=?12, timeout_ms=?13, updated_at=?14
-                 WHERE id=?15",
+                     api_key = COALESCE(?5, api_key), auth_style=?6, protocols=?7,
+                     extra_headers=?8, param_override=?9, model_mapping=?10, weight=?11,
+                     priority=?12, enabled=?13, timeout_ms=?14, updated_at=?15
+                 WHERE id=?16",
             )
             .bind(&input.tag)
             .bind(&input.name)
@@ -176,6 +182,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(&input.base_url)
             .bind(&input.api_key)
             .bind(input.auth_style.as_str())
+            .bind(&protocols)
             .bind(&extra)
             .bind(&param_override)
             .bind(&mapping)
@@ -196,9 +203,9 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
         None => {
             let result = sqlx::query(
                 "INSERT INTO providers (tag, name, kind, base_url, api_key, auth_style,
-                     extra_headers, param_override, model_mapping, weight, priority,
+                     protocols, extra_headers, param_override, model_mapping, weight, priority,
                      enabled, timeout_ms, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
             )
             .bind(&input.tag)
             .bind(&input.name)
@@ -206,6 +213,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(&input.base_url)
             .bind(&input.api_key)
             .bind(input.auth_style.as_str())
+            .bind(&protocols)
             .bind(&extra)
             .bind(&param_override)
             .bind(&mapping)
@@ -378,6 +386,7 @@ mod tests {
             base_url: "https://api.anthropic.com".into(),
             api_key: Some("sk-test".into()),
             auth_style: AuthStyle::XApiKey,
+            protocols: Vec::new(),
             extra_headers: IndexMap::new(),
             param_override: None,
             model_mapping: IndexMap::new(),

@@ -18,6 +18,7 @@ use http::HeaderMap;
 use crate::gateway::stream::{translate_stream, StreamOutcome, StreamTimeouts};
 use crate::protocol::anthropic::{AnthropicStreamDecoder, AnthropicStreamEncoder};
 use crate::protocol::oai_chat::{ChatStreamDecoder, ChatStreamEncoder};
+use crate::protocol::dto::Protocol;
 use crate::storage::models::{AuthStyle, Provider, ProviderKind};
 use crate::upstream::channel::Channel;
 use crate::upstream::outbound::{Outbound, UpstreamBody};
@@ -100,6 +101,7 @@ fn provider(base_url: &str, kind: ProviderKind) -> Provider {
         base_url: base_url.to_string(),
         api_key: Some("sk-test-key".into()),
         auth_style,
+        protocols: Vec::new(),
         extra_headers: Default::default(),
         param_override: None,
         model_mapping: Default::default(),
@@ -156,7 +158,7 @@ async fn run_pipeline(
     let body = Bytes::from_static(
         br#"{"model":"claude-sonnet-5","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
     );
-    let prepared = channel.prepare(&HeaderMap::new(), body, true).unwrap();
+    let prepared = channel.prepare(Protocol::AnthropicMessages, &HeaderMap::new(), body, true).unwrap();
     let resp = channel.dial(prepared).await.expect("上游应当可达");
     assert!(resp.is_success(), "上游应当返回成功");
 
@@ -264,7 +266,7 @@ async fn outbound_url_follows_channel_protocol_not_client_protocol() {
     );
 
     let prepared = channel
-        .prepare(&HeaderMap::new(), Bytes::from_static(b"{}"), true)
+        .prepare(Protocol::AnthropicMessages, &HeaderMap::new(), Bytes::from_static(b"{}"), true)
         .unwrap();
     assert!(
         prepared.url.ends_with("/v1/chat/completions"),
@@ -293,7 +295,7 @@ async fn chat_upstream_to_anthropic_client_end_to_end() {
     );
 
     let prepared = channel
-        .prepare(&HeaderMap::new(), Bytes::from_static(b"{}"), true)
+        .prepare(Protocol::AnthropicMessages, &HeaderMap::new(), Bytes::from_static(b"{}"), true)
         .unwrap();
     let resp = channel.dial(prepared).await.unwrap();
     let stream = match resp.body {
@@ -336,7 +338,7 @@ async fn unreachable_upstream_reports_a_connect_error() {
     );
 
     let prepared = channel
-        .prepare(&HeaderMap::new(), Bytes::from_static(b"{}"), false)
+        .prepare(Protocol::AnthropicMessages, &HeaderMap::new(), Bytes::from_static(b"{}"), false)
         .unwrap();
     // `UpstreamResponse` 内含流对象，无法 derive Debug，因此不用 `unwrap_err`。
     let err = match channel.dial(prepared).await {
@@ -386,7 +388,7 @@ async fn request_direction_conversion_reaches_upstream_correctly() {
         .expect("跨协议请求转换不应失败");
 
     let prepared = channel
-        .prepare(&HeaderMap::new(), Bytes::from(converted), false)
+        .prepare(Protocol::AnthropicMessages, &HeaderMap::new(), Bytes::from(converted), false)
         .unwrap();
     let resp = channel.dial(prepared).await.unwrap();
     assert!(resp.is_success());
@@ -456,7 +458,7 @@ async fn bare_sse_body_is_reconstructible_from_single_chunk() {
     let channel = Channel::new(provider(&base, ProviderKind::Anthropic), crate::upstream::client::build());
 
     let prepared = channel
-        .prepare(&HeaderMap::new(), Bytes::from_static(b"{}"), false) // 非流式
+        .prepare(Protocol::AnthropicMessages, &HeaderMap::new(), Bytes::from_static(b"{}"), false) // 非流式
         .unwrap();
     let resp = channel.dial(prepared).await.unwrap();
 
@@ -502,6 +504,7 @@ async fn buffered_upstream_response_is_handled() {
     );
     let prepared = channel
         .prepare(
+            Protocol::AnthropicMessages,
             &HeaderMap::new(),
             Bytes::from_static(br#"{"stream":true}"#),
             true,
@@ -516,4 +519,66 @@ async fn buffered_upstream_response_is_handled() {
         }
         UpstreamBody::Stream(_) => panic!("上游返回完整 JSON，不该被当成流"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 渠道声明支持多种协议时，按入站协议挑直通的那一种
+// ---------------------------------------------------------------------------
+
+/// 把 `provider` 改造成"同时声明 Anthropic 与 Chat"的渠道。
+fn declare_both_protocols(p: &mut Provider) {
+    p.protocols = vec![
+        crate::storage::models::ProtocolEndpoint::plain(Protocol::AnthropicMessages),
+        crate::storage::models::ProtocolEndpoint::plain(Protocol::OpenAiChat),
+    ];
+}
+
+#[tokio::test]
+async fn client_protocol_is_used_verbatim_when_the_channel_supports_it() {
+    // 渠道两种协议都支持 —— 客户端说 Anthropic 就该原样发 /v1/messages，
+    // 而不是"反正能转换"就一律转成某个首选协议。
+    let (base, captured) = spawn_upstream(ANTHROPIC_SSE).await;
+    let mut p = provider(&base, ProviderKind::Anthropic);
+    declare_both_protocols(&mut p);
+    let channel = Channel::new(p, crate::upstream::client::build());
+
+    let raw = br#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let wire = channel.wire_for(Protocol::AnthropicMessages);
+    assert_eq!(wire, Protocol::AnthropicMessages, "支持就该直通");
+
+    let prepared = channel
+        .prepare(wire, &HeaderMap::new(), Bytes::from_static(raw), true)
+        .unwrap();
+    assert!(prepared.url.ends_with("/v1/messages"), "实际: {}", prepared.url);
+
+    // 直通的含义就是"字节不动"：转换路径会重新序列化 IR，
+    // 那样未建模的字段就丢了。这里逐字节比对，守住这一点。
+    assert_eq!(prepared.body.as_ref(), raw, "同协议必须原样转发");
+
+    let _ = channel.dial(prepared).await.unwrap();
+    let reqs = captured.lock().unwrap();
+    assert_eq!(reqs[0].path, "/v1/messages");
+}
+
+#[tokio::test]
+async fn channel_without_the_incoming_protocol_converts_to_its_preferred_one() {
+    // 同一个上游地址，但这次渠道只声明 Chat —— 客户端仍说 Anthropic，
+    // 就该转换并发到 chat/completions。
+    let (base, captured) = spawn_upstream(CHAT_SSE).await;
+    let channel = Channel::new(
+        provider(&base, ProviderKind::OpenAiChat),
+        crate::upstream::client::build(),
+    );
+
+    let wire = channel.wire_for(Protocol::AnthropicMessages);
+    assert_eq!(wire, Protocol::OpenAiChat, "不支持才回落到首选协议");
+
+    let prepared = channel
+        .prepare(wire, &HeaderMap::new(), Bytes::from_static(br#"{"model":"x"}"#), true)
+        .unwrap();
+    assert!(prepared.url.ends_with("/v1/chat/completions"), "实际: {}", prepared.url);
+
+    let _ = channel.dial(prepared).await.unwrap();
+    let reqs = captured.lock().unwrap();
+    assert_eq!(reqs[0].path, "/v1/chat/completions");
 }

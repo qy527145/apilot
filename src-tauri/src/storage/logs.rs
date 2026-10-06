@@ -19,6 +19,16 @@ pub struct RequestLogRecord {
     pub channel_kind: Option<String>,
     pub model: String,
     pub request_model: String,
+    /// 入站请求路径（客户端打给 Apilot 的，如 `/v1/responses`）。
+    pub path: String,
+    /// Apilot 实际请求的上游 URL。缓存命中或路由失败时为 `None`。
+    pub upstream_url: Option<String>,
+    /// 映射后实际发给上游的模型名。与 `model`（客户端要的）不同时，
+    /// 排查"上游说模型不存在"能一眼看出是映射把它改错了。
+    pub upstream_model: Option<String>,
+    /// 上游返回的原始状态码。与 `status_code` 分开记：网关可能把上游的
+    /// 404 包装成 502 再返回给客户端，只留一个数字就对不上了。
+    pub upstream_status: Option<i32>,
     pub is_stream: bool,
     pub status_code: i32,
     pub error_message: Option<String>,
@@ -49,6 +59,10 @@ pub struct RequestLog {
     pub provider_tag: Option<String>,
     pub model: String,
     pub request_model: String,
+    pub path: String,
+    pub upstream_url: Option<String>,
+    pub upstream_model: Option<String>,
+    pub upstream_status: Option<i32>,
     pub is_stream: bool,
     pub status_code: i32,
     pub error_message: Option<String>,
@@ -94,7 +108,8 @@ impl LogFilter {
 }
 
 const LOG_COLUMNS: &str = "request_id, ts, client, protocol_in, protocol_out, provider_tag, \
-     model, request_model, is_stream, status_code, error_message, input_tokens, output_tokens, \
+     model, request_model, path, upstream_url, upstream_model, upstream_status, is_stream, \
+     status_code, error_message, input_tokens, output_tokens, \
      cache_read_tokens, cache_creation_tokens, usage_source, quota, cost_usd, latency_ms, \
      ttfb_ms, cache_hit, saved_quota";
 
@@ -108,6 +123,10 @@ fn row_to_log(r: &sqlx::sqlite::SqliteRow) -> RequestLog {
         provider_tag: r.get("provider_tag"),
         model: r.get("model"),
         request_model: r.get("request_model"),
+        path: r.get("path"),
+        upstream_url: r.get("upstream_url"),
+        upstream_model: r.get("upstream_model"),
+        upstream_status: r.get("upstream_status"),
         is_stream: r.get::<i64, _>("is_stream") != 0,
         status_code: r.get("status_code"),
         error_message: r.get("error_message"),
@@ -130,11 +149,13 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
     sqlx::query(
         "INSERT OR REPLACE INTO request_logs (
              request_id, ts, client, protocol_in, protocol_out, provider_tag, channel_kind,
-             model, request_model, is_stream, status_code, error_message,
+             model, request_model, path, upstream_url, upstream_model, upstream_status,
+             is_stream, status_code, error_message,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              reasoning_tokens, usage_source, quota, cost_usd, latency_ms, ttfb_ms,
              cache_hit, saved_quota, other)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
+                 ?22,?23,?24,?25,?26,?27,?28,?29)",
     )
     .bind(&rec.request_id)
     .bind(rec.ts)
@@ -145,6 +166,10 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
     .bind(&rec.channel_kind)
     .bind(&rec.model)
     .bind(&rec.request_model)
+    .bind(&rec.path)
+    .bind(&rec.upstream_url)
+    .bind(&rec.upstream_model)
+    .bind(rec.upstream_status)
     .bind(rec.is_stream as i64)
     .bind(rec.status_code)
     .bind(&rec.error_message)
@@ -248,14 +273,44 @@ pub struct RequestDetail {
     pub cache_hit: bool,
     pub saved_quota: i64,
 
+    // --- 入站方向：客户端 → Apilot ---
     pub method: String,
     pub path: String,
     pub request_headers: serde_json::Value,
     pub request_body: Option<String>,
+
+    // --- 出站方向：Apilot → 上游 ---
+    /// Apilot 实际请求的 URL。缓存命中或路由失败时为 `None`。
+    pub upstream_url: Option<String>,
+    /// 映射后实际发给上游的模型名。
+    pub upstream_model: Option<String>,
+    /// 上游返回的原始状态码。
+    pub upstream_status: Option<i32>,
+    pub upstream_headers: serde_json::Value,
+    pub upstream_body: Option<String>,
+    pub upstream_response_headers: serde_json::Value,
+    pub upstream_response_body: Option<String>,
+
+    // --- 出站方向：Apilot → 客户端 ---
     pub response_headers: serde_json::Value,
     pub response_body: Option<String>,
     pub stream_text: Option<String>,
     pub stream_events: i64,
+}
+
+/// 出站方向的追踪：Apilot 实际发给上游的请求，与上游返回的原始响应。
+///
+/// 与 `CaptureRecord` 顶层的入站字段成对存在。两者必须都留：跨协议转换时
+/// 上游收到的请求体和我们返回给客户端的响应体内容并不相同，只留一份就看不出
+/// 「转换到底做了什么」，而排查上游报错时最需要的恰恰是上游那一份原文。
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamTrace {
+    pub url: String,
+    pub headers: serde_json::Value,
+    pub body: Option<Vec<u8>>,
+    pub status: Option<i32>,
+    pub response_headers: serde_json::Value,
+    pub response_body: Option<Vec<u8>>,
 }
 
 /// 保存一次请求 / 响应的原文。
@@ -263,10 +318,14 @@ pub struct RequestDetail {
 pub struct CaptureRecord {
     pub request_id: String,
     pub ts: i64,
+    // 入站
     pub method: String,
     pub path: String,
     pub request_headers: serde_json::Value,
     pub request_body: Option<Vec<u8>>,
+    // 出站
+    pub upstream: UpstreamTrace,
+    // 返回给客户端
     pub response_headers: serde_json::Value,
     pub response_body: Option<Vec<u8>>,
     pub stream_text: Option<String>,
@@ -277,8 +336,10 @@ pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()>
     sqlx::query(
         "INSERT OR REPLACE INTO captures (
              request_id, ts, method, path, request_headers, request_body,
+             upstream_url, upstream_headers, upstream_body, upstream_status,
+             upstream_response_headers, upstream_response_body,
              response_headers, response_body, stream_text, stream_events)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
     )
     .bind(&c.request_id)
     .bind(c.ts)
@@ -286,6 +347,12 @@ pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()>
     .bind(&c.path)
     .bind(serde_json::to_string(&c.request_headers)?)
     .bind(&c.request_body)
+    .bind(&c.upstream.url)
+    .bind(serde_json::to_string(&c.upstream.headers)?)
+    .bind(&c.upstream.body)
+    .bind(c.upstream.status)
+    .bind(serde_json::to_string(&c.upstream.response_headers)?)
+    .bind(&c.upstream.response_body)
     .bind(serde_json::to_string(&c.response_headers)?)
     .bind(&c.response_body)
     .bind(&c.stream_text)
@@ -302,19 +369,28 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
     };
 
     let cap = sqlx::query(
-        "SELECT method, path, request_headers, request_body, response_headers,
-                response_body, stream_text, stream_events
+        "SELECT method, path, request_headers, request_body,
+                upstream_url, upstream_headers, upstream_body, upstream_status,
+                upstream_response_headers, upstream_response_body,
+                response_headers, response_body, stream_text, stream_events
          FROM captures WHERE request_id = ?1",
     )
     .bind(request_id)
     .fetch_optional(pool)
     .await?;
 
+    // 没有捕获行时全部留空，而不是报错 —— 日志本身（用量、状态码）始终可读。
     let (
         method,
         path,
         request_headers,
         request_body,
+        upstream_url,
+        upstream_headers,
+        upstream_body,
+        upstream_status,
+        upstream_response_headers,
+        upstream_response_body,
         response_headers,
         response_body,
         stream_text,
@@ -325,6 +401,12 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
             r.get::<Option<String>, _>("path").unwrap_or_default(),
             parse_json(r.get::<Option<String>, _>("request_headers")),
             r.get::<Option<Vec<u8>>, _>("request_body"),
+            r.get::<Option<String>, _>("upstream_url"),
+            parse_json(r.get::<Option<String>, _>("upstream_headers")),
+            r.get::<Option<Vec<u8>>, _>("upstream_body"),
+            r.get::<Option<i64>, _>("upstream_status").map(|v| v as i32),
+            parse_json(r.get::<Option<String>, _>("upstream_response_headers")),
+            r.get::<Option<Vec<u8>>, _>("upstream_response_body"),
             parse_json(r.get::<Option<String>, _>("response_headers")),
             r.get::<Option<Vec<u8>>, _>("response_body"),
             r.get::<Option<String>, _>("stream_text"),
@@ -335,12 +417,22 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
             String::new(),
             serde_json::json!({}),
             None,
+            None,
+            serde_json::json!({}),
+            None,
+            None,
+            serde_json::json!({}),
+            None,
             serde_json::json!({}),
             None,
             None,
             0,
         ),
     };
+
+    // 上游状态码优先取捕获里的；没捕获时退回日志列的（两者本就同源）。
+    let upstream_status = upstream_status.or(log.upstream_status);
+    let upstream_url = upstream_url.or(log.upstream_url);
 
     Ok(Some(RequestDetail {
         request_id: log.request_id,
@@ -366,10 +458,18 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         cache_hit: log.cache_hit,
         saved_quota: log.saved_quota,
         method,
-        path,
+        path: if path.is_empty() { log.path } else { path },
         request_headers,
         // 捕获体按 UTF-8 展示；非法字节用替换字符，不因一个坏字节丢掉整条详情。
         request_body: request_body.map(|b| String::from_utf8_lossy(&b).to_string()),
+        upstream_url,
+        upstream_model: log.upstream_model,
+        upstream_status,
+        upstream_headers,
+        upstream_body: upstream_body.map(|b| String::from_utf8_lossy(&b).to_string()),
+        upstream_response_headers,
+        upstream_response_body: upstream_response_body
+            .map(|b| String::from_utf8_lossy(&b).to_string()),
         response_headers,
         response_body: response_body.map(|b| String::from_utf8_lossy(&b).to_string()),
         stream_text,
@@ -412,6 +512,25 @@ pub async fn prune_logs(pool: &SqlitePool, before_ts: i64) -> AppResult<u64> {
     Ok(r.rows_affected())
 }
 
+/// 清空全部请求明细与捕获原文。返回 `(删除的日志条数, 删除的捕获条数)`。
+///
+/// 刻意**不动** `usage_hourly` 与内存里的累计计数器：那些是计费口径的历史账目，
+/// 用户在监控页点"清空日志"是不想让列表继续堆着，不是想把自己的账单抹掉。
+pub async fn clear_all(pool: &SqlitePool) -> AppResult<(u64, u64)> {
+    // 放一个事务里：两张表要么都空，要么都留，不会出现"列表空了但详情还在"。
+    let mut tx = pool.begin().await?;
+    let logs = sqlx::query("DELETE FROM request_logs")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let captures = sqlx::query("DELETE FROM captures")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok((logs, captures))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +551,10 @@ mod tests {
             channel_kind: Some("openai_chat".into()),
             model: model.into(),
             request_model: model.into(),
+            path: "/v1/messages".into(),
+            upstream_url: Some("https://api.example.com/v1/chat/completions".into()),
+            upstream_model: Some(model.into()),
+            upstream_status: Some(200),
             is_stream: true,
             status_code: 200,
             input_tokens: 100,
@@ -455,6 +578,38 @@ mod tests {
         assert!(got.is_stream);
         assert_eq!(got.ttfb_ms, Some(300));
         assert_eq!(got.input_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn direction_fields_roundtrip() {
+        // 入站路径与出站 URL / 模型 / 状态码都要能存能取 —— 排查上游 404 全靠它们。
+        let p = pool().await;
+        insert(&p, &rec("r1", "codex", "gpt-5")).await.unwrap();
+
+        let got = get(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(got.path, "/v1/messages");
+        assert_eq!(
+            got.upstream_url.as_deref(),
+            Some("https://api.example.com/v1/chat/completions")
+        );
+        assert_eq!(got.upstream_model.as_deref(), Some("gpt-5"));
+        assert_eq!(got.upstream_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn upstream_fields_default_to_none() {
+        // 缓存命中 / 路由失败没有上游，不能凭空造一个空字符串出来。
+        let p = pool().await;
+        let mut r = rec("r1", "a", "m");
+        r.upstream_url = None;
+        r.upstream_model = None;
+        r.upstream_status = None;
+        insert(&p, &r).await.unwrap();
+
+        let got = get(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(got.upstream_url, None);
+        assert_eq!(got.upstream_model, None);
+        assert_eq!(got.upstream_status, None);
     }
 
     #[tokio::test]
@@ -608,6 +763,14 @@ mod tests {
                 path: "/v1/messages".into(),
                 request_headers: serde_json::json!({"content-type": "application/json"}),
                 request_body: Some(br#"{"model":"m"}"#.to_vec()),
+                upstream: UpstreamTrace {
+                    url: "https://api.example.com/v1/chat/completions".into(),
+                    headers: serde_json::json!({"authorization": "<已隐去>"}),
+                    body: Some(br#"{"model":"deepseek-chat"}"#.to_vec()),
+                    status: Some(404),
+                    response_headers: serde_json::json!({"content-type": "application/json"}),
+                    response_body: Some(br#"{"error":"model not found"}"#.to_vec()),
+                },
                 response_headers: serde_json::json!({"x-req-id": "abc"}),
                 response_body: Some(br#"{"ok":true}"#.to_vec()),
                 stream_text: Some("最终答案".into()),
@@ -626,14 +789,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detail_keeps_both_directions_separate() {
+        // 两个方向必须各留一份：跨协议转换时上游收到的体与返回给客户端的体不同，
+        // 合成一份就看不出转换做了什么。
+        let p = pool().await;
+        insert(&p, &rec("r1", "codex", "m")).await.unwrap();
+
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r1".into(),
+                ts: now_ms(),
+                method: "POST".into(),
+                path: "/v1/responses".into(),
+                request_headers: serde_json::json!({"user-agent": "codex"}),
+                request_body: Some(br#"{"model":"m","input":"hi"}"#.to_vec()),
+                upstream: UpstreamTrace {
+                    url: "https://api.deepseek.com/v1/chat/completions".into(),
+                    headers: serde_json::json!({}),
+                    body: Some(br#"{"model":"deepseek-chat","messages":[]}"#.to_vec()),
+                    status: Some(200),
+                    response_headers: serde_json::json!({}),
+                    response_body: Some(br#"{"choices":[]}"#.to_vec()),
+                },
+                response_body: Some(br#"{"output":"hi"}"#.to_vec()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(
+            d.upstream_url.as_deref(),
+            Some("https://api.deepseek.com/v1/chat/completions")
+        );
+        assert_eq!(d.upstream_status, Some(200));
+        // 入站体是 Responses 形状，出站体是 Chat 形状。
+        assert!(d.request_body.as_deref().unwrap().contains("input"));
+        assert!(d.upstream_body.as_deref().unwrap().contains("messages"));
+        // 上游原文与返回给客户端的那份也不一样。
+        assert!(d.upstream_response_body.as_deref().unwrap().contains("choices"));
+        assert!(d.response_body.as_deref().unwrap().contains("output"));
+    }
+
+    #[tokio::test]
+    async fn detail_falls_back_to_log_columns_without_capture() {
+        // 没有捕获行时，upstream_url / upstream_status 仍要从日志列里取到，
+        // 否则"日志有、捕获被裁掉"的请求会显示成"没请求过上游"。
+        let p = pool().await;
+        insert(&p, &rec("r1", "a", "m")).await.unwrap();
+
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(
+            d.upstream_url.as_deref(),
+            Some("https://api.example.com/v1/chat/completions")
+        );
+        assert_eq!(d.upstream_status, Some(200));
+        assert_eq!(d.path, "/v1/messages", "路径也要从日志列回退");
+        assert_eq!(d.method, "", "方法只存在于捕获里，没有就是空");
+    }
+
+    #[tokio::test]
     async fn detail_without_capture_still_returns_log_fields() {
         let p = pool().await;
         insert(&p, &rec("r1", "a", "m")).await.unwrap();
 
         let d = get_detail(&p, "r1").await.unwrap().unwrap();
         assert_eq!(d.model, "m");
-        assert_eq!(d.path, "", "无捕获时字段为空而不是报错");
-        assert!(d.request_body.is_none());
+        assert!(d.request_body.is_none(), "捕获被裁掉时不该伪造请求体");
+        assert_eq!(
+            d.request_headers,
+            serde_json::json!({}),
+            "没有捕获时 headers 应是空对象，而不是 null"
+        );
     }
 
     #[tokio::test]
@@ -689,5 +918,60 @@ mod tests {
         let removed = prune_logs(&p, 5_000).await.unwrap();
         assert_eq!(removed, 1);
         assert!(get(&p, "new").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn clear_all_empties_logs_and_captures() {
+        let p = pool().await;
+        insert(&p, &rec("r1", "a", "m")).await.unwrap();
+        insert(&p, &rec("r2", "a", "m")).await.unwrap();
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r1".into(),
+                ts: now_ms(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (logs, captures) = clear_all(&p).await.unwrap();
+        assert_eq!(logs, 2);
+        assert_eq!(captures, 1);
+
+        let (items, total) = query(&p, &LogFilter::default()).await.unwrap();
+        assert!(items.is_empty());
+        assert_eq!(total, 0);
+        assert!(get_detail(&p, "r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_all_on_empty_database_is_a_noop() {
+        let p = pool().await;
+        assert_eq!(clear_all(&p).await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn clear_all_leaves_hourly_aggregates_alone() {
+        // 计费口径的历史账目不在"清空日志"的范围内 —— 用户点这个按钮是不想让
+        // 列表堆着，不是想把自己已花的钱从账单上抹掉。
+        let p = pool().await;
+        insert(&p, &rec("r1", "a", "m")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_hourly (bucket_ts, client, provider_tag, model, requests, quota)
+             VALUES (0, 'a', 'p1', 'm', 1, 300)",
+        )
+        .execute(&p)
+        .await
+        .unwrap();
+
+        clear_all(&p).await.unwrap();
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_hourly")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(left, 1, "清空日志不应影响计费聚合");
     }
 }

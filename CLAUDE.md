@@ -1,6 +1,7 @@
 # CLAUDE.md
 
-本文件每次会话都会自动加载，请保持精简。详细的模块地图在 [docs/CODE_MAP.md](docs/CODE_MAP.md)。
+本文件每次会话都会自动加载，请保持精简。详细的模块地图在 [docs/CODE_MAP.md](docs/CODE_MAP.md)，
+协议兼容矩阵（何时直通 / 何时转换 / 转换损耗）在 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md)。
 
 ## 这是什么
 
@@ -52,6 +53,8 @@ cargo build
 | **加一个新协议**（如 Gemini） | `protocol/dto.rs` 加 `Protocol` 变体 → 新建 `protocol/<name>/`（request/response/stream/mod）→ `protocol/codec.rs::CodecRegistry::new` 注册 → 按需加 `gateway/router.rs` 路由 |
 | **加一个新客户端接管** | `takeover/clients.rs` 加 `ClientId` 变体 + `config_paths()` + `plan_apply()`；`config/paths.rs` 加路径函数 |
 | **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → 同文件 `Provider::auth_header()`（**鉴权头的唯一构造点**，出站转发、连通探测、拉模型列表都走它） |
+| **改「直通还是转换」的判定** | `storage/models.rs::Provider::wire_for`（渠道声明的协议集合命中就直通）+ `gateway/pipeline.rs::prefer_native_protocol`（多渠道路由时同协议优先）→ 同步更新 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md) |
+| **改出站 URL 拼接** | `storage/models.rs::Provider::endpoint`（协议默认路径，会补 `/v1`）/ `endpoint_verbatim`（用户手写路径，**不补** `/v1`） |
 | **改计费公式** | `billing/engine.rs::settle`（唯一真源）→ 对应更新其测试；倍率字段在 `billing/pricing.rs` |
 | **加一种路由匹配条件** | `routing/rule_item.rs` 加 `RuleItem` 变体（`matches` + `describe` + 测试）→ 前端 `src/components/routing/RuleEditor.tsx` |
 | **加一种路由动作** | `routing/rule.rs::RouteAction`（注意 `is_final` 的归类）→ `routing/engine.rs::route` 的 match → 前端 `ruleSummary.ts` |
@@ -72,6 +75,8 @@ cargo build
 
 2. **同协议直通，跨协议才重编码。**
    `gateway/pipeline.rs` 里 `needs_conversion` 为 false 时转发**原始字节**，只旁路统计用量。
+   「同协议」指**入站协议 == 渠道实际使用的协议**，由 `Provider::wire_for` 按渠道声明的协议集合决定，
+   不是"入站协议 == 渠道的 kind"。渠道声明了入站协议就直通，没声明才回落到 kind 做转换。
    但有个例外：响应若是从 SSE 还原出来的，必须重新编码 —— 见 `decoded_from_sse`。
 
 3. **规则链区分终结与非终结动作。** `RouteAction::is_final()` 决定命中后是否停止求值。

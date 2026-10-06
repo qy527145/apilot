@@ -9,6 +9,37 @@ export type Protocol = "anthropic" | "openai_chat" | "openai_responses";
 export type ProviderKind = "anthropic" | "openai_chat" | "openai_responses";
 export type AuthStyle = "bearer" | "x-api-key" | "none";
 
+/** 协议名 → 中文标签。多处复用，避免同一个名字在三个页面里写法不一致。 */
+export const PROTOCOL_LABEL: Record<Protocol, string> = {
+  anthropic: "Anthropic Messages",
+  openai_chat: "OpenAI Chat",
+  openai_responses: "OpenAI Responses",
+};
+
+/** 各协议的标准请求路径。与后端 `Protocol::default_path()` 一一对应。 */
+export const PROTOCOL_DEFAULT_PATH: Record<Protocol, string> = {
+  anthropic: "/v1/messages",
+  openai_chat: "/v1/chat/completions",
+  openai_responses: "/v1/responses",
+};
+
+export const ALL_PROTOCOLS: Protocol[] = [
+  "anthropic",
+  "openai_chat",
+  "openai_responses",
+];
+
+/**
+ * 服务商在某种协议下的接入点。
+ *
+ * `path` 留空表示用该协议的默认路径；填了就**原样**拼在 base_url 后面
+ * （不会替你补 /v1）—— 服务商把接口挂在子路径下时靠它避免 404。
+ */
+export interface ProtocolEndpoint {
+  protocol: Protocol;
+  path?: string | null;
+}
+
 export interface ProviderInput {
   id?: number | null;
   tag: string;
@@ -17,6 +48,8 @@ export interface ProviderInput {
   base_url: string;
   api_key?: string | null;
   auth_style: AuthStyle;
+  /** 该服务商支持哪些协议。留空表示"只支持 kind 那一种"。 */
+  protocols: ProtocolEndpoint[];
   extra_headers: Record<string, string>;
   param_override?: unknown | null;
   model_mapping: Record<string, string>;
@@ -33,6 +66,7 @@ export interface Provider {
   kind: ProviderKind;
   base_url: string;
   auth_style: AuthStyle;
+  protocols: ProtocolEndpoint[];
   extra_headers: Record<string, string>;
   param_override?: unknown | null;
   model_mapping: Record<string, string>;
@@ -226,6 +260,14 @@ export interface RequestLog {
   provider_tag?: string | null;
   model: string;
   request_model: string;
+  /** 入站请求路径（客户端打给 Apilot 的）。 */
+  path: string;
+  /** Apilot 实际请求的上游 URL。缓存命中 / 路由失败时为 null。 */
+  upstream_url?: string | null;
+  /** 映射后实际发给上游的模型名。与 model 不同时说明渠道做了映射。 */
+  upstream_model?: string | null;
+  /** 上游返回的原始状态码，可能与我们返回给客户端的 status_code 不同。 */
+  upstream_status?: number | null;
   is_stream: boolean;
   status_code: number;
   error_message?: string | null;
@@ -247,9 +289,25 @@ export interface Page<T> {
   total: number;
 }
 
+/** 清空日志的结果：各删了多少条。 */
+export interface ClearResult {
+  logs: number;
+  captures: number;
+}
+
 export interface RequestDetail extends RequestLog {
+  /* --- 入站：客户端 → Apilot --- */
+  method: string;
   request_headers: Record<string, string>;
   request_body?: string | null;
+
+  /* --- 出站：Apilot → 上游 --- */
+  upstream_headers: Record<string, string>;
+  upstream_body?: string | null;
+  upstream_response_headers: Record<string, string>;
+  upstream_response_body?: string | null;
+
+  /* --- 返回给客户端 --- */
   response_headers: Record<string, string>;
   response_body?: string | null;
   stream_text?: string | null;
@@ -423,6 +481,8 @@ export const api = {
   queryLogs: (filter: LogFilter) => call<Page<RequestLog>>("query_logs", { filter }),
   getRequestDetail: (requestId: string) =>
     call<RequestDetail>("get_request_detail", { requestId }),
+  /** 清空请求明细与原文捕获。计费聚合不受影响。 */
+  clearLogs: () => call<ClearResult>("clear_logs"),
 };
 
 export type Api = typeof api;

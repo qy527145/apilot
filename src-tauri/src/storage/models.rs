@@ -5,11 +5,17 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::dto::Protocol;
 
 /// 渠道类型 = 该渠道说哪种线协议。
+///
+/// JSON 名显式写死，理由同 `Protocol`：`rename_all = "snake_case"` 会把
+/// `OpenAiChat` 拆成 `open_ai_chat`，与 `as_str()`（DB 的 kind 列）和前端
+/// 联合类型里的 `openai_chat` 对不上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "openai_chat")]
     OpenAiChat,
+    #[serde(rename = "openai_responses")]
     OpenAiResponses,
 }
 
@@ -71,6 +77,32 @@ impl AuthStyle {
     }
 }
 
+/// 服务商在某种协议下的接入点。
+///
+/// 一个服务商常常同时提供多种协议（比如同一家既给 `/v1/messages` 也给
+/// `/v1/chat/completions`）。声明出来之后，客户端说什么协议就直接说什么协议，
+/// 省掉一次编解码，也避开转换带来的字段损耗；只有声明里没有的入站协议才转换。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolEndpoint {
+    pub protocol: Protocol,
+    /// 该协议在该服务商下的请求路径，`None` 表示用协议默认路径。
+    ///
+    /// 存在的意义：服务商路径不遵循 `/v1/<name>` 约定时（挂在网关子路径下、
+    /// 或版本号不同），用户能直接指定，不必让 Apilot 去猜 —— 猜错的后果是 404。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl ProtocolEndpoint {
+    /// 声明"支持该协议但不覆盖路径"。
+    pub fn plain(protocol: Protocol) -> Self {
+        Self {
+            protocol,
+            path: None,
+        }
+    }
+}
+
 /// 一个上游渠道。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -78,11 +110,16 @@ pub struct Provider {
     /// 路由与 selector 引用的稳定标识。
     pub tag: String,
     pub name: String,
+    /// **首选协议**：探测连通性、拉 `/v1/models`、以及入站协议不在 `protocols` 里时
+    /// 转换的目标协议。实际用哪种协议由 [`Provider::wire_for`] 按入站请求决定。
     pub kind: ProviderKind,
     pub base_url: String,
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
     pub auth_style: AuthStyle,
+    /// 该服务商支持哪些协议、各自的请求路径。空表示"只支持 `kind` 那一种"。
+    #[serde(default)]
+    pub protocols: Vec<ProtocolEndpoint>,
     /// 渠道级额外请求头。
     pub extra_headers: indexmap::IndexMap<String, String>,
     /// 请求体字段覆盖（如强制 temperature、加 top_k）。
@@ -104,6 +141,52 @@ impl Provider {
             .get(model)
             .map(|s| s.as_str())
             .unwrap_or(model)
+    }
+
+    /// 实际可用的协议列表。
+    ///
+    /// 没声明过协议时退化成"只有 `kind` 那一种" —— 老数据、预设、以及没动过这一项的
+    /// 渠道行为完全不变，不会因为引入这个字段而改变既有路由结果。
+    pub fn endpoints(&self) -> Vec<ProtocolEndpoint> {
+        if self.protocols.is_empty() {
+            vec![ProtocolEndpoint::plain(self.kind.wire_protocol())]
+        } else {
+            self.protocols.clone()
+        }
+    }
+
+    pub fn supports(&self, protocol: Protocol) -> bool {
+        self.endpoints().iter().any(|e| e.protocol == protocol)
+    }
+
+    /// 针对入站协议选一个上游协议。
+    ///
+    /// 能同协议就同协议 —— 此时管线会走直通（原始字节转发，只旁路统计用量），
+    /// 既不丢字段也不多一次编解码；对不上才回落到首选协议，由管线做跨协议转换。
+    pub fn wire_for(&self, incoming: Protocol) -> Protocol {
+        if self.supports(incoming) {
+            incoming
+        } else {
+            self.kind.wire_protocol()
+        }
+    }
+
+    /// 某种协议对应的出站 URL。
+    ///
+    /// 是个纯映射：给什么协议就拼什么协议的路径，不在声明里就用该协议的默认路径。
+    /// 「该用哪种协议」是 [`Provider::wire_for`] 的职责，两者分开，
+    /// 免得这里偷偷换协议、调用方还以为自己拿的是想要的那个 URL。
+    pub fn endpoint_for(&self, protocol: Protocol) -> String {
+        let override_path = self
+            .endpoints()
+            .into_iter()
+            .find(|e| e.protocol == protocol)
+            .and_then(|e| e.path);
+
+        match override_path {
+            Some(path) => self.endpoint_verbatim(&path),
+            None => self.endpoint(protocol.default_path()),
+        }
     }
 
     /// 该渠道要注入上游的鉴权头；不该注入时返回 `None`。
@@ -139,6 +222,24 @@ impl Provider {
         };
         joined
     }
+
+    /// 拼接一个**用户显式给出**的路径。
+    ///
+    /// 与 [`Provider::endpoint`] 的区别：只做「两边都带 /v1 时去掉重复的那一次」，
+    /// 绝不替用户补 `/v1`。`endpoint` 会补，是因为它拿到的都是协议默认路径
+    /// （硬编码 `/v1/...`）；而用户手写的路径可能是 `/api/chat` 这种，
+    /// 被补成 `/v1/api/chat` 就是一个必然 404 —— 「我写什么就发什么」比猜得聪明重要。
+    fn endpoint_verbatim(&self, path: &str) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        let path = path.trim_start_matches('/');
+
+        if base.ends_with("/v1") {
+            if let Some(rest) = path.strip_prefix("v1/") {
+                return format!("{base}/{rest}");
+            }
+        }
+        format!("{base}/{path}")
+    }
 }
 
 /// 某模型在某渠道下的可用性条目（等价于 new-api 的 abilities）。
@@ -167,6 +268,7 @@ mod tests {
             base_url: base_url.into(),
             api_key: None,
             auth_style: AuthStyle::XApiKey,
+            protocols: Vec::new(),
             extra_headers: Default::default(),
             param_override: None,
             model_mapping: Default::default(),
@@ -273,5 +375,125 @@ mod tests {
             Some(ProviderKind::OpenAiResponses)
         );
         assert_eq!(ProviderKind::parse("nope"), None);
+    }
+
+    #[test]
+    fn provider_kind_json_name_matches_db_and_frontend() {
+        // 前端 `ProviderKind` 联合类型、DB 的 kind 列、`as_str()` 必须是同一套名字。
+        // `rename_all = "snake_case"` 会把 OpenAiChat 变成 open_ai_chat，与它们对不上，
+        // 后果是前端保存 OpenAI 系渠道时 ProviderInput 直接反序列化失败。
+        for (k, name) in [
+            (ProviderKind::Anthropic, "anthropic"),
+            (ProviderKind::OpenAiChat, "openai_chat"),
+            (ProviderKind::OpenAiResponses, "openai_responses"),
+        ] {
+            assert_eq!(k.as_str(), name);
+            assert_eq!(serde_json::to_string(&k).unwrap(), format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<ProviderKind>(&format!("\"{name}\"")).unwrap(), k);
+        }
+    }
+
+    #[test]
+    fn endpoints_fall_back_to_kind_when_nothing_declared() {
+        // 没声明过的渠道必须保持"只有 kind 那一种协议"的既有行为。
+        let p = provider("https://x");
+        let es = p.endpoints();
+        assert_eq!(es.len(), 1);
+        assert_eq!(es[0].protocol, Protocol::AnthropicMessages);
+        assert!(es[0].path.is_none());
+    }
+
+    #[test]
+    fn endpoints_use_declared_list_when_present() {
+        let mut p = provider("https://x");
+        p.protocols = vec![
+            ProtocolEndpoint::plain(Protocol::AnthropicMessages),
+            ProtocolEndpoint::plain(Protocol::OpenAiChat),
+        ];
+        assert_eq!(p.endpoints().len(), 2);
+        assert!(p.supports(Protocol::AnthropicMessages));
+        assert!(p.supports(Protocol::OpenAiChat));
+        assert!(!p.supports(Protocol::OpenAiResponses));
+    }
+
+    #[test]
+    fn wire_for_prefers_the_incoming_protocol() {
+        let mut p = provider("https://x");
+        p.kind = ProviderKind::OpenAiChat;
+        p.protocols = vec![
+            ProtocolEndpoint::plain(Protocol::OpenAiChat),
+            ProtocolEndpoint::plain(Protocol::AnthropicMessages),
+        ];
+
+        // 声明里有就用它 —— 同协议直通，不转换。
+        assert_eq!(
+            p.wire_for(Protocol::AnthropicMessages),
+            Protocol::AnthropicMessages
+        );
+        // 声明里没有才回落到首选协议。
+        assert_eq!(p.wire_for(Protocol::OpenAiResponses), Protocol::OpenAiChat);
+    }
+
+    #[test]
+    fn endpoint_for_uses_default_path_and_honours_override() {
+        let mut p = provider("https://api.example.com");
+        // 未覆盖时用协议默认路径。
+        assert_eq!(
+            p.endpoint_for(Protocol::OpenAiChat),
+            "https://api.example.com/v1/chat/completions"
+        );
+
+        p.protocols = vec![ProtocolEndpoint {
+            protocol: Protocol::OpenAiChat,
+            path: Some("/api/chat".into()),
+        }];
+        assert_eq!(p.endpoint_for(Protocol::OpenAiChat), "https://api.example.com/api/chat");
+        // 没在声明里的协议仍然拼得出来（用它的默认路径），不会 panic ——
+        // endpoint_for 是纯映射，"该不该用这个协议"由 wire_for 决定。
+        assert_eq!(
+            p.endpoint_for(Protocol::AnthropicMessages),
+            "https://api.example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn endpoint_for_never_invents_a_v1_prefix_for_custom_paths() {
+        // 用户手写的路径直接拼在 base_url 后面。"/api/chat" 被补成
+        // "/v1/api/chat" 就是一次必然 404，而按协议默认路径来的 "/v1/..." 又
+        // 不能重复拼出 "/v1/v1/..."，两种意图必须分开处理。
+        let mut p = provider("https://gw.example.com");
+        p.protocols = vec![ProtocolEndpoint {
+            protocol: Protocol::OpenAiChat,
+            path: Some("api/chat".into()),
+        }];
+        assert_eq!(p.endpoint_for(Protocol::OpenAiChat), "https://gw.example.com/api/chat");
+    }
+
+    #[test]
+    fn endpoint_for_does_not_duplicate_v1_with_override() {
+        // base_url 自带 /v1、覆盖路径也带 /v1 时，去重逻辑要同样生效。
+        let mut p = provider("https://api.example.com/v1");
+        p.protocols = vec![ProtocolEndpoint {
+            protocol: Protocol::OpenAiChat,
+            path: Some("/v1/chat/completions".into()),
+        }];
+        assert_eq!(
+            p.endpoint_for(Protocol::OpenAiChat),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn protocols_roundtrip_through_json() {
+        // 前端存的 JSON 与后端解析的必须是同一形状（path 可省略）。
+        let raw = r#"[{"protocol":"anthropic"},{"protocol":"openai_chat","path":"/api/chat"}]"#;
+        let parsed: Vec<ProtocolEndpoint> = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].protocol, Protocol::AnthropicMessages);
+        assert_eq!(parsed[0].path, None);
+        assert_eq!(parsed[1].path.as_deref(), Some("/api/chat"));
+
+        // 没有 path 的条目序列化后不该带上 null，免得前端多一层判断。
+        assert_eq!(serde_json::to_string(&parsed[0]).unwrap(), r#"{"protocol":"anthropic"}"#);
     }
 }

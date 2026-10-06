@@ -9,14 +9,21 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 /// 支持的线协议。
+///
+/// **变体名必须显式写死 JSON 名，不能用 `rename_all`。** 类型名里的 `Ai` 在
+/// `snake_case` 规则下会被拆成 `open_ai_chat`，而在 `as_str()`（DB 列、日志、
+/// 前端联合类型）里一律是 `openai_chat`。两套名字并存会让 Tauri IPC 的入参
+/// 反序列化失败 —— 前端发 `openai_chat`，后端却在等 `open_ai_chat`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum Protocol {
     /// Anthropic Messages API（`POST /v1/messages`）
+    #[serde(rename = "anthropic")]
     AnthropicMessages,
     /// OpenAI Chat Completions（`POST /v1/chat/completions`）
+    #[serde(rename = "openai_chat")]
     OpenAiChat,
     /// OpenAI Responses API（`POST /v1/responses`）
+    #[serde(rename = "openai_responses")]
     OpenAiResponses,
 }
 
@@ -466,6 +473,36 @@ impl UnifiedDelta {
         Self::TextDelta {
             index,
             text: text.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_json_name_matches_frontend_contract() {
+        // JSON 名字必须与 `as_str()`、DB 里的 protocol_in / protocol_out / channel_kind 列、
+        // 以及前端 `src/lib/api.ts` 的联合类型完全一致。
+        //
+        // 之前靠 `rename_all = "snake_case"` 推导，它会在每个大写字母前插下划线，
+        // 于是 `OpenAiChat` 序列化成 `open_ai_chat` —— 和前端发的 `openai_chat` 对不上，
+        // 反序列化直接报 unknown variant。
+        for p in [
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&p).unwrap(),
+                format!("\"{}\"", p.as_str()),
+                "{p:?} 的 JSON 名必须与 as_str() 一致"
+            );
+            assert_eq!(
+                serde_json::from_str::<Protocol>(&format!("\"{}\"", p.as_str())).unwrap(),
+                p
+            );
         }
     }
 }

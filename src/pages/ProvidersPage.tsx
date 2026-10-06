@@ -33,7 +33,13 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { qk } from "@/hooks/queries";
-import { api, type ProbeResult, type Provider } from "@/lib/api";
+import {
+  api,
+  PROTOCOL_LABEL,
+  type ProbeResult,
+  type Protocol,
+  type Provider,
+} from "@/lib/api";
 import { formatNumber, truncate } from "@/lib/utils";
 
 const KIND_LABEL: Record<string, string> = {
@@ -41,6 +47,15 @@ const KIND_LABEL: Record<string, string> = {
   openai_chat: "OpenAI Chat",
   openai_responses: "OpenAI Responses",
 };
+
+/**
+ * 该渠道支持的协议集合。
+ *
+ * 库里存空数组表示"只支持 kind 那一种"——这是老数据的语义，
+ * 界面必须照后端 `Provider::endpoints()` 的规则还原，否则会显示成"一种都不支持"。
+ */
+const supportedProtocols = (p: Provider): Protocol[] =>
+  p.protocols?.length ? p.protocols.map((e) => e.protocol) : [p.kind];
 
 export default function ProvidersPage() {
   const qc = useQueryClient();
@@ -167,9 +182,39 @@ export default function ProvidersPage() {
                           </code>
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline">
-                            {KIND_LABEL[p.kind] ?? p.kind}
-                          </Badge>
+                          <div className="space-y-1">
+                            <Badge variant="outline">
+                              {KIND_LABEL[p.kind] ?? p.kind}
+                            </Badge>
+                            {supportedProtocols(p).length > 1 && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <div className="text-muted-foreground cursor-help text-[11px]">
+                                    支持 {supportedProtocols(p).length} 种协议
+                                  </div>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  <div className="space-y-0.5 text-xs">
+                                    {supportedProtocols(p).map((proto) => {
+                                      const override = p.protocols?.find(
+                                        (e) => e.protocol === proto,
+                                      )?.path;
+                                      return (
+                                        <div key={proto}>
+                                          {PROTOCOL_LABEL[proto]}
+                                          {proto === p.kind ? "（首选）" : ""}
+                                          <span className="text-muted-foreground">
+                                            {" "}
+                                            {override ?? "默认路径"}
+                                          </span>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </TooltipContent>
+                              </Tooltip>
+                            )}
+                          </div>
                         </TableCell>
                         <TableCell
                           className="text-muted-foreground max-w-[240px] truncate text-xs"
