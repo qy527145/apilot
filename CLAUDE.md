@@ -55,6 +55,8 @@ cargo build
 | **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → 同文件 `Provider::auth_header()`（**鉴权头的唯一构造点**，出站转发、连通探测、拉模型列表都走它） |
 | **改「直通还是转换」的判定** | `storage/models.rs::Provider::wire_for`（渠道声明的协议集合命中就直通）+ `gateway/pipeline.rs::prefer_native_protocol`（多渠道路由时同协议优先）→ 同步更新 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md) |
 | **改出站 URL 拼接** | `storage/models.rs::Provider::endpoint`（协议默认路径，会补 `/v1`）/ `endpoint_verbatim`（用户手写路径，**不补** `/v1`） |
+| **改「用哪个模型」** | 全局替换策略在 `routing/model_policy.rs::effective_model`（在 `gateway/pipeline.rs` 解码后、路由前应用）；规则链的 `ModelOverride` 在它之上再改 |
+| **改「用哪个渠道」** | `routing/model_select.rs::order`（按模型策略排序）+ `gateway/pipeline.rs::build_candidates`（未配策略时回落 selector）。模型页的策略存在 `model_policies` 表 |
 | **改计费公式** | `billing/engine.rs::settle`（唯一真源）→ 对应更新其测试；倍率字段在 `billing/pricing.rs` |
 | **加一种路由匹配条件** | `routing/rule_item.rs` 加 `RuleItem` 变体（`matches` + `describe` + 测试）→ 前端 `src/components/routing/RuleEditor.tsx` |
 | **加一种路由动作** | `routing/rule.rs::RouteAction`（注意 `is_final` 的归类）→ `routing/engine.rs::route` 的 match → 前端 `ruleSummary.ts` |

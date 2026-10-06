@@ -61,6 +61,8 @@ export function ModelMappingPanel({
       // 保存会把映射同步进 providers.model_mapping，渠道对话框拿的是旧快照；
       // 不刷新的话，之后在渠道对话框点保存会用旧映射把它覆盖回去。
       qc.invalidateQueries({ queryKey: qk.providers });
+      // 模型页的目录是从 provider_models 派生的，声明变了它也得变。
+      qc.invalidateQueries({ queryKey: qk.modelCatalog });
       // 接管页的就绪判定取决于"有没有声明过模型"，改完得让它重新问一次后端。
       qc.invalidateQueries({ queryKey: qk.takeoverReadiness });
       toast.success("模型映射已保存");

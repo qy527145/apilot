@@ -74,6 +74,7 @@ export default function ProvidersPage() {
     mutationFn: (id: number) => api.deleteProvider(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.providers });
+      qc.invalidateQueries({ queryKey: qk.modelCatalog });
       toast.success("渠道已删除");
     },
   });

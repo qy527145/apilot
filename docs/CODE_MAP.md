@@ -14,7 +14,7 @@
 - [后端模块](#后端模块)
   - [protocol — 协议 IR 与编解码](#protocol--协议-ir-与编解码6409-行)
   - [gateway — 反向代理与请求管线](#gateway--反向代理与请求管线3364-行)
-  - [routing — 规则链与热切换](#routing--规则链与热切换1874-行)
+  - [routing — 模型选择、规则链与热切换](#routing--模型选择规则链与热切换1874-行)
   - [upstream — 上游渠道](#upstream--上游渠道771-行)
   - [billing — 计费](#billing--计费848-行)
   - [cache — 响应缓存](#cache--响应缓存1109-行)
@@ -115,17 +115,40 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 ---
 
-### `routing/` — 规则链与热切换（1874 行）
+### `routing/` — 模型选择、规则链与热切换（1874 行）
 
 借自 sing-box 的模型。**规则顺序求值，首个终结动作胜出。**
 
 | 文件 | 内容 |
 |---|---|
+| `model_policy.rs` | **全局模型替换**：`effective_model()`（关闭 / 无条件 / 兜底 / 按客户端四种模式）。判定是纯函数，"有没有渠道"作为参数传入 —— 只有兜底模式才查库 |
+| `model_select.rs` | **按模型策略给候选渠道排序**（`order()`）：按优先级 / 按延迟 / 加权随机。随机源与延迟都从外面传，所以三种策略都能脱离数据库测 |
 | `metadata.rs` | `RouteMetadata`（贯穿规则链的上下文，可被非终结动作改写）、`RouteOptions` |
 | `rule_item.rs` | 匹配条件：`RuleItem` 枚举（client / model / protocol / path / header / token_estimate / logical）、`glob_match` |
 | `rule.rs` | `RouteAction`（**终结**：`Final` / `Reject`；**非终结**：`ModelOverride` / `RouteOptions` / `Sniff`）、`RouteRule` |
 | `engine.rs` | `Router::route()` —— 遍历规则，终结即停，非终结改写后继续；`RouteOutcome` |
 | `selector.rs` | `Selector`（`ArcSwap` 热切换）、`SelectorManager`（按 tag 索引 + 兜底解析）、`SelectionEvent` |
+
+**模型的两次改写，顺序不能调**：先在 `pipeline::handle` 解码后应用全局模型策略
+（`model_policy::effective_model`），再跑规则链（`meta` 可被 `ModelOverride` 再改）。
+规则链因此看到的是生效模型，也能在它之上继续改。
+
+**三个模型名各司其职，别混用**（`RequestLogRecord` 上同名）：
+
+| 字段 | 含义 | 用在哪 |
+|---|---|---|
+| `request_model` | 客户端请求的名字 | 只作展示 |
+| `model` | 生效模型（全局策略 + 规则改写之后） | 计费、聚合、**缓存键**、模型列表筛选 |
+| `upstream_model` | 渠道 `model_mapping` 之后真正发出去的名字 | 只在出站报文里 |
+
+混用会出事：缓存键若跟 `request_model` 走，换了模型会直接命中上一个模型生成的答案。
+
+**「用哪个渠道」的两条路径**（`pipeline::build_candidates`）：
+
+- 模型在 `model_policies` 里有行 → 按 `model_select::order` 排序，第一个当主渠道；
+- 没有行 → 沿用 `resolve(selector)` 选出的那个（**旧行为，一键不动**）。
+
+`model_policies` 表里没有行 == 交给 selector 与规则链，这条界线是既有配置不被破坏的基础。
 
 **热切换为什么不需要重启**：`Selector` 的当前选中项存在 `ArcSwapOption<String>` 里，
 读侧每次请求只做一次原子读 + 一次 `DashMap` 查表，拿到的 `Arc<dyn Outbound>` 在请求生命周期内稳定。
@@ -215,10 +238,11 @@ quota           += tool_call_surcharge × 工具调用次数
 | `migrations.rs` | **手写 DDL 数组**（不用 sqlx 编译期宏），按 `PRAGMA user_version` 增量执行 |
 | `db.rs` | 连接池 + PRAGMA（WAL / foreign_keys / busy_timeout）；`open_memory()` 供测试 |
 | `models.rs` | `Provider`、`ProviderKind`、`AuthStyle`、`ProviderModel`、`ProtocolEndpoint`。**`Provider::auth_header()`** 是鉴权头的唯一构造点；`wire_for()` 决定直通还是转换，`endpoint` / `endpoint_verbatim` 是出站 URL 的拼接点 |
-| `providers.rs` | 渠道 CRUD、模型映射、**`channels_for_model`**（故障转移的候选来源）、`has_declared_models`（接管前置条件） |
+| `providers.rs` | 渠道 CRUD、模型映射、**`candidate_channels`**（按每模型优先级排序，路由的候选来源）/ `candidates_for_model`（含停用渠道，模型页展示用）、**`set_model_candidates`**（跨渠道写，与 `set_models` 是同一张表的两个方向）、`has_declared_models`（接管前置条件） |
 | `routing.rs` | 路由规则 / selector / 兜底配置的读写；`ensure_default_selector` |
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
 | `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站）；`query`（动态过滤）、`get_detail`、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧 |
+| `model_policies.rs` | 每模型的渠道选择策略读写。**没有行 = 交给 selector 与路由规则** |
 | `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` |
 
 **迁移规则**：`MIGRATIONS` 数组**只追加，不修改已发布的条目**。
@@ -267,6 +291,7 @@ apilot://cache             → CacheStats
 | `billing.rs` | 6 | 单价 CRUD、`billing_summary` / `totals` / `timeseries` |
 | `cache.rs` | 4 | `cache_stats`、`clear_cache`、策略读写 |
 | `takeover.rs` | 6 | `detect_clients`、`takeover_status`、`takeover_readiness`（接管前置条件）、`preview_takeover`、`apply_takeover`、`restore_client` |
+| `models.rs` | 8 | 模型视角：`list_model_catalog` / `list_model_options`、`get_model_policy`（全局替换）、`upsert_model_policy` / `reset_model_policy` / `switch_model_channel`（每模型选渠道）、`set_model_candidates`、`probe_model_candidates` |
 | `logs.rs` | 3 | `query_logs`、`get_request_detail`、`clear_logs`（只清明细与捕获，不动 `usage_hourly`） |
 
 **命令注册**：全部在 `lib.rs` 的 `generate_handler!` 里，用**完整路径**。
@@ -291,10 +316,11 @@ apilot://cache             → CacheStats
 
 ## 数据库
 
-11 张表，SQLite（WAL 模式）。DDL 真源在 `storage/migrations.rs`。
+12 张表，SQLite（WAL 模式）。DDL 真源在 `storage/migrations.rs`。
 
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
+| `model_policies` | `model` | 每个模型的渠道选择策略（priority / latency / weight + 手动选中的渠道）。**没有行 = 交给 selector 与路由规则** |
 | `providers` | `tag` 唯一 | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、模型映射、权重、超时 |
 | `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃**。`set_models` 会把声明同步派生成 `providers.model_mapping`（见下） |
 | `route_rules` | `id` | 规则链，按 `sort_index` 求值；`items` / `action` 存 JSON |
@@ -321,7 +347,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
-| `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings |
+| `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings。**Models 是模型视角**（全局模型替换 + 每个模型的候选渠道与策略），Providers 是渠道视角 —— 同一份 `provider_models` 的两个方向 |
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明）、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |

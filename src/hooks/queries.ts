@@ -9,6 +9,8 @@ export const qk = {
   gateway: ["gateway"] as const,
   providers: ["providers"] as const,
   providerModels: (id: number) => ["provider_models", id] as const,
+  /** 模型目录（模型视角）。渠道侧改过模型声明后也要让它失效。 */
+  modelCatalog: ["model_catalog"] as const,
   routeRules: ["route_rules"] as const,
   selectors: ["selectors"] as const,
   pricing: ["pricing"] as const,

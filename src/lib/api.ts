@@ -78,6 +78,72 @@ export interface Provider {
   updated_at: number;
 }
 
+/* --------------------------- 模型（模型视角） --------------------------- */
+
+/**
+ * 全局模型替换。不管客户端发什么模型名，统一换成选定的那个。
+ *
+ * - `off` 不替换（默认）
+ * - `always` 一律替换
+ * - `fallback` 只当请求的模型没有任何可用渠道时才替换
+ * - `per_client` 按客户端分别指定，没配到的客户端用 `active_model`
+ */
+export type ModelPolicyMode = "off" | "always" | "fallback" | "per_client";
+
+export interface ModelPolicy {
+  mode: ModelPolicyMode;
+  /** `always` / `fallback` 用的模型；`per_client` 里没配到的客户端也用它。 */
+  active_model?: string | null;
+  /** `per_client` 模式：客户端标识 → 模型名。 */
+  per_client: Record<string, string>;
+}
+
+/** 同一个模型在多个渠道都有时怎么选。 */
+export type ModelStrategy = "priority" | "latency" | "weight";
+
+/** 一条候选渠道。priority / weight 是**这个模型在**该渠道上的值。 */
+export interface ModelCandidate {
+  provider_tag: string;
+  provider_name: string;
+  upstream_model?: string | null;
+  priority: number;
+  weight: number;
+  enabled: boolean;
+  /** 最近一次测速的延迟；没测过是 null。 */
+  latency_ms?: number | null;
+}
+
+export interface ModelPolicyRecord {
+  model: string;
+  strategy: ModelStrategy;
+  /** 手动切换到的渠道；null 表示按策略自动。 */
+  active_provider?: string | null;
+}
+
+export interface ModelCatalogEntry {
+  model: string;
+  /** 含被停用的渠道 —— 否则停用之后就再也启用不回来了。 */
+  candidates: ModelCandidate[];
+  /** null 表示这个模型交给路由规则与选择器管。 */
+  policy?: ModelPolicyRecord | null;
+  /** 当前会走哪个渠道。加权随机策略下为 null（每次请求重抽）。 */
+  primary?: string | null;
+}
+
+/** 写候选渠道时的入参（比读模型少几个只读字段）。 */
+export interface ModelCandidateInput {
+  provider_tag: string;
+  upstream_model?: string | null;
+  priority: number;
+  weight: number;
+  enabled: boolean;
+}
+
+export interface ModelOption {
+  model: string;
+  provider_count: number;
+}
+
 export interface GatewayStatus {
   running: boolean;
   host: string;
@@ -97,6 +163,8 @@ export interface AppSettings {
   cache_enabled: boolean;
   cache_ttl_secs: number;
   cache_max_entries: number;
+  /** 全局模型替换。默认 `mode: "off"`。 */
+  model_policy: ModelPolicy;
 }
 
 /* ------------------------------ 路由规则 ------------------------------ */
@@ -618,6 +686,28 @@ export const api = {
     call<RequestDetail>("get_request_detail", { requestId }),
   /** 清空请求明细与原文捕获。计费聚合不受影响。 */
   clearLogs: () => call<ClearResult>("clear_logs"),
+
+  /* -------------------------- 模型（模型视角） -------------------------- */
+
+  getModelPolicy: () => call<ModelPolicy>("get_model_policy"),
+  setModelPolicy: (policy: ModelPolicy) =>
+    call<ModelPolicy>("set_model_policy", { policy }),
+
+  listModelCatalog: () => call<ModelCatalogEntry[]>("list_model_catalog"),
+  listModelOptions: () => call<ModelOption[]>("list_model_options"),
+
+  upsertModelPolicy: (input: ModelPolicyRecord) =>
+    call<ModelPolicyRecord>("upsert_model_policy", { input }),
+  /** 交回路由规则与选择器管。 */
+  resetModelPolicy: (model: string) => call<null>("reset_model_policy", { model }),
+  switchModelChannel: (model: string, providerTag: string) =>
+    call<ModelPolicyRecord>("switch_model_channel", { model, providerTag }),
+
+  setModelCandidates: (model: string, candidates: ModelCandidateInput[]) =>
+    call<null>("set_model_candidates", { model, candidates }),
+  /** 对候选渠道跑一次测速，结果缓存起来供「按延迟」策略用。 */
+  probeModelCandidates: (model: string) =>
+    call<ProbeResult[]>("probe_model_candidates", { model }),
 };
 
 export type Api = typeof api;

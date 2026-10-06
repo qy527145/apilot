@@ -169,6 +169,8 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
     mutationFn: (input: ProviderInput) => api.upsertProvider(input),
     onSuccess: (saved) => {
       qc.invalidateQueries({ queryKey: qk.providers });
+      // 改渠道的启用状态 / 删渠道都会影响模型页的候选列表。
+      qc.invalidateQueries({ queryKey: qk.modelCatalog });
       qc.invalidateQueries({ queryKey: qk.providerModels(saved.id) });
       toast.success(provider ? "渠道已更新" : "渠道已创建");
       onOpenChange(false);
