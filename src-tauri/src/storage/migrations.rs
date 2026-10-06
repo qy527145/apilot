@@ -216,6 +216,21 @@ ALTER TABLE captures ADD COLUMN upstream_response_body    BLOB;
 -- 空数组表示"只支持 kind 那一种"，老数据与预设不必回填。
 ALTER TABLE providers ADD COLUMN protocols TEXT NOT NULL DEFAULT '[]';
 "#,
+    // --- v3: 流式响应的结构化内容与原始帧 ---
+    //
+    // 动机：流式响应此前只留了拼接后的纯文本（stream_text）。那份文本里没有
+    // 思考内容、没有工具调用，监控页因此做不出「模型想了什么 / 要调什么工具」。
+    // 而这两样恰恰是排查 Agent 行为时最需要看的。
+    //
+    // response_content 存的是由增量重建出的 UnifiedResponse（IR），不是 SSE 原文 ——
+    // 它小得多，且解一次就能拿到全部语义。原始帧另存，用于「原始」视图。
+    r#"
+ALTER TABLE captures ADD COLUMN response_content    TEXT;
+ALTER TABLE captures ADD COLUMN upstream_stream_raw BLOB;
+ALTER TABLE captures ADD COLUMN client_stream_raw   BLOB;
+-- 原始帧超过上限被截断时置 1。界面必须如实标出来，否则用户会以为拿到的是全部。
+ALTER TABLE captures ADD COLUMN stream_raw_truncated INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -227,7 +242,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

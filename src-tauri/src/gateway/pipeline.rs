@@ -868,6 +868,28 @@ fn finalize_stream(
             cap.ts = rec.ts;
             cap.stream_text = Some(outcome.text);
             cap.stream_events = outcome.events as i64;
+
+            // 结构化内容：思考与工具调用只存在于这里，纯文本的 stream_text 里没有。
+            // 内容为空（流一开始就断了）时不写，免得给一条失败的请求塞个空响应。
+            if !outcome.content.is_empty() {
+                let resp = UnifiedResponse {
+                    id: rec.request_id.clone(),
+                    model: rec.model.clone(),
+                    content: outcome.content.clone(),
+                    finish_reason: outcome
+                        .finish_reason
+                        .clone()
+                        .unwrap_or(FinishReason::Stop),
+                };
+                cap.response_content = serde_json::to_string(&resp).ok();
+            }
+
+            // 原始 SSE 帧，供「原始」视图。客户端侧那份在直通时与上游相同，不重复存。
+            cap.upstream_stream_raw = (!outcome.raw_upstream.is_empty())
+                .then_some(outcome.raw_upstream.clone());
+            cap.client_stream_raw = outcome.raw_client.clone();
+            cap.stream_raw_truncated = outcome.raw_truncated;
+
             if let Err(e) = crate::storage::logs::save_capture(&shell.db, &cap).await {
                 tracing::warn!("写流式捕获失败: {e}");
             }

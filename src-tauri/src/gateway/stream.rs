@@ -18,6 +18,13 @@ use crate::protocol::dto::{FinishReason, UnifiedDelta, UnifiedResponse, UnifiedU
 
 use super::sse::{append_utf8_safe, encode_event, parse_event, take_sse_block};
 
+/// 原始帧缓冲的上限（字节）。超出后停止累积并置 `raw_truncated`。
+///
+/// 一个长回答的 SSE 帧轻松上 MB，无上限累积等于把响应大小变成内存占用。
+/// 截断而不是丢弃，是因为"原始帧"本来就只有排查时才看，半份也远比没有有用 ——
+/// 前提是界面明确标出它被截断了。
+const MAX_RAW_STREAM_BYTES: usize = 2 * 1024 * 1024;
+
 /// 流结束后的统计结果。
 #[derive(Debug, Clone, Default)]
 pub struct StreamOutcome {
@@ -26,6 +33,14 @@ pub struct StreamOutcome {
     pub text: String,
     /// 由流式增量重建出的结构化内容，用于把流式结果写进缓存。
     pub content: Vec<crate::protocol::dto::ContentBlock>,
+    /// 上游发来的原始 SSE 字节。
+    pub raw_upstream: Vec<u8>,
+    /// 重编码后发给客户端的原始 SSE 字节。
+    ///
+    /// 直通时为 `None`：那种情况下客户端收到的就是 `raw_upstream`，再存一份是纯浪费。
+    pub raw_client: Option<Vec<u8>>,
+    /// 原始帧是否因为超过上限被截断。
+    pub raw_truncated: bool,
     /// 首字节耗时。
     pub ttfb: Option<Duration>,
     pub total: Option<Duration>,
@@ -33,6 +48,26 @@ pub struct StreamOutcome {
     pub events: u64,
     pub finish_reason: Option<FinishReason>,
     pub error: Option<String>,
+}
+
+/// 有上限地累积原始帧。到顶之后不再增长，只把 `truncated` 立起来。
+#[derive(Debug, Default)]
+struct RawBuffer {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl RawBuffer {
+    fn push(&mut self, chunk: &[u8]) {
+        if self.truncated {
+            return;
+        }
+        if self.bytes.len() + chunk.len() > MAX_RAW_STREAM_BYTES {
+            self.truncated = true;
+            return;
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
 }
 
 /// 把流式增量重建成完整的内容块列表。
@@ -178,6 +213,8 @@ where
         let mut buf = String::new();
         let mut rem: Vec<u8> = Vec::new();
         let mut pinned = upstream;
+        let mut raw_upstream = RawBuffer::default();
+        let mut raw_client = RawBuffer::default();
 
         loop {
             // 首个字节用更短的超时，之后用空闲超时。
@@ -207,6 +244,9 @@ where
             if outcome.ttfb.is_none() {
                 outcome.ttfb = Some(start.elapsed());
             }
+
+            // 原始帧：上游侧无条件留一份。
+            raw_upstream.push(&chunk);
 
             // 直通模式：先把原始字节原样发给客户端。
             if passthrough {
@@ -241,7 +281,9 @@ where
                     for d in &deltas {
                         if let Some(enc) = encoder.as_mut() {
                             for out in enc.on_delta(d) {
-                                yield Ok::<Bytes, std::io::Error>(encode_event(&out));
+                                let bytes = encode_event(&out);
+                                raw_client.push(&bytes);
+                                yield Ok::<Bytes, std::io::Error>(bytes);
                             }
                         }
                     }
@@ -257,7 +299,9 @@ where
             if !passthrough {
                 if let Some(enc) = encoder.as_mut() {
                     for out in enc.on_delta(&d) {
-                        yield Ok::<Bytes, std::io::Error>(encode_event(&out));
+                        let bytes = encode_event(&out);
+                        raw_client.push(&bytes);
+                        yield Ok::<Bytes, std::io::Error>(bytes);
                     }
                 }
             }
@@ -265,7 +309,9 @@ where
         if !passthrough {
             if let Some(enc) = encoder.as_mut() {
                 for out in enc.finish() {
-                    yield Ok::<Bytes, std::io::Error>(encode_event(&out));
+                    let bytes = encode_event(&out);
+                    raw_client.push(&bytes);
+                    yield Ok::<Bytes, std::io::Error>(bytes);
                 }
             }
         }
@@ -273,6 +319,10 @@ where
         outcome.usage = decoder.usage();
         outcome.text = decoder.text();
         outcome.content = acc.finish();
+        // 直通时客户端收到的就是上游字节，客户端侧那份不必重复存。
+        outcome.raw_upstream = raw_upstream.bytes;
+        outcome.raw_client = (!passthrough).then_some(raw_client.bytes);
+        outcome.raw_truncated = raw_upstream.truncated || raw_client.truncated;
         outcome.total = Some(start.elapsed());
 
         if let Some(f) = on_finish.take() {
@@ -429,6 +479,87 @@ mod tests {
         assert_eq!(outcome.text, "hi");
         assert!(outcome.ttfb.is_some());
         assert!(outcome.events >= 2);
+    }
+
+    /// 直通时客户端收到的就是上游字节，不必再存一份。
+    #[tokio::test]
+    async fn passthrough_records_upstream_raw_but_not_a_duplicate_client_copy() {
+        let chunks = vec![
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream(
+            upstream(chunks),
+            Box::new(AnthropicStreamDecoder::new()),
+            None, // 直通
+            StreamTimeouts::default(),
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+        let bytes = run(body).await;
+
+        let outcome = rx.await.unwrap();
+        assert_eq!(
+            outcome.raw_upstream, bytes,
+            "直通时上游帧应逐字节等于客户端收到的"
+        );
+        assert!(outcome.raw_client.is_none(), "直通不该重复存客户端那份");
+        assert!(!outcome.raw_truncated);
+    }
+
+    /// 跨协议时两侧原始帧都要留，且必须是不同的两份 —— 这正是排查
+    /// "转换把什么改坏了" 时唯一能对照的东西。
+    #[tokio::test]
+    async fn transcoding_keeps_both_raw_sides_and_they_differ() {
+        let chunks = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"m\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream(
+            upstream(chunks),
+            Box::new(AnthropicStreamDecoder::new()),
+            Some(Box::new(ChatStreamEncoder::new())),
+            StreamTimeouts::default(),
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+        let bytes = run(body).await;
+
+        let outcome = rx.await.unwrap();
+        let client_raw = outcome.raw_client.expect("重编码时必须留下游原始帧");
+
+        assert!(String::from_utf8_lossy(&outcome.raw_upstream).contains("message_start"));
+        assert!(String::from_utf8_lossy(&client_raw).contains("chat.completion.chunk"));
+        assert_ne!(outcome.raw_upstream, client_raw);
+        assert_eq!(client_raw, bytes, "下游原始帧应等于客户端实际收到的字节");
+    }
+
+    /// 原始帧缓冲必须有上限：一个长回答的 SSE 轻松上 MB，无限累积等于把
+    /// 响应体大小变成常驻内存。
+    #[test]
+    fn raw_buffer_stops_growing_at_the_cap_and_reports_truncation() {
+        let mut b = RawBuffer::default();
+
+        b.push(&vec![b'x'; MAX_RAW_STREAM_BYTES - 1]);
+        assert!(!b.truncated);
+        assert_eq!(b.bytes.len(), MAX_RAW_STREAM_BYTES - 1);
+
+        // 这一下会越界：整个 chunk 丢弃并置位，而不是只存一半 ——
+        // 存一半会切在 SSE 帧中间，看起来像报文本身坏了。
+        b.push(b"yy");
+        assert!(b.truncated);
+        assert_eq!(b.bytes.len(), MAX_RAW_STREAM_BYTES - 1);
+
+        // 之后不再增长。
+        b.push(b"zzz");
+        assert_eq!(b.bytes.len(), MAX_RAW_STREAM_BYTES - 1);
     }
 
     #[tokio::test]

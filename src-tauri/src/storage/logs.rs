@@ -296,6 +296,17 @@ pub struct RequestDetail {
     pub response_body: Option<String>,
     pub stream_text: Option<String>,
     pub stream_events: i64,
+    /// 流式响应的结构化内容（`UnifiedResponse` 的 JSON）。
+    ///
+    /// 流式没有完整的响应体可存，但由增量重建出的内容块里有思考与工具调用 ——
+    /// 只留 `stream_text`（纯文本）的话这两样就没了。
+    pub response_content: Option<String>,
+    /// 上游发来的原始 SSE 帧；`raw_truncated` 为真时是被截断过的。
+    pub upstream_stream_raw: Option<String>,
+    /// 重编码后发给客户端的原始 SSE 帧。直通时为 `None`（与上游那份相同）。
+    pub client_stream_raw: Option<String>,
+    /// 原始 SSE 帧是否因为超过上限被截断。
+    pub stream_raw_truncated: bool,
 }
 
 /// 出站方向的追踪：Apilot 实际发给上游的请求，与上游返回的原始响应。
@@ -330,6 +341,11 @@ pub struct CaptureRecord {
     pub response_body: Option<Vec<u8>>,
     pub stream_text: Option<String>,
     pub stream_events: i64,
+    /// 流式响应的结构化内容（`UnifiedResponse` 的 JSON 文本）。
+    pub response_content: Option<String>,
+    pub upstream_stream_raw: Option<Vec<u8>>,
+    pub client_stream_raw: Option<Vec<u8>>,
+    pub stream_raw_truncated: bool,
 }
 
 pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()> {
@@ -338,8 +354,9 @@ pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()>
              request_id, ts, method, path, request_headers, request_body,
              upstream_url, upstream_headers, upstream_body, upstream_status,
              upstream_response_headers, upstream_response_body,
-             response_headers, response_body, stream_text, stream_events)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+             response_headers, response_body, stream_text, stream_events,
+             response_content, upstream_stream_raw, client_stream_raw, stream_raw_truncated)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
     )
     .bind(&c.request_id)
     .bind(c.ts)
@@ -357,6 +374,10 @@ pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()>
     .bind(&c.response_body)
     .bind(&c.stream_text)
     .bind(c.stream_events)
+    .bind(&c.response_content)
+    .bind(&c.upstream_stream_raw)
+    .bind(&c.client_stream_raw)
+    .bind(c.stream_raw_truncated as i64)
     .execute(pool)
     .await?;
     Ok(())
@@ -372,7 +393,8 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         "SELECT method, path, request_headers, request_body,
                 upstream_url, upstream_headers, upstream_body, upstream_status,
                 upstream_response_headers, upstream_response_body,
-                response_headers, response_body, stream_text, stream_events
+                response_headers, response_body, stream_text, stream_events,
+                response_content, upstream_stream_raw, client_stream_raw, stream_raw_truncated
          FROM captures WHERE request_id = ?1",
     )
     .bind(request_id)
@@ -395,6 +417,10 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         response_body,
         stream_text,
         stream_events,
+        response_content,
+        upstream_stream_raw,
+        client_stream_raw,
+        stream_raw_truncated,
     ) = match &cap {
         Some(r) => (
             r.get::<Option<String>, _>("method").unwrap_or_default(),
@@ -411,6 +437,10 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
             r.get::<Option<Vec<u8>>, _>("response_body"),
             r.get::<Option<String>, _>("stream_text"),
             r.get::<Option<i64>, _>("stream_events").unwrap_or(0),
+            r.get::<Option<String>, _>("response_content"),
+            r.get::<Option<Vec<u8>>, _>("upstream_stream_raw"),
+            r.get::<Option<Vec<u8>>, _>("client_stream_raw"),
+            r.get::<Option<i64>, _>("stream_raw_truncated").unwrap_or(0) != 0,
         ),
         None => (
             String::new(),
@@ -427,6 +457,10 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
             None,
             None,
             0,
+            None,
+            None,
+            None,
+            false,
         ),
     };
 
@@ -474,6 +508,12 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         response_body: response_body.map(|b| String::from_utf8_lossy(&b).to_string()),
         stream_text,
         stream_events,
+        response_content,
+        upstream_stream_raw: upstream_stream_raw
+            .map(|b| String::from_utf8_lossy(&b).to_string()),
+        client_stream_raw: client_stream_raw
+            .map(|b| String::from_utf8_lossy(&b).to_string()),
+        stream_raw_truncated,
     }))
 }
 
@@ -775,6 +815,7 @@ mod tests {
                 response_body: Some(br#"{"ok":true}"#.to_vec()),
                 stream_text: Some("最终答案".into()),
                 stream_events: 42,
+                ..Default::default()
             },
         )
         .await
@@ -786,6 +827,75 @@ mod tests {
         assert_eq!(d.request_body.as_deref(), Some(r#"{"model":"m"}"#));
         assert_eq!(d.stream_text.as_deref(), Some("最终答案"));
         assert_eq!(d.stream_events, 42);
+    }
+
+    #[tokio::test]
+    async fn stream_specific_capture_fields_roundtrip() {
+        // 流式响应没有完整响应体，思考与工具调用只存在于 response_content 里，
+        // 原始帧则只在两个 raw 列里。少存任何一个，界面都做不出对应的视图。
+        let p = pool().await;
+        insert(&p, &rec("r1", "claude-code", "m")).await.unwrap();
+
+        let content = serde_json::json!({
+            "id": "msg_1",
+            "model": "m",
+            "content": [
+                { "type": "thinking", "text": "先看看目录" },
+                { "type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "ls"} },
+            ],
+            "finish_reason": { "type": "tool_use" },
+        });
+
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r1".into(),
+                ts: now_ms(),
+                stream_text: Some("".into()),
+                stream_events: 17,
+                response_content: Some(content.to_string()),
+                upstream_stream_raw: Some(b"event: x\ndata: {}\n\n".to_vec()),
+                client_stream_raw: Some(b"event: y\ndata: {}\n\n".to_vec()),
+                stream_raw_truncated: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(d.response_content.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"][0]["type"], "thinking");
+        assert_eq!(parsed["content"][1]["input"]["cmd"], "ls");
+        assert_eq!(parsed["finish_reason"]["type"], "tool_use");
+        assert!(d.upstream_stream_raw.as_deref().unwrap().contains("event: x"));
+        assert!(d.client_stream_raw.as_deref().unwrap().contains("event: y"));
+        assert!(d.stream_raw_truncated);
+    }
+
+    #[tokio::test]
+    async fn stream_raw_fields_default_to_none_and_false() {
+        // 非流式捕获不该被这些列影响；截断标志默认必须是 false，
+        // 否则界面会对所有请求都显示"已截断"。
+        let p = pool().await;
+        insert(&p, &rec("r1", "a", "m")).await.unwrap();
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r1".into(),
+                ts: now_ms(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(d.response_content, None);
+        assert_eq!(d.upstream_stream_raw, None);
+        assert_eq!(d.client_stream_raw, None);
+        assert!(!d.stream_raw_truncated);
     }
 
     #[tokio::test]
