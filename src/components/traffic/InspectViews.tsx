@@ -169,18 +169,40 @@ function ToolCallCard({ name, input }: { name: string; input: unknown }) {
   );
 }
 
+/** 取出纯文本内容（**不含**思考块）。
+ *
+ * 收敛成一个函数是有原因的：`thinking` 块的形状是 `{ type: "thinking", text }`，
+ * 它同样带 `text` 属性，所以 `"text" in block` 或 `block.text` 这类写法会把
+ * 思考内容混进回答里。判断一律走 `type`，且只在这一个地方判断。
+ */
+function joinText(blocks: ContentBlock[]): string {
+  return blocks
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+}
+
 /**
  * 按 `block.type` 渲染。`tool_result` 的内容是块数组，所以这里是递归的。
  *
+ * ⚠️ 判断块类型一律用 `block.type === "..."`，**不要**用 `"text" in block`：
+ * `thinking` 块的形状是 `{ type: "thinking", text: "..." }`，它同样有 `text`
+ * 属性，用 `in` 判断会把思考内容当成回答拼进去。取文本用 [`joinText`]。
+ *
  * `depth` 只用于给嵌套块加缩进 —— 工具结果里再套工具结果虽然罕见，
  * 但协议允许，不加缩进会看不出层级。
+ *
+ * `labels` 控制是否自带类型标签。响应视图会给每个块套一层带标题的卡片，
+ * 那里再带上标签就重复了。
  */
 function BlockRenderer({
   block,
   depth = 0,
+  labels = true,
 }: {
   block: ContentBlock;
   depth?: number;
+  labels?: boolean;
 }) {
   switch (block.type) {
     case "text":
@@ -188,11 +210,13 @@ function BlockRenderer({
 
     case "thinking":
       return (
-        <div className="border-l-2 border-dashed pl-2">
-          <div className="text-muted-foreground mb-1 text-[11px]">
-            思考内容
-            {block.signature ? "（带签名）" : ""}
-          </div>
+        <div className={labels ? "border-l-2 border-dashed pl-2" : undefined}>
+          {labels && (
+            <div className="text-muted-foreground mb-1 text-[11px]">
+              思考内容
+              {block.signature ? "（带签名）" : ""}
+            </div>
+          )}
           <LongText text={block.text} limit={400} className="italic" />
         </div>
       );
@@ -216,19 +240,21 @@ function BlockRenderer({
             block.is_error && "border-destructive/40 bg-destructive/10",
           )}
         >
-          <div className="mb-1 flex items-center gap-1.5 text-[11px]">
-            <span className="text-muted-foreground font-mono">
-              结果 → {block.tool_use_id}
-            </span>
-            {block.is_error && (
-              <Badge variant="destructive" className="h-4 px-1 text-[10px]">
-                出错
-              </Badge>
-            )}
-          </div>
+          {labels && (
+            <div className="mb-1 flex items-center gap-1.5 text-[11px]">
+              <span className="text-muted-foreground font-mono">
+                结果 → {block.tool_use_id}
+              </span>
+              {block.is_error && (
+                <Badge variant="destructive" className="h-4 px-1 text-[10px]">
+                  出错
+                </Badge>
+              )}
+            </div>
+          )}
           <div className={cn("space-y-2", depth > 0 && "pl-3")}>
             {block.content.map((b, i) => (
-              <BlockRenderer key={i} block={b} depth={depth + 1} />
+              <BlockRenderer key={i} block={b} depth={depth + 1} labels={labels} />
             ))}
           </div>
         </div>
@@ -309,7 +335,7 @@ function MessageCard({
 
 /** 收起状态下的一行摘要：先给文本，没有文本就说明有几个什么块。 */
 function previewOf(msg: UnifiedMessage): string {
-  const text = msg.content.map((b) => ("text" in b ? b.text : "")).join("").trim();
+  const text = joinText(msg.content).trim();
   if (text) return text.replace(/\s+/g, " ").slice(0, 120);
 
   const counts: string[] = [];
@@ -372,8 +398,10 @@ export function RequestView({ req }: { req: UnifiedRequest }) {
   // `extra` 是后端 flatten 上来的未建模字段，要按已知键名排除掉。
   const extras = Object.entries(req).filter(([k]) => !SYSTEM_KEYS.has(k));
 
+  // 按 type 判断，不用 `"text" in b` —— 思考块同样带 text 属性（见 BlockRenderer 的说明）。
   const systemText = system
-    .map((b) => ("text" in b ? b.text : ""))
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
     .join("\n")
     .trim();
 
@@ -563,6 +591,60 @@ function UsagePanel({ usage }: { usage: UnifiedUsage }) {
   );
 }
 
+/** 响应里每种内容块的标题。用于把交错的块区分开。 */
+const RESPONSE_BLOCK_LABEL: Record<ContentBlock["type"], string> = {
+  text: "回答",
+  thinking: "思考",
+  redacted_thinking: "加密思考",
+  tool_use: "工具调用",
+  tool_result: "工具结果",
+  image: "图片",
+};
+
+/**
+ * 响应里的一个内容块。
+ *
+ * 文字块与思考块套一层带标题的卡片 —— 它们在事件流里是交替出现的，不标出来
+ * 就看不出哪段是模型想给自己看的、哪段是给用户看的。
+ * 工具调用/图片这类块自带标题，直接用 `BlockRenderer` 的成品，不再套一层。
+ */
+function ResponseBlock({ block }: { block: ContentBlock }) {
+  if (block.type !== "text" && block.type !== "thinking") {
+    return <BlockRenderer block={block} />;
+  }
+
+  const thinking = block.type === "thinking";
+  const len = block.text.length;
+
+  return (
+    <div
+      className={cn(
+        "rounded-md border p-2",
+        thinking && "bg-muted/20 border-dashed",
+      )}
+    >
+      <div className="mb-1 flex items-center gap-2 text-[11px]">
+        <span
+          className={cn(
+            "font-medium",
+            thinking ? "text-muted-foreground" : "text-foreground",
+          )}
+        >
+          {RESPONSE_BLOCK_LABEL[block.type]}
+        </span>
+        <span className="text-muted-foreground tabular-nums">
+          {formatNumber(len)} 字
+        </span>
+        {block.type === "thinking" && block.signature && (
+          <span className="text-muted-foreground">带签名</span>
+        )}
+      </div>
+      {/* 思考默认限得更短：它是过程，不该把回答挤到屏幕外。 */}
+      <BlockRenderer block={block} labels={false} />
+    </div>
+  );
+}
+
 export function ResponseView({
   resp,
   usage,
@@ -570,70 +652,36 @@ export function ResponseView({
   resp: UnifiedResponse;
   usage?: UnifiedUsage | null;
 }) {
-  const text = resp.content
-    .map((b) => ("text" in b ? b.text : ""))
-    .join("")
-    .trim();
-  const thinking = resp.content.filter((b) => b.type === "thinking");
-  const calls = resp.content.filter((b) => b.type === "tool_use");
-  const rest = resp.content.filter(
-    (b) =>
-      b.type !== "text" && b.type !== "thinking" && b.type !== "tool_use",
-  );
+  const content = resp.content ?? [];
+
+  const hasText = content.some((b) => b.type === "text");
+  const toolCalls = content.filter((b) => b.type === "tool_use").length;
 
   return (
     <div className="space-y-2">
-      {calls.length > 0 && (
-        <Section title="要调用的工具" count={`${calls.length} 个`}>
-          <div className="space-y-2">
-            {calls.map((b, i) =>
-              b.type === "tool_use" ? (
-                <ToolCallCard key={i} name={b.name} input={b.input} />
-              ) : null,
-            )}
-          </div>
-        </Section>
+      {/*
+       * 顺序就是事件流里的顺序：模型先想、再答、最后决定调工具。
+       * 按类型分桶重排（先"要调用的工具"、再"回答"、再"思考内容"）会把这个
+       * 因果顺序抹掉，读起来像"思考和回答是并列的两件事"。
+       */}
+      <div className="space-y-2">
+        {content.map((b, i) => (
+          <ResponseBlock key={i} block={b} />
+        ))}
+      </div>
+
+      {content.length === 0 && (
+        <p className="text-muted-foreground py-4 text-center text-xs">
+          （这一轮没有输出任何内容块）
+        </p>
       )}
 
-      <Section title="回答" defaultOpen>
-        {text ? (
-          <LongText text={text} limit={1600} />
-        ) : (
-          <p className="text-muted-foreground text-xs">
-            {calls.length > 0
-              ? "模型这一轮没有输出文本，只发起了工具调用。"
-              : "（没有文本内容）"}
-          </p>
-        )}
-      </Section>
-
-      {thinking.length > 0 && (
-        <Section
-          title="思考内容"
-          count={`${formatNumber(
-            thinking.reduce(
-              (n, b) => n + ("text" in b ? b.text.length : 0),
-              0,
-            ),
-          )} 字`}
-          defaultOpen={false}
-        >
-          <div className="space-y-2">
-            {thinking.map((b, i) => (
-              <BlockRenderer key={i} block={b} />
-            ))}
-          </div>
-        </Section>
-      )}
-
-      {rest.length > 0 && (
-        <Section title="其它内容块" defaultOpen={false}>
-          <div className="space-y-2">
-            {rest.map((b, i) => (
-              <BlockRenderer key={i} block={b} />
-            ))}
-          </div>
-        </Section>
+      {content.length > 0 && !hasText && (
+        <p className="text-muted-foreground text-xs">
+          {toolCalls > 0
+            ? "模型这一轮没有输出文本，只发起了工具调用。"
+            : "（没有文本内容）"}
+        </p>
       )}
 
       {usage && (
