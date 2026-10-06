@@ -24,12 +24,32 @@ pub async fn query_logs(
     Ok(Page { items, total })
 }
 
+/// 详情命令的返回：日志 + 捕获原文 + 语义化视图。
+///
+/// `flatten` 让前端看到的就是一个扁平的 `RequestDetail` 再加一个 `views` 字段
+/// —— 既有的类型定义不用改结构。
+#[derive(Debug, Clone, Serialize)]
+pub struct DetailResponse {
+    #[serde(flatten)]
+    pub detail: RequestDetail,
+    /// 把捕获的报文解成 IR 的结果。解不出来的方向会带上原因。
+    pub views: crate::protocol::inspect::DetailViews,
+}
+
 #[tauri::command]
 pub async fn get_request_detail(
     shell: State<'_, Arc<AppShell>>,
     request_id: String,
-) -> AppResult<Option<RequestDetail>> {
-    crate::storage::logs::get_detail(&shell.db, &request_id).await
+) -> AppResult<Option<DetailResponse>> {
+    let Some(detail) = crate::storage::logs::get_detail(&shell.db, &request_id).await? else {
+        return Ok(None);
+    };
+
+    // 解码放在这里而不是落库时：它只在用户点开某一条详情时才跑，
+    // 而且报文可能很重（请求体动辄上百 KB），不该占用请求热路径。
+    let views = crate::protocol::inspect::inspect(&shell.codecs, &detail);
+
+    Ok(Some(DetailResponse { detail, views }))
 }
 
 /// 清空请求明细的返回：各删了多少条，供前端提示。

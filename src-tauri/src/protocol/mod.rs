@@ -5,6 +5,7 @@
 pub mod anthropic;
 pub mod codec;
 pub mod dto;
+pub mod inspect;
 pub mod oai_chat;
 pub mod oai_responses;
 pub mod shared;
