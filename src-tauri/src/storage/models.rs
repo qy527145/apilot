@@ -483,6 +483,65 @@ mod tests {
         );
     }
 
+    /// 主流服务商预设里的 base_url + 路径，拼出来必须是文档给的那个地址。
+    ///
+    /// 这些值和 `src/components/providers/presets.ts` 一一对应。放在这里是为了
+    /// 给 `endpoint` / `endpoint_verbatim` 的拼接规则上一道锁：规则一旦改动，
+    /// 先炸的是这个测试，而不是用户那边一堆莫名其妙的 404。
+    #[test]
+    fn provider_preset_urls_match_the_documented_endpoints() {
+        let cases: &[(&str, Protocol, Option<&str>, &str)] = &[
+            // Anthropic 官方
+            ("https://api.anthropic.com", Protocol::AnthropicMessages, None,
+             "https://api.anthropic.com/v1/messages"),
+            // OpenAI 官方（base 自带 /v1，默认路径也带，不能拼重）
+            ("https://api.openai.com/v1", Protocol::OpenAiChat, None,
+             "https://api.openai.com/v1/chat/completions"),
+            ("https://api.openai.com/v1", Protocol::OpenAiResponses, None,
+             "https://api.openai.com/v1/responses"),
+            // DeepSeek：三种协议，Anthropic 那条挂在 /anthropic 子路径下
+            ("https://api.deepseek.com", Protocol::OpenAiChat, None,
+             "https://api.deepseek.com/v1/chat/completions"),
+            ("https://api.deepseek.com", Protocol::OpenAiResponses, None,
+             "https://api.deepseek.com/v1/responses"),
+            ("https://api.deepseek.com", Protocol::AnthropicMessages,
+             Some("/anthropic/v1/messages"),
+             "https://api.deepseek.com/anthropic/v1/messages"),
+            // Moonshot：base 用裸域名，否则 /anthropic 会被拼成 /v1/anthropic
+            ("https://api.moonshot.cn", Protocol::OpenAiChat,
+             Some("/v1/chat/completions"),
+             "https://api.moonshot.cn/v1/chat/completions"),
+            ("https://api.moonshot.cn", Protocol::AnthropicMessages,
+             Some("/anthropic/v1/messages"),
+             "https://api.moonshot.cn/anthropic/v1/messages"),
+            // 百炼：两种协议在完全不同的前缀下
+            ("https://dashscope.aliyuncs.com", Protocol::OpenAiChat,
+             Some("/compatible-mode/v1/chat/completions"),
+             "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
+            ("https://dashscope.aliyuncs.com", Protocol::AnthropicMessages,
+             Some("/apps/anthropic/v1/messages"),
+             "https://dashscope.aliyuncs.com/apps/anthropic/v1/messages"),
+            // OpenRouter：三种都在 /v1 下
+            ("https://openrouter.ai/api/v1", Protocol::AnthropicMessages, None,
+             "https://openrouter.ai/api/v1/messages"),
+            ("https://openrouter.ai/api/v1", Protocol::OpenAiResponses, None,
+             "https://openrouter.ai/api/v1/responses"),
+        ];
+
+        for (base, protocol, path, expected) in cases {
+            let mut p = provider(base);
+            p.protocols = vec![ProtocolEndpoint {
+                protocol: *protocol,
+                path: path.map(String::from),
+            }];
+            assert_eq!(
+                p.endpoint_for(*protocol),
+                *expected,
+                "base={base} protocol={protocol:?} path={path:?}"
+            );
+        }
+    }
+
     #[test]
     fn protocols_roundtrip_through_json() {
         // 前端存的 JSON 与后端解析的必须是同一形状（path 可省略）。

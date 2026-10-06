@@ -1,7 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, Loader2 } from "lucide-react";
+import { ArrowRight, Copy, Loader2 } from "lucide-react";
+import { useState } from "react";
+import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -26,6 +29,10 @@ interface Props {
 }
 
 export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
+  // 原始 / 格式化是全局的：在「Apilot → 上游」切成原始后翻到别的 tab，
+  // 期望的还是原始 —— 这个模式表达的是"我正在核对报文"，与看哪一段无关。
+  const [rawMode, setRawMode] = useState(false);
+
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: qk.requestDetail(requestId ?? ""),
     queryFn: () => api.getRequestDetail(requestId as string),
@@ -88,6 +95,8 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
                   headers={data.request_headers}
                   body={data.request_body}
                   emptyBody="未捕获请求体"
+                  rawMode={rawMode}
+                  onRawModeChange={setRawMode}
                 />
               </TabsContent>
 
@@ -111,6 +120,8 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
                   emptyBody={
                     data.upstream_url ? "未捕获请求体" : "没有发往上游的请求"
                   }
+                  rawMode={rawMode}
+                  onRawModeChange={setRawMode}
                 />
               </TabsContent>
 
@@ -125,6 +136,8 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
                   headers={data.upstream_response_headers}
                   body={data.upstream_response_body}
                   emptyBody="未捕获上游响应体（流式响应不缓冲原文，见「流式文本」）"
+                  rawMode={rawMode}
+                  onRawModeChange={setRawMode}
                 />
               </TabsContent>
 
@@ -135,6 +148,8 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
                   headers={data.response_headers}
                   body={data.response_body}
                   emptyBody="未捕获响应体"
+                  rawMode={rawMode}
+                  onRawModeChange={setRawMode}
                 />
               </TabsContent>
 
@@ -230,14 +245,19 @@ function Exchange({
   headers,
   body,
   emptyBody,
+  rawMode,
+  onRawModeChange,
 }: {
   headline: string;
   note: string;
   headers: Record<string, string>;
   body?: string | null;
   emptyBody: string;
+  rawMode: boolean;
+  onRawModeChange: (v: boolean) => void;
 }) {
   const headerCount = Object.keys(headers ?? {}).length;
+  const headersRaw = JSON.stringify(headers ?? {});
 
   return (
     <div className="space-y-2">
@@ -251,10 +271,29 @@ function Exchange({
           </TabsTrigger>
         </TabsList>
         <TabsContent value="body">
-          <JsonBlock raw={body} empty={emptyBody} />
+          <JsonBlock
+            raw={body}
+            empty={emptyBody}
+            rawMode={rawMode}
+            onRawModeChange={onRawModeChange}
+          />
         </TabsContent>
         <TabsContent value="headers">
-          <BareBlock text={JSON.stringify(headers ?? {}, null, 2)} />
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-muted-foreground text-[11px] tabular-nums">
+                {headerCount} 个字段
+              </span>
+              <div className="flex items-center gap-1">
+                <RawToggle raw={rawMode} onChange={onRawModeChange} />
+                <CopyButton text={headersRaw} />
+              </div>
+            </div>
+            <BareBlock
+              text={rawMode ? headersRaw : JSON.stringify(headers ?? {}, null, 2)}
+              pre={rawMode}
+            />
+          </div>
         </TabsContent>
       </Tabs>
     </div>
@@ -291,20 +330,109 @@ function Field({
  * 内容块统一用原生滚动而不是 Radix ScrollArea。
  * ScrollArea 的 viewport 需要一个确定高度才能滚动，而这里的高度由 flex 容器
  * 决定 —— 那正是详情弹窗溢出、滚不动的直接原因。
+ *
+ * `pre` 用于原始报文：保持单行与原有空白，横向滚动，不做任何折行重排
+ * —— 折行会让人分不清哪些空白是报文里真有的。
  */
-function BareBlock({ text }: { text: string }) {
+function BareBlock({ text, pre }: { text: string; pre?: boolean }) {
   return (
-    <pre className="bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre-wrap">
+    <pre
+      className={
+        pre
+          ? "bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre"
+          : "bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre-wrap"
+      }
+    >
       {text}
     </pre>
   );
 }
 
-function JsonBlock({ raw, empty }: { raw?: string | null; empty: string }) {
+/** 原始 / 格式化的切换按钮。 */
+function RawToggle({
+  raw,
+  onChange,
+}: {
+  raw: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center gap-1">
+      <Button
+        variant={raw ? "default" : "outline"}
+        size="sm"
+        className="h-6 px-2 text-[11px]"
+        onClick={() => onChange(true)}
+      >
+        原始
+      </Button>
+      <Button
+        variant={raw ? "outline" : "default"}
+        size="sm"
+        className="h-6 px-2 text-[11px]"
+        onClick={() => onChange(false)}
+      >
+        格式化
+      </Button>
+    </div>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className="h-6 px-2 text-[11px]"
+      onClick={() => {
+        navigator.clipboard
+          .writeText(text)
+          .then(() => toast.success("已复制到剪贴板"))
+          .catch(() => toast.error("复制失败，请手动选中复制"));
+      }}
+    >
+      <Copy className="size-3" />
+      复制
+    </Button>
+  );
+}
+
+/**
+ * 报文正文。默认展示格式化后的 JSON，可切到「原始」看未经任何加工的字符串。
+ *
+ * 之所以需要这个切换：格式化会重排键序、补缩进，看结构方便；但要核对
+ * "客户端到底发了什么"、或者怀疑哪一步改动了报文时，只有原始串说得清。
+ */
+function JsonBlock({
+  raw,
+  empty,
+  rawMode,
+  onRawModeChange,
+}: {
+  raw?: string | null;
+  empty: string;
+  rawMode: boolean;
+  onRawModeChange: (v: boolean) => void;
+}) {
   if (!raw) {
     return (
       <p className="text-muted-foreground py-6 text-center text-xs">{empty}</p>
     );
   }
-  return <BareBlock text={prettyJson(raw)} />;
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-muted-foreground text-[11px] tabular-nums">
+          {raw.length} 字符
+          {rawMode ? "（未加工）" : "（已格式化）"}
+        </span>
+        <div className="flex items-center gap-1">
+          <RawToggle raw={rawMode} onChange={onRawModeChange} />
+          <CopyButton text={raw} />
+        </div>
+      </div>
+      <BareBlock text={rawMode ? raw : prettyJson(raw)} pre={rawMode} />
+    </div>
+  );
 }

@@ -46,7 +46,9 @@ wire = 入站协议 ∈ 渠道声明的协议集合 ? 入站协议 : 渠道的�
 对角线是直通，前提是渠道把该协议声明进了「支持的协议」。
 
 想确认某次请求实际走了哪条路，看监控页：日志行的「协议」列会标 **直通** 或 **转换**，
-详情弹窗里有完整的入站路径与上游 URL 可以对照。
+详情弹窗里有完整的入站路径与上游 URL 可以对照。详情里的报文可以在
+**原始 / 格式化**之间切换 —— 核对"客户端到底发了什么"时看原始那份，
+看结构时看格式化的那份。
 
 ---
 
@@ -152,6 +154,40 @@ Anthropic 本来就是这口径；OpenAI / Responses 的 `prompt_tokens` **含**
 
 日志行的「状态码」旁边如果多出一个「上游 404」，说明那是上游返回的 404、
 而 Apilot 按自己的约定回给了客户端另一个码 —— 两个数字都留着，就不会对不上。
+
+---
+
+## 各服务商的真实端点
+
+新建渠道时选预设，Apilot 会把这些值直接填进去。下表是它们的依据 ——
+**用错路径是这类配置最常见的故障，而且表现就是 404。**
+
+| 服务商 | base_url | Anthropic Messages | OpenAI Chat | OpenAI Responses |
+|---|---|---|---|---|
+| Anthropic 官方 | `https://api.anthropic.com` | `/v1/messages` | — | — |
+| OpenAI 官方 | `https://api.openai.com/v1` | — | `/v1/chat/completions` | `/v1/responses` |
+| DeepSeek | `https://api.deepseek.com` | `/anthropic/v1/messages` | `/v1/chat/completions` | `/v1/responses` |
+| Moonshot (Kimi) | `https://api.moonshot.cn` | `/anthropic/v1/messages` | `/v1/chat/completions` | — |
+| 通义千问（百炼） | `https://dashscope.aliyuncs.com` | `/apps/anthropic/v1/messages` | `/compatible-mode/v1/chat/completions` | — |
+| OpenRouter | `https://openrouter.ai/api/v1` | `/v1/messages` | `/v1/chat/completions` | `/v1/responses` |
+| 硅基流动 | `https://api.siliconflow.cn/v1` | — | `/v1/chat/completions` | — |
+| Ollama / LM Studio | `http://127.0.0.1:11434/v1` 等 | — | `/v1/chat/completions` | — |
+
+「—」表示该服务商没有这个端点（或没核实到），**不是"用默认路径即可"**。
+表格里没写就不勾那一种协议，让 Apilot 走转换 —— 转换一定可用，猜路径不一定。
+
+### 两个容易踩的点
+
+**1. Anthropic 兼容入口几乎都不在 `/v1` 下。**
+DeepSeek 在 `/anthropic`、Moonshot 在 `/anthropic`、百炼在 `/apps/anthropic`。
+拿默认路径 `/v1/messages` 去拼就是 404 —— 而且它长得跟 Anthropic 官方一模一样，
+不盯着看很难发现。所以渠道对话框里每个勾选的协议下面都会直接显示拼出来的完整地址。
+
+**2. base_url 带不带 `/v1` 会影响覆盖路径怎么拼。**
+覆盖路径是**原样**接在 base_url 后面的。所以 base_url 取到 `/v1` 时，
+再写 `/anthropic/...` 就会拼出 `.../v1/anthropic/...`，多一层。
+稳妥的做法是 base_url 只填到公共前缀（裸域名），两种协议各自的完整路径都在下面写全 ——
+Moonshot 和百炼的预设就是这么配的。
 
 ---
 

@@ -82,12 +82,33 @@ const EMPTY: FormState = {
   param_override: "",
 };
 
+/** 某协议当前生效的路径：覆盖过就用覆盖值，否则用协议默认值。 */
+const effectivePath = (
+  paths: Partial<Record<Protocol, string>>,
+  p: Protocol,
+): string => paths[p]?.trim() || PROTOCOL_DEFAULT_PATH[p];
+
+/**
+ * 预览出站 URL。**必须与后端 `Provider::endpoint` / `endpoint_verbatim` 同规则**，
+ * 否则这个预览会比没有更糟 —— 它会让用户以为路径是对的。
+ *
+ * 规则：只去掉「base 与 path 都带 /v1」时重复的那一次，绝不替你补 /v1。
+ * 后端分两个函数（一个补、一个不补）是因为它自己生成的默认路径需要补，
+ * 而用户手写的路径不需要；这里一律按"用户写的"处理，因为输入框里就是用户看到的值。
+ */
+const joinUrl = (baseUrl: string, path: string): string => {
+  const base = baseUrl.trim().replace(/\/+$/, "");
+  const p = path.trim().replace(/^\/+/, "");
+  if (!base) return p;
+  if (base.endsWith("/v1") && p.startsWith("v1/")) {
+    return `${base}/${p.slice(3)}`;
+  }
+  return p ? `${base}/${p}` : base;
+};
+
 function toForm(p: Provider): FormState {
   let protocols = (p.protocols ?? []).map((e) => e.protocol);
   const paths: Partial<Record<Protocol, string>> = {};
-  for (const e of p.protocols ?? []) {
-    if (e.path) paths[e.protocol] = e.path;
-  }
 
   // 老渠道（或任何没声明过协议的渠道）在库里存的是空数组，
   // 语义是"只支持 kind 那一种"。补上它，用户改个超时时间不必先手动勾一次协议。
@@ -97,6 +118,13 @@ function toForm(p: Provider): FormState {
   // 转换、直接打 /v1/messages 了 —— 用户没这么配，服务商也未必有那个路径。
   if (protocols.length === 0) {
     protocols = [p.kind];
+  }
+
+  // 路径一律填上**当前生效值**，不留空。留空只显示 placeholder 的话，
+  // 用户看不出这条协议到底会打到哪个 URL 上，而这正是最需要一眼看清的东西。
+  for (const proto of ALL_PROTOCOLS) {
+    const override = (p.protocols ?? []).find((e) => e.protocol === proto)?.path;
+    paths[proto] = override ?? PROTOCOL_DEFAULT_PATH[proto];
   }
 
   return {
@@ -153,20 +181,28 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
   // 预设只覆盖"服务商身份"相关的字段；api_key 留空由用户自己填，
   // 免得切预设时把已经敲好的密钥冲掉。
   //
-  // 支持协议列表也跟着预设重置：预设知道的只有"这家主要说哪种协议"（kind），
-  // 我们不去猜它还提供哪些 —— 猜错会让 Apilot 打到一个不存在的路径上。
-  // 想用同协议直通，用户自己勾一下即可。
+  // 支持的协议与路径一并带上 —— 预设里写的是核实过的端点。少了它们，
+  // 像 DeepSeek 这种三种协议都支持的服务商会被当成只说一种，客户端每次
+  // 请求都要经 Apilot 转换；而它的 Anthropic 入口挂在 /anthropic 子路径下，
+  // 用错路径就是 404。
   const applyPreset = (p: ProviderPreset) =>
-    setForm((f) => ({
-      ...f,
-      name: p.name,
-      tag: p.tag,
-      kind: p.kind,
-      base_url: p.base_url,
-      auth_style: p.auth_style,
-      protocols: [p.kind],
-      paths: {},
-    }));
+    setForm((f) => {
+      const paths: Partial<Record<Protocol, string>> = {};
+      for (const proto of ALL_PROTOCOLS) {
+        const override = p.protocols.find((e) => e.protocol === proto)?.path;
+        paths[proto] = override ?? PROTOCOL_DEFAULT_PATH[proto];
+      }
+      return {
+        ...f,
+        name: p.name,
+        tag: p.tag,
+        kind: p.kind,
+        base_url: p.base_url,
+        auth_style: p.auth_style,
+        protocols: p.protocols.map((e) => e.protocol),
+        paths,
+      };
+    });
 
   const submit = () => {
     if (!form.tag.trim()) return setError("请填写渠道 tag");
@@ -192,12 +228,16 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
       base_url: form.base_url.trim(),
       api_key: form.api_key.trim() ? form.api_key.trim() : null,
       auth_style: form.auth_style,
-      // 顺序无所谓，后端按协议查找；path 是「相对 base_url 的路径覆盖」，
-      // 留空即用该协议的默认路径。
-      protocols: form.protocols.map((p) => ({
-        protocol: p,
-        path: form.paths[p]?.trim() ? form.paths[p]!.trim() : null,
-      })),
+      // 顺序无所谓，后端按协议查找。
+      // 路径等于默认值（或留空）时回退成 null，让后端用协议默认路径 ——
+      // 存一份和默认值一模一样的字符串只会让"到底覆盖过没有"变得看不出来。
+      protocols: form.protocols.map((p) => {
+        const path = effectivePath(form.paths, p);
+        return {
+          protocol: p,
+          path: path === PROTOCOL_DEFAULT_PATH[p] ? null : path,
+        };
+      }),
       extra_headers: form.extra_headers,
       param_override: paramOverride,
       model_mapping: provider?.model_mapping ?? {},
@@ -318,51 +358,64 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
             <p className="text-muted-foreground text-xs">
               Apilot 会用这里勾选的协议直接对上游说话。客户端说什么协议，命中哪一项就
               用哪一项，<span className="text-foreground">不重编码</span>
-              （直通）；都没命中才做协议转换。路径留空即用默认值。
+              （直通）；都没命中才做协议转换。
             </p>
             <div className="mt-1 space-y-2">
               {ALL_PROTOCOLS.map((p) => {
                 const checked = form.protocols.includes(p);
+                const value = effectivePath(form.paths, p);
+                const isDefault = value === PROTOCOL_DEFAULT_PATH[p];
                 return (
-                  <div key={p} className="flex items-center gap-3">
-                    <Checkbox
-                      checked={checked}
-                      onCheckedChange={(c) =>
-                        setForm((f) => {
-                          const protocols = c
-                            ? [...f.protocols, p]
-                            : f.protocols.filter((x) => x !== p);
-                          return {
+                  <div key={p} className="space-y-1">
+                    <div className="flex items-center gap-3">
+                      <Checkbox
+                        checked={checked}
+                        onCheckedChange={(c) =>
+                          setForm((f) => {
+                            const protocols = c
+                              ? [...f.protocols, p]
+                              : f.protocols.filter((x) => x !== p);
+                            return {
+                              ...f,
+                              protocols,
+                              // 首选协议跟着勾选走：取消勾选首选时，换成还留着的第一个，
+                              // 免得留下"首选不在集合里"的非法状态。
+                              kind:
+                                !c && f.kind === p && protocols.length > 0
+                                  ? protocols[0]
+                                  : f.kind,
+                            };
+                          })
+                        }
+                      />
+                      <span className="w-44 shrink-0 text-xs">
+                        {PROTOCOL_LABEL[p]}
+                        {form.kind === p && (
+                          <span className="text-muted-foreground">（首选）</span>
+                        )}
+                      </span>
+                      <Input
+                        className="h-8 flex-1 font-mono text-xs"
+                        value={value}
+                        disabled={!checked}
+                        onChange={(e) =>
+                          setForm((f) => ({
                             ...f,
-                            protocols,
-                            // 首选协议跟着勾选走：取消勾选首选时，换成还留着的第一个，
-                            // 免得留下"首选不在集合里"的非法状态。
-                            kind:
-                              !c && f.kind === p && protocols.length > 0
-                                ? protocols[0]
-                                : f.kind,
-                          };
-                        })
-                      }
-                    />
-                    <span className="w-44 shrink-0 text-xs">
-                      {PROTOCOL_LABEL[p]}
-                      {form.kind === p && (
-                        <span className="text-muted-foreground">（首选）</span>
-                      )}
-                    </span>
-                    <Input
-                      className="h-8 flex-1 font-mono text-xs"
-                      value={form.paths[p] ?? ""}
-                      disabled={!checked}
-                      placeholder={PROTOCOL_DEFAULT_PATH[p]}
-                      onChange={(e) =>
-                        setForm((f) => ({
-                          ...f,
-                          paths: { ...f.paths, [p]: e.target.value },
-                        }))
-                      }
-                    />
+                            paths: { ...f.paths, [p]: e.target.value },
+                          }))
+                        }
+                      />
+                    </div>
+                    {/* 直接把拼出来的完整地址摆出来。上游报 404 时第一个要看的就是它，
+                        藏在一个 placeholder 里没人看得见。 */}
+                    {checked && form.base_url.trim() && (
+                      <p className="text-muted-foreground pl-[3.75rem] font-mono text-[11px] break-all">
+                        → {joinUrl(form.base_url, value)}
+                        {isDefault && (
+                          <span className="font-sans">（默认路径）</span>
+                        )}
+                      </p>
+                    )}
                   </div>
                 );
               })}
