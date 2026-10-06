@@ -133,18 +133,22 @@ function ModelPolicyCard({ models }: { models: string[] }) {
   });
 
   const policy = data?.model_policy;
-  if (!policy) return null;
 
-  const patch = (next: Partial<ModelPolicy>) =>
-    save.mutate({ ...policy, ...next });
-
+  // ⚠️ 所有 hook 都必须在下面那个提前 return **之前**调用。
+  // 写到后面的话，首帧（data 还是 undefined）少调一个 hook、数据到了又多调一个，
+  // React 检测到 hook 顺序变化会直接抛错并把整棵组件树卸载 —— 表现为白/黑屏。
   const modelOptions = useMemo(() => {
     // 全局替换的目标可能是个还没配渠道的模型，所以除了目录里的，
     // 也要把当前值本身列进去，否则下拉会显示成空。
     const set = new Set(models);
-    if (policy.active_model) set.add(policy.active_model);
+    if (policy?.active_model) set.add(policy.active_model);
     return [...set].sort();
-  }, [models, policy.active_model]);
+  }, [models, policy?.active_model]);
+
+  if (!policy) return null;
+
+  const patch = (next: Partial<ModelPolicy>) =>
+    save.mutate({ ...policy, ...next });
 
   return (
     <Card className="py-0">
