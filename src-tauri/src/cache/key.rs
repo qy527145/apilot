@@ -17,6 +17,11 @@ use crate::protocol::dto::{Protocol, UnifiedRequest};
 ///
 /// 需要说明的是：排除字段是有风险的。因此 [`super::policy::is_cacheable`] 只会
 /// 在 `temperature == 0` 时才放行，把"看起来相同但结果不同"的风险压到最低。
+///
+/// ⚠️ **`req.model` 必须是「生效模型」**（全局模型策略与路由规则改写之后的那个），
+/// 不是客户端请求的名字。`pipeline::handle` 在路由之后会把它们统一，
+/// 调用方不要自己拿原始请求去算键 —— 否则换上便宜模型后会直接命中上一个模型
+/// 生成的答案，那是正确性事故而不只是账目问题。
 pub fn cache_key(protocol: Protocol, req: &UnifiedRequest) -> String {
     let mut hasher = Sha256::new();
 
@@ -229,6 +234,9 @@ mod tests {
 
     #[test]
     fn model_changes_key() {
+        // 这条守的是「换模型不能命中旧模型的缓存」。全局模型替换开启后，
+        // 客户端请求的模型名可能完全不变，只有生效模型变了 ——
+        // 若键跟着请求名走，用户换到便宜模型后会拿到上一个模型生成的答案。
         let mut r = base();
         r.model = "claude-opus-5".into();
         assert_ne!(

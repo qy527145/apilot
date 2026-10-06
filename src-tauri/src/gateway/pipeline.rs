@@ -174,7 +174,8 @@ pub async fn handle(
 
     // ---- 1. 解码入站请求 ----
     let codec_in = shell.codecs.codec(protocol);
-    let req = match codec_in.decode_request(&body) {
+    // `mut` 是因为路由之后会把 model 换成生效模型（见下面「2. 路由决策」）。
+    let mut req = match codec_in.decode_request(&body) {
         Ok(r) => r,
         Err(e) => {
             shell.traffic.record_failure();
@@ -191,6 +192,9 @@ pub async fn handle(
             client: client.clone(),
             protocol_in: protocol.as_str().to_string(),
             protocol_out: protocol.as_str().to_string(),
+            // 此刻 req.model 还是客户端请求的名字，两者先填一样的。
+            // 路由之后 `model` 会被改写成生效模型，`request_model` 保持原样不动 ——
+            // 计费与缓存键取 `model`，所以两者绝不能混为一谈。
             model: req.model.clone(),
             request_model: req.model.clone(),
             path: path.clone(),
@@ -218,8 +222,29 @@ pub async fn handle(
     meta.stream = req.stream;
     meta.est_input_tokens = est_tokens;
 
+    let outcome = shell.router.route(&mut meta);
+    let selector_tag = match outcome {
+        RouteOutcome::Reject { reason, .. } => {
+            shell.traffic.record_failure();
+            recorder.fail(403, &reason);
+            return error_response(protocol, 403, "请求被路由规则拒绝", &reason);
+        }
+        RouteOutcome::Final { selector, .. } => selector,
+    };
+
+    // 规则可能改写过模型名（ModelOverride 是非终结动作）。**从这一行之后，「模型」
+    // 一律指最终生效的那个** —— 计费、聚合、缓存键全部跟着它，不再各算各的。
+    //
+    // 三个模型名各司其职，别再混用：
+    //   request_model  客户端请求的名字，只作展示
+    //   model          生效模型，计费 / 聚合 / 缓存键都用它
+    //   upstream_model 渠道映射后真正发出去的名字（在 try_outbound 里填）
+    req.model = meta.model.clone();
+    recorder.record.model = meta.model.clone();
+
     // 预扣估算：拿本地 token 估算 + max_tokens 当输出上界。它**不参与真实计费**，
     // 只用来记下"估算与实际的偏差"，让用户在监控页看到估算靠不靠谱。
+    // 口径要跟真实计费一致，所以在生效模型确定之后才算。
     let price_for_estimate = shell.pricing.load().get(&req.model);
     let est_usage = UnifiedUsage {
         input_tokens: est_tokens,
@@ -231,16 +256,6 @@ pub async fn handle(
         BillingEngine::settle(&est_usage, &price_for_estimate, 0).total_quota,
     );
 
-    let outcome = shell.router.route(&mut meta);    let selector_tag = match outcome {
-        RouteOutcome::Reject { reason, .. } => {
-            shell.traffic.record_failure();
-            recorder.fail(403, &reason);
-            return error_response(protocol, 403, "请求被路由规则拒绝", &reason);
-        }
-        RouteOutcome::Final { selector, .. } => selector,
-    };
-
-    // 模型名可能被非终结动作改写。
     let upstream_model = meta.model.clone();
 
     // ---- 3. 选定渠道 ----
