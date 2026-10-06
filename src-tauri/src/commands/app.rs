@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::State;
 
+use crate::config::settings::ModelPolicy;
 use crate::config::AppSettings;
 use crate::error::AppResult;
 use crate::shell::AppShell;
@@ -43,4 +44,20 @@ pub async fn update_settings(
     let next = settings.normalized();
     shell.update_settings(next.clone()).await?;
     Ok(next)
+}
+
+/// 只改全局模型策略。
+///
+/// 比让前端回传整个 `AppSettings` 稳妥：模型页不该、也不必覆盖监听端口、超时、
+/// 缓存策略这些它不关心的字段 —— 整份回传会把别处刚改的设置一起冲掉。
+#[tauri::command]
+pub async fn set_model_policy(
+    shell: State<'_, Arc<AppShell>>,
+    policy: ModelPolicy,
+) -> AppResult<ModelPolicy> {
+    let mut settings = shell.settings().as_ref().clone();
+    settings.model_policy = policy.normalized();
+    let saved = settings.model_policy.clone();
+    shell.update_settings(settings).await?;
+    Ok(saved)
 }

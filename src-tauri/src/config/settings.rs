@@ -12,6 +12,81 @@ const SETTINGS_KEY: &str = "app_settings";
 /// 默认监听端口。选 8787 避开常见的 8080/3000 冲突。
 pub const DEFAULT_PORT: u16 = 8787;
 
+/// 全局模型替换的模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPolicyMode {
+    /// 不替换。默认值 —— 不配就完全保持原有行为。
+    Off,
+    /// 任何入站模型名都换成 `active_model`。
+    Always,
+    /// 只当请求的模型在 Apilot 里没有任何可用渠道时才替换。
+    ///
+    /// 适合"平时用某个模型，顺手让别的也能跑"：客户端要的模型配了渠道就用它，
+    /// 没配才落到选定的那个。
+    Fallback,
+    /// 按客户端分别指定（claude-code / codex / ...），没配到的客户端用 `active_model`。
+    PerClient,
+}
+
+impl ModelPolicyMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Always => "always",
+            Self::Fallback => "fallback",
+            Self::PerClient => "per_client",
+        }
+    }
+}
+
+impl Default for ModelPolicyMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+/// 全局模型替换策略。
+///
+/// 目的是让"换个模型"变成一次下拉选择：不必去理解 selector 热切换与规则链，
+/// 选中的模型直接套用到所有客户端。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelPolicy {
+    pub mode: ModelPolicyMode,
+    /// `Always` / `Fallback` 时替换成它；`PerClient` 里没配到的客户端也用它。
+    pub active_model: Option<String>,
+    /// `PerClient` 模式：客户端标识 → 模型名。
+    pub per_client: indexmap::IndexMap<String, String>,
+}
+
+impl ModelPolicy {
+    /// 客户端被分到的模型（`PerClient` 模式用）。没配返回 `None`。
+    pub fn for_client(&self, client: &str) -> Option<&str> {
+        self.per_client.get(client).map(|s| s.as_str())
+    }
+
+    /// 修剪空白、丢掉空条目。
+    ///
+    /// 界面上「跟随全局」会存成空字符串，那种条目等同于没配 —— 在入口处清理掉，
+    /// 免得判定逻辑到处都要 filter 一遍，也免得空串被当成一个真实的模型名发出去。
+    pub fn normalized(mut self) -> Self {
+        self.active_model = self
+            .active_model
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        self.per_client = self
+            .per_client
+            .into_iter()
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+            .collect();
+
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -36,6 +111,9 @@ pub struct AppSettings {
     pub cache_enabled: bool,
     pub cache_ttl_secs: u64,
     pub cache_max_entries: u32,
+
+    /// 全局模型替换。默认关闭。
+    pub model_policy: ModelPolicy,
 }
 
 impl Default for AppSettings {
@@ -55,6 +133,8 @@ impl Default for AppSettings {
             cache_enabled: false, // 默认关：缓存会改变语义，需用户显式开启
             cache_ttl_secs: 3600,
             cache_max_entries: 1000,
+
+            model_policy: ModelPolicy::default(), // 默认关闭
         }
     }
 }
@@ -80,6 +160,7 @@ impl AppSettings {
         self.request_timeout_ms = self.request_timeout_ms.clamp(1_000, 3_600_000);
         self.cache_max_entries = self.cache_max_entries.clamp(1, 100_000);
         self.capture_max_entries = self.capture_max_entries.clamp(1, 100_000);
+        self.model_policy = self.model_policy.normalized();
         self
     }
 
@@ -174,5 +255,33 @@ mod tests {
 
         let s = AppSettings::load(&pool).await.unwrap();
         assert_eq!(s.listen_port, DEFAULT_PORT);
+        assert_eq!(s.model_policy.mode, ModelPolicyMode::Off);
+    }
+
+    #[test]
+    fn model_policy_normalization_drops_blank_entries() {
+        let mut p = ModelPolicy {
+            mode: ModelPolicyMode::PerClient,
+            active_model: Some("  deepseek-chat  ".into()),
+            ..Default::default()
+        };
+        p.per_client.insert(" codex ".into(), " gpt-5 ".into());
+        p.per_client.insert("cursor".into(), "".into());
+        p.per_client.insert("".into(), "orphan".into());
+
+        let n = p.normalized();
+        assert_eq!(n.active_model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(n.per_client.len(), 1, "空值与空键都该被丢掉");
+        assert_eq!(n.for_client("codex"), Some("gpt-5"));
+    }
+
+    #[test]
+    fn blank_active_model_becomes_none() {
+        let p = ModelPolicy {
+            mode: ModelPolicyMode::Always,
+            active_model: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(p.normalized().active_model, None);
     }
 }

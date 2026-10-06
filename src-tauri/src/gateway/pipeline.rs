@@ -23,7 +23,7 @@ use crate::protocol::dto::{
     UsageSource,
 };
 use crate::protocol::shared::tokens::estimate_request_tokens;
-use crate::routing::{RouteMetadata, RouteOutcome};
+use crate::routing::{model_policy, RouteMetadata, RouteOutcome};
 use crate::shell::AppShell;
 use crate::storage::logs::{CaptureRecord, RequestLogRecord};
 use crate::upstream::outbound::{Outbound, UpstreamBody, UpstreamError};
@@ -214,6 +214,25 @@ pub async fn handle(
         }),
         finished: false,
     };
+
+    // ---- 1.5 全局模型替换 ----
+    //
+    // 放在路由规则之前：这样规则链看到的就是生效模型。规则里的 ModelOverride
+    // 仍可在它之上再改（那是"例外规则"的用法）。
+    //
+    // `request_model` 在 Recorder 初始化时已经填成了原始值，这里只动 `req.model`，
+    // 让它带着生效模型往下走。
+    let policy = shell.settings().model_policy.clone();
+    let has_channels = if model_policy::needs_channel_check(&policy) {
+        // 只有 Fallback 模式需要这个判据，其余模式不白查一次库。
+        crate::storage::providers::channels_for_model(&shell.db, &req.model)
+            .await
+            .map(|v| !v.is_empty())
+            .unwrap_or(true) // 查库失败时按"有渠道"处理：宁可不动，也不要把请求改道
+    } else {
+        true
+    };
+    req.model = model_policy::effective_model(&policy, &client, &req.model.clone(), has_channels);
 
     // ---- 2. 路由决策 ----
     let est_tokens = estimate_request_tokens(&req);
