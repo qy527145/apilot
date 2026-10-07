@@ -81,8 +81,9 @@ export default function OverviewPage({ onNavigate }: Props) {
   const chartData = useMemo(
     () =>
       (series.data ?? []).map((p) => ({
-        ts: p.bucket_ts,
-        label: formatTime(p.bucket_ts).slice(6),
+        // 后端给的 bucket_ts 是 unix **秒**（usage_hourly.bucket_ts），
+        // `new Date` 要的是毫秒 —— 不乘这一千，横轴会显示成 1970 年的小时。
+        label: formatTime(p.bucket_ts * 1000).slice(6),
         requests: p.requests,
         usd: p.quota / 500000,
       })),
