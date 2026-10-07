@@ -492,6 +492,19 @@ export default function TrafficPage() {
                         <div className="truncate" title={r.model}>
                           {r.model}
                         </div>
+                        {/*
+                          被改写时把客户端**原本要的**露出来。少了它，"我明明发的 A，
+                          怎么按 B 计费 / 缓存"在列表上永远看不出来 —— 数据是记着的
+                          （`request_model`），只是此前只有详情弹窗里才显示。
+                        */}
+                        {r.request_model && r.request_model !== r.model && (
+                          <div
+                            className="text-muted-foreground truncate text-[11px]"
+                            title={`客户端请求的模型：${r.request_model}`}
+                          >
+                            ← {r.request_model}
+                          </div>
+                        )}
                         {/* 映射改过名字时露出来 —— 上游说"模型不存在"多半是这里。 */}
                         {r.upstream_model && r.upstream_model !== r.model && (
                           <div

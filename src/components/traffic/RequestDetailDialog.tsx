@@ -551,11 +551,21 @@ function Metrics({ data }: { data: RequestDetail }) {
         <Field label="协议(入)" value={data.protocol_in} />
         <Field label="协议(出)" value={data.protocol_out} />
         <Field label="请求模型" value={data.request_model} />
+        {/*
+          三个模型名是一条链，缺一个就断在中间：客户端发的 → Apilot 决定的（计费与
+          缓存按它算）→ 渠道映射后真发出去的。只显示首尾的话，"我发的 A 怎么按 B
+          计费"这种问题还是查不出来。
+        */}
+        <Field
+          label="生效模型"
+          value={data.model}
+          highlight={data.model !== data.request_model}
+        />
         <Field
           label="上游模型"
           value={data.upstream_model ?? "—"}
           highlight={
-            !!data.upstream_model && data.upstream_model !== data.request_model
+            !!data.upstream_model && data.upstream_model !== data.model
           }
         />
         <Field label="用量来源" value={data.usage_source} />
