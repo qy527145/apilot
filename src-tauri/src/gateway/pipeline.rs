@@ -28,7 +28,7 @@ use crate::shell::AppShell;
 use crate::storage::logs::{CaptureRecord, RequestLogRecord};
 use crate::upstream::outbound::{Outbound, UpstreamBody, UpstreamError};
 
-use super::stream::{translate_stream, StreamOutcome, StreamTimeouts};
+use super::stream::{translate_stream_observed, StreamOutcome, StreamTimeouts};
 
 /// 从请求头 / 路径识别调用方。
 ///
@@ -122,6 +122,19 @@ impl Recorder {
         let shell = self.shell.clone();
         let rec = self.record.clone();
         let capture = self.capture.take();
+
+        // 「结束」信号同步发，不走下面那个后台任务：前端要立刻把这条从
+        // 「进行中」移走，晚一个调度周期就看着像卡住了。负载极小。
+        //
+        // 流式请求不走这里 —— 它们的结束由 `StreamEmitter` 负责（流真正跑完
+        // 才算结束，而 `Recorder` 早就返回了）；这里是失败路径与缓存的兜底。
+        shell
+            .events
+            .request_finished(&crate::traffic::stream_events::RequestFinished {
+                request_id: rec.request_id.clone(),
+                status_code: rec.status_code,
+                error: rec.error_message.clone(),
+            });
 
         // 记账不该阻塞响应返回，放到后台任务里做。
         tauri::async_runtime::spawn(async move {
@@ -329,6 +342,23 @@ pub async fn handle(
 
     // ---- 5. 出站 ----
     let candidates = build_candidates(&shell, &primary, &upstream_model, protocol).await;
+
+    // 监控页的「进行中」列表靠这一条进入。放在这里而不是请求最开始：
+    // 此刻才既有生效模型、又有选定的渠道，而用户在意的正是"这一条在跑哪条路"。
+    // 缓存命中在上面就返回了，所以它不会出现在「进行中」—— 那是对的，
+    // 缓存命中没有过程可看。
+    shell
+        .events
+        .request_started(&crate::traffic::stream_events::RequestStarted {
+            request_id: recorder.record.request_id.clone(),
+            ts: recorder.record.ts,
+            client: recorder.record.client.clone(),
+            model: recorder.record.model.clone(),
+            path: recorder.record.path.clone(),
+            protocol_in: protocol.as_str().to_string(),
+            provider_tag: primary.tag().to_string(),
+            is_stream: req.stream,
+        });
 
     let mut last_error: Option<UpstreamError> = None;
 
@@ -608,6 +638,26 @@ async fn try_outbound(
             idle: std::time::Duration::from_millis(settings.idle_timeout_ms),
         };
 
+        let mut response_headers = resp.headers.clone();
+        // 我们可能改写了内容，长度与编码都不再由上游保证。
+        response_headers.remove(http::header::CONTENT_LENGTH);
+        response_headers.remove(http::header::CONTENT_ENCODING);
+        response_headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        response_headers.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+
+        // 把真正发给客户端的响应头记下来。必须在这里做：下面 `ctx` 会把 capture
+        // take 走，之后再想改就没地方改了。缺了它，监控页的「Apilot → 客户端」
+        // 一栏永远是空的 —— 直通时尤其误导，用户会以为网关什么都没回。
+        if let Some(c) = recorder.capture.as_mut() {
+            c.response_headers = headers_to_json(&response_headers);
+        }
+
         // 流式没有 `Recorder::finish` 这一步，收尾全在 finalize_stream 里做，
         // 所以把入站捕获和出站追踪都交给它 —— 不 take 走的话，入站那份
         //（路径、请求头、请求体）会随 recorder 一起被丢掉。
@@ -632,25 +682,21 @@ async fn try_outbound(
             upstream_status: recorder.record.upstream_status,
         };
 
-        let body = translate_stream(
+        // 实时事件流的出口。它的 Drop 会在客户端断连时补发一次 done ——
+        // 那种情况下 finalize_stream 根本不会执行，没有兜底前端就永远清不掉
+        // 这条「进行中」。
+        let observer = Box::new(crate::traffic::stream_events::StreamEmitter::new(
+            shell.events.clone(),
+            recorder.record.request_id.clone(),
+        ));
+
+        let body = translate_stream_observed(
             upstream_stream,
             decoder,
             encoder,
             timeouts,
+            Some(observer),
             move |outcome| finalize_stream(ctx, outcome),
-        );
-
-        let mut response_headers = resp.headers.clone();
-        // 我们可能改写了内容，长度与编码都不再由上游保证。
-        response_headers.remove(http::header::CONTENT_LENGTH);
-        response_headers.remove(http::header::CONTENT_ENCODING);
-        response_headers.insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("text/event-stream"),
-        );
-        response_headers.insert(
-            http::header::CACHE_CONTROL,
-            http::HeaderValue::from_static("no-cache"),
         );
 
         return Ok((status, response_headers, body).into_response());
@@ -798,10 +844,6 @@ async fn finish_buffered(
     // 非流式没有独立的 TTFB，用整体耗时近似（对客户端而言等价）。
     recorder.finish(status.as_u16() as i32, usage.clone(), Some(latency));
 
-    if let Some(c) = recorder.capture.as_mut() {
-        c.response_headers = headers_to_json(&headers);
-    }
-
     // 客户端要流式，但上游给的是完整响应（有些中转会无视 stream=true）：
     // 用编码器把结果"假装"成流，客户端的解码路径就不必区分这两种情况。
     if recorder.record.is_stream {
@@ -815,12 +857,19 @@ async fn finish_buffered(
             http::header::CACHE_CONTROL,
             http::HeaderValue::from_static("no-cache"),
         );
+        if let Some(c) = recorder.capture.as_mut() {
+            c.response_headers = headers_to_json(&sse_headers);
+        }
         return Ok((
             status,
             sse_headers,
             super::stream::stream_from_response(decoded, usage, encoder, |_| {}),
         )
             .into_response());
+    }
+
+    if let Some(c) = recorder.capture.as_mut() {
+        c.response_headers = headers_to_json(&headers);
     }
 
     let out_bytes = if needs_conversion {
@@ -1127,6 +1176,15 @@ async fn serve_from_cache(
             let mut r = rec.clone();
             r.output_tokens = outcome.usage.output_tokens;
             r.ts = crate::util::now_ms();
+            // 缓存重放不走 `Recorder::finish`（它早就被丢下了），所以这里的
+            // 结束事件得自己补 —— 否则前端那条「进行中」会一直挂着。
+            shell_cb
+                .events
+                .request_finished(&crate::traffic::stream_events::RequestFinished {
+                    request_id: r.request_id.clone(),
+                    status_code: 200,
+                    error: None,
+                });
             let shell2 = shell_cb.clone();
             tauri::async_runtime::spawn(async move {
                 shell2.aggregates.record(&r);
@@ -1145,6 +1203,12 @@ async fn serve_from_cache(
             http::HeaderValue::from_static("no-cache"),
         );
         headers.insert("x-apilot-cache", http::HeaderValue::from_static("hit"));
+
+        // 与真实流式那条路一致：把发给客户端的响应头也记进捕获，
+        // 否则监控页的「Apilot → 客户端」在缓存命中时是空的。
+        if let Some(c) = recorder.capture.as_mut() {
+            c.response_headers = headers_to_json(&headers);
+        }
 
         return (http::StatusCode::OK, headers, body).into_response();
     }
