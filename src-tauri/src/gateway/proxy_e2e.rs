@@ -32,9 +32,57 @@ fn direct_client() -> reqwest::Client {
 /// 上游收到的请求快照，用于断言出站请求确实带上了该带的东西。
 #[derive(Debug, Default, Clone)]
 struct ReceivedRequest {
+    method: String,
     path: String,
     headers: HeaderMap,
     body: String,
+}
+
+/// 起一个"回声"上游：不认路径，收到什么记什么，并按给定状态与原样回一段正文。
+///
+/// 原样转发的测试要的正是"路径 / 方法 / 正文都没被改写"，所以上游必须能收到**任意**
+/// 路径 —— [`spawn_upstream`] 只注册了两条固定路径，那正是这类测试要排除的前提。
+async fn spawn_echo_upstream(
+    status: u16,
+    response_body: &'static str,
+) -> (String, Arc<Mutex<Vec<ReceivedRequest>>>) {
+    let captured: Arc<Mutex<Vec<ReceivedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // 闭包是 `move`，会把这个句柄整个拿走 —— 而外面还要用它当 state 和返回值，
+    // 所以各留一份克隆。
+    let for_handler = captured.clone();
+    let for_state = captured.clone();
+    let app = Router::new()
+        .fallback(
+            move |method: http::Method,
+                  uri: http::Uri,
+                  headers: HeaderMap,
+                  body: Bytes| {
+                let cap = for_handler.clone();
+                async move {
+                    cap.lock().unwrap().push(ReceivedRequest {
+                        method: method.to_string(),
+                        path: uri.path().to_string(),
+                        headers,
+                        body: String::from_utf8_lossy(&body).to_string(),
+                    });
+                    AxumResponse::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(AxumBody::from(response_body))
+                        .unwrap()
+                }
+            },
+        )
+        .with_state(for_state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}"), captured)
 }
 
 /// 起一个假上游，按 `sse_body` 原样返回 SSE。
@@ -48,6 +96,7 @@ async fn spawn_upstream(sse_body: &'static str) -> (String, Arc<Mutex<Vec<Receiv
                         headers: HeaderMap,
                         body: Bytes| async move {
         cap.lock().unwrap().push(ReceivedRequest {
+            method: "POST".into(),
             path: path.to_string(),
             headers,
             body: String::from_utf8_lossy(&body).to_string(),
@@ -614,4 +663,98 @@ async fn a_configured_proxy_never_swallows_loopback_requests() {
     }
 
     assert_eq!(captured.lock().unwrap().len(), 2, "两次都该真的打到上游");
+}
+
+// ---------------------------------------------------------------------------
+// 非对话请求的原样转发
+//
+// `/v1/messages/count_tokens` 这类请求没有 IR 可言，只能原样送出去。下面两条
+// 盯的正是"原样"：路径、方法、正文都没被改写，上游的报错也没被包装。
+// ---------------------------------------------------------------------------
+
+/// 路径与方法都要原样到达上游。
+#[tokio::test]
+async fn a_non_chat_request_reaches_the_upstream_verbatim() {
+    let (base, captured) = spawn_echo_upstream(200, r#"{"input_tokens":1234}"#).await;
+    let channel = Channel::new(
+        provider(&base, ProviderKind::Anthropic),
+        build_with(&ProxySpec::Direct),
+    );
+
+    let body = Bytes::from_static(
+        br#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+
+    // 客户端带了自己的 base path（`/anthropic`）。那段是它本地的事，转给上游要丢掉。
+    let mut prepared = channel
+        .prepare_at(
+            Protocol::AnthropicMessages,
+            &HeaderMap::new(),
+            body.clone(),
+            false,
+            Some("v1/messages/count_tokens"),
+        )
+        .unwrap();
+    // 用一个不寻常的方法，好让"写死成 POST"这件事暴露出来。
+    prepared.method = http::Method::PUT;
+
+    assert!(
+        prepared.url.ends_with("/v1/messages/count_tokens"),
+        "出站 URL 该落在客户端那条路径上：{}",
+        prepared.url
+    );
+    assert!(
+        !prepared.url.contains("/anthropic"),
+        "客户端自己的 base path 不该带上游：{}",
+        prepared.url
+    );
+
+    let resp = channel.dial(prepared).await.unwrap();
+    assert!(resp.is_success());
+
+    let got = captured.lock().unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].path, "/v1/messages/count_tokens");
+    assert_eq!(got[0].method, "PUT", "方法要原样，不能退回成写死的 POST");
+    assert_eq!(got[0].body, String::from_utf8_lossy(&body), "正文一个字节都不该动");
+}
+
+/// 上游的报错原样交给客户端，不变成我们自己的 502。
+///
+/// 这正是这类接口存在的意义之一：「这个服务商不支持它」该由客户端自己看见。
+#[tokio::test]
+async fn an_upstream_error_comes_back_verbatim() {
+    let (base, _cap) = spawn_echo_upstream(
+        404,
+        r#"{"error":{"message":"count_tokens not supported"}}"#,
+    )
+    .await;
+    let channel = Channel::new(
+        provider(&base, ProviderKind::Anthropic),
+        build_with(&ProxySpec::Direct),
+    );
+
+    let prepared = channel
+        .prepare_at(
+            Protocol::AnthropicMessages,
+            &HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+            false,
+            Some("v1/messages/count_tokens"),
+        )
+        .unwrap();
+
+    // `dial` 不把非 2xx 当错误 —— 原样转发要的正是这一点：由调用方原封不动回给客户端，
+    // 而不是像对话路径那样把它折成 UpstreamError 去换渠道。
+    let resp = channel.dial(prepared).await.unwrap();
+    assert_eq!(resp.status.as_u16(), 404);
+    match resp.body {
+        UpstreamBody::Buffered(b) => {
+            assert!(
+                String::from_utf8_lossy(&b).contains("not supported"),
+                "上游的错误正文该原样留在响应里"
+            );
+        }
+        UpstreamBody::Stream(_) => panic!("非流式请求不该拿到流"),
+    }
 }

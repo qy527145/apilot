@@ -92,9 +92,16 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 | 文件 | 内容 |
 |---|---|
-| `pipeline.rs` | **核心编排**。`handle()` 串起整条链路；`Recorder` 收口记账；`detect_client()` 识别来源；`decode_sse_as_response()` 兜住「上游无视 stream 参数」 |
+| `pipeline.rs` | **核心编排**。`handle()` 串起整条链路；`handle_raw()` 是**非对话请求的原样转发**（见下）；`Recorder` 收口记账；`detect_client()` 识别来源；`decode_sse_as_response()` 兜住「上游无视 stream 参数」 |
 | `server.rs` | `GatewayServer`：`start` / `start_at` / `stop` / `status` / `base_url`，用 oneshot + graceful shutdown。**`rebind` 负责"改了监听地址要真的换过去"**：端口变了先绑新的探路（绑不上就原样退回，绝不先停再试），新地址起不来则退回老地址；`needs_rebind` 是它的纯函数判据 |
-| `router.rs` | axum 路由表、`/health`、`/v1/models`、路径兜底（按路径特征猜协议） |
+| `router.rs` | axum 路由表、`/health`、`/v1/models`、路径兜底。兜底按**后缀**判：是三种对话入口之一就交给 `handle`，**其余一律交给 `handle_raw` 原样转发** —— 客户端会发 `/v1/messages/count_tokens` 这类非对话接口，硬解成对话再编码回去会把它改坏 |
+
+**两种"直通"别混**（`CLAUDE.md` 铁律 2 说的是前者）：
+
+| | 什么时候 | 做了什么 |
+|---|---|---|
+| **同协议直通** | 入站协议 == 渠道声明的协议 | 仍在对话那条路上。转发原始字节，只把 `model` 换成映射后的名字；不解码再编码 |
+| **非对话原样转发** | 路径不是三种对话入口 | 走 `handle_raw`。**连 IR 都不解**，只从 body 里取一个 `model` 用来选渠道，请求与响应都原样收发，上游的报错也不包装 |
 | `stream.rs` | `translate_stream()`（上游流 → 下游流）、`stream_from_response()`（缓存重放流）、**`ContentAccumulator`**（从增量重建完整内容，供缓存写入）、**`StreamTimings`**（每个事件的时间点，供时间轴；平行数组 + 名字表，两千帧几 KB）。`delta_display_name()` 那套名字**必须与前端 `StreamDelta` 的 serde 标签逐字相同**，有测试钉着 |
 | `sse.rs` | SSE 原语：`take_sse_block`（两种分隔符取最早）、`append_utf8_safe`（跨 chunk 多字节）、`parse_event` / `encode_event` |
 | `proxy_e2e.rs` | 端到端测试：起真实上游 HTTP 服务跑通全链路 |

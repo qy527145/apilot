@@ -99,6 +99,22 @@ pub trait Outbound: Send + Sync {
         incoming: &http::HeaderMap,
         body: Bytes,
         stream: bool,
+    ) -> Result<PreparedRequest, UpstreamError> {
+        self.prepare_at(wire, incoming, body, stream, None)
+    }
+
+    /// 同上，但可以指定出站路径。
+    ///
+    /// 非对话请求（`/v1/messages/count_tokens` 这类）没有 IR 可言，只能原样转发，
+    /// 而它们的路径不是任何协议的默认路径 —— 那时由调用方把客户端那条路径传进来。
+    /// `None` 表示"用协议默认路径"，也就是 [`Outbound::prepare`] 一直以来的行为。
+    fn prepare_at(
+        &self,
+        wire: Protocol,
+        incoming: &http::HeaderMap,
+        body: Bytes,
+        stream: bool,
+        path: Option<&str>,
     ) -> Result<PreparedRequest, UpstreamError>;
 
     /// 发出请求。

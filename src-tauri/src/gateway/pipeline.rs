@@ -28,6 +28,7 @@ use crate::shell::AppShell;
 use crate::storage::logs::{CaptureRecord, RequestLogRecord};
 use crate::upstream::outbound::{Outbound, UpstreamBody, UpstreamError};
 
+use super::router::{protocol_family, upstream_path};
 use super::stream::{translate_stream_observed, StreamOutcome, StreamTimeouts};
 
 /// 从请求头 / 路径识别调用方。
@@ -407,6 +408,266 @@ pub async fn handle(
         .unwrap_or_else(|| "没有可用的上游渠道".to_string());
     recorder.fail(502, &err);
     error_response(protocol, 502, "上游请求失败", &err)
+}
+
+/// 非对话请求的原样转发。
+///
+/// `/v1/messages/count_tokens` 是典型：客户端在问"我这段上下文占了多少 token"，
+/// body 里没有对话语义，响应也不是补全结果。硬解成 IR 再编码回去，轻则丢字段，
+/// 重则把上游的解释直接改坏。
+///
+/// 所以这条路**只从 body 里取一个 `model` 字段**用来选渠道，其余一律原样收发。
+/// 上游的报错也原样返回 —— "这个服务商不支持这个接口"正是客户端该自己看到的信息，
+/// 由我们包装成 502 反而把它藏了。
+///
+/// 与「同协议直通」不是一回事，别混：那个仍在对话那条路上，只是不做跨协议转码；
+/// 这个连 IR 都不解。
+pub async fn handle_raw(
+    shell: Arc<AppShell>,
+    method: http::Method,
+    path: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let _active = shell.traffic.begin_request();
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let client = detect_client(&headers, &path);
+
+    // 只取一个字段。解不出 JSON、或者没有 model，都不算错 —— 路由规则与 selector
+    // 照样能给出一个渠道，只是按模型匹配的条件不会命中。
+    let requested_model = peek_model(&body);
+
+    let mut recorder = Recorder {
+        shell: shell.clone(),
+        record: RequestLogRecord {
+            request_id: request_id.clone(),
+            ts: crate::util::now_ms(),
+            client: client.clone(),
+            // 这一栏是给监控页看的：路径能看出是哪种协议族的客户端就填它，
+            // 看不出就明说 raw。它不参与任何转发决策。
+            protocol_in: protocol_family(&path)
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "raw".into()),
+            protocol_out: "raw".into(),
+            model: requested_model.clone(),
+            request_model: requested_model.clone(),
+            path: path.clone(),
+            ..Default::default()
+        },
+        // 不预扣：这类请求没有可计费的产出，`deferred()` 本来就是 0。
+        session: BillingSession::deferred(),
+        capture: Some(CaptureRecord {
+            request_id: request_id.clone(),
+            ts: crate::util::now_ms(),
+            method: method.as_str().to_string(),
+            path: path.clone(),
+            request_headers: headers_to_json(&headers),
+            request_body: Some(body.to_vec()),
+            ..Default::default()
+        }),
+        finished: false,
+    };
+
+    // ---- 模型替换 ----
+    //
+    // 照样过策略。不过的话会变成「按 A 计数、按 B 对话」—— 两个数字对不上，
+    // 而且上游可能根本没有 A。
+    let policy_settings = shell.settings();
+    let policy = &policy_settings.model_policy;
+    let has_channels = if model_policy::needs_channel_check(policy, &client) {
+        crate::storage::providers::channels_for_model(&shell.db, &requested_model)
+            .await
+            .map(|v| !v.is_empty())
+            .unwrap_or(true)
+    } else {
+        true
+    };
+    let effective = {
+        // 非对话请求没有"入站协议"，给策略看的是空串 —— 自定义规则里按协议分支的
+        // 写法在这里自然落到 else 上，而不是拿到一个假的协议名。
+        let ctx = model_policy::RequestCtx {
+            client: &client,
+            model: &requested_model,
+            protocol: "",
+        };
+        model_policy::effective_model(policy, &ctx, &ShellModelEnv { has_channels })
+    };
+    recorder.record.model = effective.clone();
+
+    // ---- 路由与选渠道（与对话请求同一套）----
+    //
+    // 给规则链看的协议取路径猜出来的那个族：按 `Protocol` 分支的规则不至于因为
+    // "这是个非对话请求"就整条落空。猜不出来时才回落到 Anthropic —— 路由规则里
+    // 按协议匹配的写法本来就少见，不值得为它再引入一个"未知协议"的概念。
+    let family = protocol_family(&path).unwrap_or(Protocol::AnthropicMessages);
+    let mut meta = RouteMetadata::new(effective.clone(), family, path.clone(), headers.clone());
+    meta.client = client.clone();
+    meta.stream = false;
+
+    let selector_tag = match shell.router.route(&mut meta) {
+        RouteOutcome::Reject { reason, .. } => {
+            shell.traffic.record_failure();
+            recorder.record.latency_ms = started.elapsed().as_millis() as i64;
+            recorder.fail(403, &reason);
+            return raw_error_response(403, "请求被路由规则拒绝", &reason);
+        }
+        RouteOutcome::Final { selector, .. } => selector,
+    };
+    recorder.record.model = meta.model.clone();
+
+    let primary = match shell.selectors.resolve(&selector_tag) {
+        Some(o) => o,
+        None => {
+            shell.traffic.record_failure();
+            let msg = format!("selector「{selector_tag}」没有可用的渠道，请先在「路由」页配置");
+            recorder.record.latency_ms = started.elapsed().as_millis() as i64;
+            recorder.fail(503, &msg);
+            return raw_error_response(503, "没有可用渠道", &msg);
+        }
+    };
+
+    let client_path = upstream_path(&path);
+    let candidates = build_candidates(&shell, &primary, &meta.model, family).await;
+
+    let mut last_error: Option<UpstreamError> = None;
+
+    for (idx, outbound) in candidates.iter().enumerate() {
+        let is_last = idx + 1 == candidates.len();
+
+        match forward_raw(
+            outbound,
+            &method,
+            &headers,
+            &body,
+            &client_path,
+            &meta.model,
+            &mut recorder,
+        )
+        .await
+        {
+            Ok(resp) => {
+                recorder.record.latency_ms = started.elapsed().as_millis() as i64;
+                // `finish` 自己会广播「结束」事件，这里不要再补一次。
+                recorder.finish(resp.status().as_u16() as i32, UnifiedUsage::default(), None);
+                return resp;
+            }
+            Err(e) => {
+                // 只有**连不上/超时**才换下一个渠道。上游返回的 4xx/5xx 不是错误，
+                // 是要原样交给客户端的答案（见 `forward_raw`）。
+                let retryable = e.is_retryable();
+                tracing::warn!(
+                    provider = outbound.tag(),
+                    error = %e,
+                    retryable,
+                    "非对话请求转发失败"
+                );
+                last_error = Some(e);
+                if !retryable || is_last {
+                    break;
+                }
+            }
+        }
+    }
+
+    shell.traffic.record_failure();
+    let err = last_error
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "没有可用的上游渠道".to_string());
+    recorder.record.latency_ms = started.elapsed().as_millis() as i64;
+    recorder.fail(502, &err);
+    raw_error_response(502, "上游请求失败", &err)
+}
+
+/// 发一次原样转发，返回**未经改写的**上游响应。
+///
+/// 与 [`try_outbound`] 的区别全在"不做"上：不解码、不重编码、不按流处理、
+/// 不把非 2xx 当成错误。只有连不上或超时才返回 `Err`，让调用方换渠道。
+#[allow(clippy::too_many_arguments)]
+async fn forward_raw(
+    outbound: &Arc<dyn Outbound>,
+    method: &http::Method,
+    headers: &HeaderMap,
+    body: &Bytes,
+    client_path: &str,
+    upstream_model: &str,
+    recorder: &mut Recorder,
+) -> Result<Response, UpstreamError> {
+    let wire = outbound.wire_for(Protocol::AnthropicMessages);
+    recorder.record.protocol_out = wire.as_str().to_string();
+    recorder.record.provider_tag = Some(outbound.tag().to_string());
+    recorder.record.channel_kind = Some(outbound.provider().kind.as_str().to_string());
+
+    // 渠道级模型映射照样生效：客户端问的是 A，上游只认 B，那也得按 B 去问。
+    let mapped_model = outbound.provider().upstream_model(upstream_model).to_string();
+    recorder.record.upstream_model = Some(mapped_model.clone());
+
+    // body 原样，只换 model 那个字段。`patch_model_field` 对非 JSON 体是原样返回的。
+    let out_body = patch_model_field(body, &mapped_model);
+
+    let mut prepared = outbound.prepare_at(wire, headers, out_body, false, Some(client_path))?;
+    // prepare 一律按 POST 组装，而原样转发要连方法一起还原 —— 不然一个 GET 会被
+    // 悄悄变成 POST，那种谎没人会发现。
+    prepared.method = method.clone();
+
+    recorder.record.upstream_url = Some(prepared.url.clone());
+    if let Some(c) = recorder.capture.as_mut() {
+        c.upstream.url = prepared.url.clone();
+        // 这份 headers 含渠道真实密钥，headers_to_json 会把鉴权头隐去。
+        c.upstream.headers = headers_to_json(&prepared.headers);
+        c.upstream.body = Some(prepared.body.to_vec());
+    }
+
+    let resp = outbound.dial(prepared).await?;
+
+    recorder.record.upstream_status = Some(resp.status.as_u16() as i32);
+    if let Some(c) = recorder.capture.as_mut() {
+        c.upstream.status = recorder.record.upstream_status;
+        c.upstream.response_headers = headers_to_json(&resp.headers);
+    }
+
+    let bytes = match resp.body {
+        UpstreamBody::Buffered(b) => b,
+        // `prepare` 里 stream 给了 false，dial 因此不会按流处理。真出现流，
+        // 只能读完再回 —— 这类接口返回的本来就是一个小 JSON。
+        UpstreamBody::Stream(_) => Bytes::new(),
+    };
+
+    if let Some(c) = recorder.capture.as_mut() {
+        c.upstream.response_body = Some(bytes.to_vec());
+        c.response_body = Some(bytes.to_vec());
+    }
+
+    tracing::debug!(provider = outbound.tag(), status = %resp.status, "非对话请求已原样转发");
+    Ok(build_response(resp.status, resp.headers, bytes))
+}
+
+/// 非对话请求的错误响应。
+///
+/// 不用 `error_response`：那个按协议族拼 JSON（Anthropic 是 `{"type":"error",…}`，
+/// OpenAI 是 `{"error":{…}}`），而这里连客户端说哪种协议都不知道。
+/// 用一个三方都认得出的形状，别猜。
+fn raw_error_response(status: u16, title: &str, detail: &str) -> Response {
+    let code = http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_GATEWAY);
+    (
+        code,
+        axum::Json(serde_json::json!({
+            "error": { "type": "apilot_error", "message": format!("{title}：{detail}") }
+        })),
+    )
+        .into_response()
+}
+
+/// 从 body 里只取 `model` 一个字段。
+///
+/// 非对话请求不解成 IR —— 那正是要避免的事。取不出来就返回空串，让路由按
+/// "没有模型"处理。
+fn peek_model(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("model")?.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// 组装候选渠道：主渠道 + 其余（用于故障转移）。
@@ -1247,9 +1508,17 @@ fn patch_model_field(original: &[u8], mapped: &str) -> Bytes {
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(original) else {
         return Bytes::from(original.to_vec());
     };
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("model".into(), serde_json::json!(mapped));
+    let Some(obj) = v.as_object_mut() else {
+        return Bytes::from(original.to_vec());
+    };
+
+    // 名字没变就一个字节都别动。重序列化会规范化空白，对"原样转发"来说那是
+    // 无谓的改动，也让"发出去的和客户端发来的一样"这句话不再成立。
+    if obj.get("model").and_then(|m| m.as_str()) == Some(mapped) {
+        return Bytes::from(original.to_vec());
     }
+
+    obj.insert("model".into(), serde_json::json!(mapped));
     serde_json::to_vec(&v)
         .map(Bytes::from)
         .unwrap_or_else(|_| Bytes::from(original.to_vec()))
@@ -1416,6 +1685,41 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_model_name_leaves_the_body_byte_for_byte() {
+        // 名字没变就一个字节都别动：重序列化会规范化空白，"原样转发"这句承诺
+        // 会因此不再成立。
+        let raw = b"{ \"model\" : \"deepseek-chat\" ,\n  \"messages\" : [] }";
+        assert_eq!(&patch_model_field(raw, "deepseek-chat")[..], raw);
+
+        // 真的变了才重写。
+        let changed = patch_model_field(raw, "other");
+        assert_ne!(&changed[..], raw);
+        let v: serde_json::Value = serde_json::from_slice(&changed).unwrap();
+        assert_eq!(v["model"], "other");
+        assert!(v.get("messages").is_some(), "改 model 不该丢掉别的字段");
+    }
+
+    #[test]
+    fn a_body_without_a_model_gets_one_inserted() {
+        // 非对话请求的 body 未必带 model；带上渠道映射后的名字总比不带强。
+        let out = patch_model_field(br#"{"messages":[]}"#, "deepseek-chat");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "deepseek-chat");
+    }
+
+    #[test]
+    fn peek_model_reads_only_the_model_field() {
+        assert_eq!(
+            peek_model(br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}"#),
+            "gpt-5"
+        );
+        // 取不出来就是空串：调用方按"没有模型"处理，而不是当成错误。
+        assert_eq!(peek_model(br#"{"messages":[]}"#), "");
+        assert_eq!(peek_model(b"not json"), "");
+        assert_eq!(peek_model(br#"{"model":123}"#), "");
+    }
+
+    #[test]
     fn thinking_is_stripped_for_cross_protocol() {
         let mut req = UnifiedRequest::new("m");
         req.messages = vec![crate::protocol::dto::UnifiedMessage::new(
@@ -1508,12 +1812,13 @@ mod tests {
         fn provider(&self) -> &crate::storage::models::Provider {
             unimplemented!("排序测试不读渠道配置")
         }
-        fn prepare(
+        fn prepare_at(
             &self,
             _wire: Protocol,
             _incoming: &HeaderMap,
             _body: Bytes,
             _stream: bool,
+            _path: Option<&str>,
         ) -> Result<crate::upstream::outbound::PreparedRequest, UpstreamError> {
             unimplemented!("排序测试不发请求")
         }

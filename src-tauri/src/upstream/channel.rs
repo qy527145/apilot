@@ -120,18 +120,24 @@ impl Outbound for Channel {
         &self.provider
     }
 
-    fn prepare(
+    fn prepare_at(
         &self,
         wire: Protocol,
         incoming: &http::HeaderMap,
         body: Bytes,
         stream: bool,
+        path: Option<&str>,
     ) -> Result<PreparedRequest, UpstreamError> {
-        // 调用方理应先用 `wire_for` 挑好协议，但 prepare 是 trait 上的公开方法，
+        // 调用方理应先用 `wire_for` 挑好协议，但 prepare_at 是 trait 上的公开方法，
         // 不能假设。这里再归一一次：否则传一个渠道不支持的协议进来，会拼出一个
         // 渠道根本没提供的路径（比如给纯 Chat 渠道拼出 /v1/messages）。
         let wire = self.provider.wire_for(wire);
-        let url = self.provider.endpoint_for(wire);
+        // 非对话请求带着自己的路径来，那时它说了算 —— 渠道里配的协议覆盖路径
+        // 是给对话协议用的，套上去只会把它带到另一个接口。
+        let url = match path {
+            Some(p) => self.provider.endpoint(p),
+            None => self.provider.endpoint_for(wire),
+        };
         let mut headers = forwardable_headers(incoming);
 
         // 注入该渠道的鉴权头。
@@ -164,7 +170,7 @@ impl Outbound for Channel {
 
         let mut builder = self
             .client
-            .post(&req.url)
+            .request(req.method.clone(), &req.url)
             .headers(req.headers)
             .body(req.body.to_vec());
 
