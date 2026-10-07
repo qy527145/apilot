@@ -800,6 +800,9 @@ export const api = {
     call<TakeoverResult>("apply_takeover", { client }),
   restoreClient: (client: string) =>
     call<TakeoverResult>("restore_client", { client }),
+  /** 用系统默认程序打开该客户端的配置文件。 */
+  openClientConfig: (client: string) =>
+    call<void>("open_client_config", { client }),
 
   /* ---- logs ---- */
   queryLogs: (filter: LogFilter) => call<Page<RequestLog>>("query_logs", { filter }),

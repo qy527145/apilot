@@ -43,7 +43,7 @@ cargo build
 | 缓存 | `src-tauri/src/cache/` | 缓存键、策略、存储与 LRU 淘汰 |
 | 接管 | `src-tauri/src/takeover/` | 客户端配置的保序补丁与原子写入 |
 | 存储 | `src-tauri/src/storage/` | SQLite 连接、迁移、各领域读写 |
-| 命令 | `src-tauri/src/commands/` | Tauri 命令层（41 个） |
+| 命令 | `src-tauri/src/commands/` | Tauri 命令层（54 个） |
 | 前端 | `src/` | 9 个页面 + shadcn/ui 组件 |
 
 ## 改什么去哪里

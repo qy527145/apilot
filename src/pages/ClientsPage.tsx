@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Eye, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
+import { AlertTriangle, Eye, FilePenLine, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
@@ -26,6 +26,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { qk } from "@/hooks/queries";
 import { api, type ClientDetect } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -74,6 +75,9 @@ export default function ClientsPage({
       invalidate();
     },
   });
+
+  // 打开失败基本只有一种情况：文件还没生成。后端已把话说清楚了，这里不再兜底文案。
+  const openConfig = useMutation({ mutationFn: api.openClientConfig });
 
   const openPreview = async (client: ClientDetect) => {
     setPreviewLoading(client.id);
@@ -165,11 +169,37 @@ export default function ClientsPage({
                           {c.taken_over ? "已接管" : "未接管"}
                         </Badge>
                       </TableCell>
-                      <TableCell
-                        className="text-muted-foreground max-w-[260px] truncate text-xs"
-                        title={c.config_path}
-                      >
-                        {c.config_path}
+                      <TableCell className="max-w-[260px] text-xs">
+                        <div className="flex items-center gap-1">
+                          <span
+                            className="text-muted-foreground truncate"
+                            title={c.config_path}
+                          >
+                            {c.config_path}
+                          </span>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              {/* 禁用的按钮吃不到 hover（pointer-events-none），
+                                  套一层 span 才能让「为什么不能开」的提示浮出来 */}
+                              <span className="inline-flex shrink-0">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="size-6"
+                                  disabled={!c.detected || openConfig.isPending}
+                                  onClick={() => openConfig.mutate(c.id)}
+                                >
+                                  <FilePenLine className="size-3.5" />
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {c.detected
+                                ? "用默认程序打开配置文件"
+                                : "配置文件还没生成，先接管"}
+                            </TooltipContent>
+                          </Tooltip>
+                        </div>
                       </TableCell>
                       <TableCell
                         className="text-muted-foreground max-w-[220px] truncate text-xs"

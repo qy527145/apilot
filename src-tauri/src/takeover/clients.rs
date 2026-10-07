@@ -58,6 +58,14 @@ impl ClientId {
         }
     }
 
+    /// 该客户端的主配置文件 —— 界面展示、「打开」按钮都指它。
+    ///
+    /// 取第一个是约定：目前每个客户端只有一个待写文件（Codex 的 auth.json 我们不动），
+    /// 真出现多文件的那天，这里的"主"要重新定义。
+    pub fn primary_config_path(&self) -> Option<PathBuf> {
+        self.config_paths().into_iter().next()
+    }
+
     /// 该客户端是否已安装（配置文件存在即认为装了）。
     pub fn detect(&self) -> bool {
         self.config_paths().iter().any(|p| p.exists())
@@ -110,8 +118,7 @@ pub fn describe_all(engine: &TakeoverEngine) -> Vec<ClientInfo> {
             id: c.as_str().to_string(),
             name: c.display_name().to_string(),
             config_path: c
-                .config_paths()
-                .first()
+                .primary_config_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             detected: c.detect(),

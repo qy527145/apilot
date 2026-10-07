@@ -109,6 +109,7 @@ pub fn run() {
             commands::takeover::preview_takeover,
             commands::takeover::apply_takeover,
             commands::takeover::restore_client,
+            commands::takeover::open_client_config,
             commands::takeover::takeover_readiness,
             // --- 日志 ---
             commands::logs::query_logs,

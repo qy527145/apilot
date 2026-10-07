@@ -91,6 +91,31 @@ pub async fn apply_takeover(
     Ok(result)
 }
 
+/// 用系统默认程序打开客户端的配置文件。
+///
+/// 路径**按 client 在后端解析**，不接受前端传路径 —— 收下一个任意路径就等于
+/// 给渲染进程开一个「打开本机任意文件」的口子，而这里要的只是那三个固定文件。
+#[tauri::command]
+pub fn open_client_config(client: String) -> AppResult<()> {
+    let id = ClientId::parse(&client).ok_or(AppError::UnknownClient(client))?;
+    let path = id
+        .primary_config_path()
+        .ok_or_else(|| AppError::msg("该客户端没有可打开的配置文件"))?;
+
+    // 文件不存在时先给一句人话：`open_path` 抛的是裸 IO 错误
+    // （Windows 上就一句"系统找不到指定的文件"），用户会当成 Apilot 的 bug。
+    if !path.exists() {
+        return Err(AppError::msg(format!(
+            "{} 还没有配置文件（{}）。先点「接管」，或手动创建后再打开。",
+            id.display_name(),
+            path.display()
+        )));
+    }
+
+    tauri_plugin_opener::open_path(&path, None::<&str>)
+        .map_err(|e| AppError::msg(format!("打开配置文件失败：{e}")))
+}
+
 #[tauri::command]
 pub async fn restore_client(
     _shell: State<'_, Arc<AppShell>>,
