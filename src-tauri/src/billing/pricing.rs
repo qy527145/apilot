@@ -32,6 +32,16 @@ pub struct ModelPricing {
     /// 其它叠加倍率（按渠道、时段等），最终连乘。
     pub other_ratios: HashMap<String, f64>,
     pub currency: String,
+    /// 这行是怎么来的。
+    ///
+    /// `None` = **用户手填的**，从目录批量更新时一律不动它 —— 否则用户精心
+    /// 调完价，下次点一下"更新价格"就全白调了。`Some("catalog:models.dev")`
+    /// 之类表示由某份目录导入，可以被同一来源的下一次导入覆盖。
+    ///
+    /// 放在 `ModelPricing` 上而不是单独查一张表：界面要显示"这个价是哪来的"，
+    /// 拆开就得在每处渲染时多做一次关联。
+    #[serde(default)]
+    pub source: Option<String>,
     pub updated_at: i64,
 }
 
@@ -49,6 +59,7 @@ impl Default for ModelPricing {
             tool_call_surcharge: 0,
             other_ratios: HashMap::new(),
             currency: "USD".to_string(),
+            source: None,
             updated_at: 0,
         }
     }

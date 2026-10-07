@@ -2,10 +2,12 @@
 
 mod billing;
 mod cache;
+mod catalog;
 mod commands;
 mod config;
 mod error;
 mod gateway;
+mod probe;
 mod protocol;
 mod routing;
 mod shell;
@@ -71,6 +73,13 @@ pub fn run() {
             commands::providers::list_provider_models,
             commands::providers::set_provider_models,
             commands::providers::fetch_provider_models,
+            // --- 上游目录（价格与能力共用同一个网络集成） ---
+            commands::catalog::catalog_price_preview,
+            commands::catalog::catalog_price_apply,
+            commands::catalog::catalog_capabilities_import,
+            commands::catalog::list_capabilities,
+            commands::catalog::probe_capability,
+            commands::catalog::test_model,
             // --- 模型（模型视角：这个模型在哪些渠道上有、优先走哪个） ---
             commands::models::get_model_policy,
             commands::models::list_model_catalog,

@@ -52,6 +52,13 @@ pub struct AppShell {
     /// 对着几天前的数字做决策。由「测速」命令写入，供按延迟选渠道的策略读取。
     pub probe_latency: Arc<dashmap::DashMap<String, i64>>,
 
+    /// 最近拉到的上游模型目录，按来源缓存。
+    ///
+    /// 缓存而不是每次重拉，是因为「预览差异」和「确认应用」是两次命令调用 ——
+    /// 不缓存就得把一个几 MB 的 JSON 下两遍，而用户还可能在界面上反复切换
+    /// 来源看差异。缓存值里带抓取时刻，由调用方按 TTL 判断新鲜度。
+    pub catalog_cache: Arc<dashmap::DashMap<crate::catalog::CatalogSource, (i64, Arc<Vec<crate::catalog::CatalogModel>>)>>,
+
     started_at: i64,
 }
 
@@ -115,6 +122,7 @@ impl AppShell {
             events: Arc::new(EventBus::new(app)),
             gateway: Arc::new(crate::gateway::server::GatewayServer::new()),
             probe_latency: Arc::new(dashmap::DashMap::new()),
+            catalog_cache: Arc::new(dashmap::DashMap::new()),
             started_at: now_ms(),
         });
 

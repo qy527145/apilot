@@ -1,6 +1,7 @@
 //! 持久化层：SQLite 连接、迁移、各领域的读写。
 
 pub mod aggregates;
+pub mod capabilities;
 pub mod db;
 pub mod logs;
 pub mod migrations;

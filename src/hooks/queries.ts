@@ -9,6 +9,10 @@ export const qk = {
   gateway: ["gateway"] as const,
   providers: ["providers"] as const,
   providerModels: (id: number) => ["provider_models", id] as const,
+  /** 某渠道下「模型 × 能力」的判定结果。 */
+  capabilities: (id: number) => ["capabilities", id] as const,
+  /** 前缀键：一次导入会同时改动多个渠道的能力，那时按前缀整片失效。 */
+  capabilitiesAll: ["capabilities"] as const,
   /** 前缀键，一次失效所有渠道的模型声明（改上游名时不知道会碰到哪几个渠道）。 */
   providerModelsAll: ["provider_models"] as const,
   /** 模型目录（模型视角）。渠道侧改过模型声明后也要让它失效。 */

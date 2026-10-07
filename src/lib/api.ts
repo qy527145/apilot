@@ -313,6 +313,13 @@ export interface PricingInput {
 export interface Pricing extends PricingInput {
   other_ratios: Record<string, number>;
   currency: string;
+  /**
+   * 这行价格的来源。
+   *
+   * `null` / 省略 = **用户手填的**，「从目录更新价格」一律不碰它。
+   * 有值（如 `catalog:models.dev`）表示由某份目录导入，下次导入可以覆盖。
+   */
+  source?: string | null;
   updated_at: number;
 }
 
@@ -668,6 +675,121 @@ export interface ProviderModel {
   upstream_model?: string | null;
 }
 
+/* --------------------------- 模型能力探测 --------------------------- */
+
+/** Apilot 关心的能力维度。与后端 `storage::capabilities::Capability` 一一对应。 */
+export type Capability = "reasoning" | "tools" | "vision";
+
+/**
+ * 判定结果。**是三态，不是布尔。**
+ *
+ * 探测「支不支持工具」时，模型完全可能只是那一次没调工具 —— 记成「不支持」
+ * 是撒谎，用户会据此把一条本来能用的渠道判死刑。所以「未知」必须是个能显示
+ * 出来的独立状态，不能压成 false。
+ */
+export type CapabilityVerdict = "supported" | "unsupported" | "inconclusive";
+
+/** 能力来源：`probe` 是实测（反映这条渠道的真实行为），`catalog` 是目录断言。 */
+export type CapabilitySource = "probe" | "catalog";
+
+export const CAPABILITY_LABEL: Record<Capability, string> = {
+  reasoning: "思考",
+  tools: "工具",
+  vision: "多模态",
+};
+
+export const CAPABILITY_VERDICT_LABEL: Record<CapabilityVerdict, string> = {
+  supported: "支持",
+  unsupported: "不支持",
+  inconclusive: "未知",
+};
+
+export const ALL_CAPABILITIES: Capability[] = ["reasoning", "tools", "vision"];
+
+export interface CapabilityRecord {
+  provider_id: number;
+  model: string;
+  capability: Capability;
+  verdict: CapabilityVerdict;
+  source: CapabilitySource;
+  /** 判定依据：具体观察到了什么。排查「凭什么叫它不支持」时看这个。 */
+  evidence?: string | null;
+  checked_at: number;
+}
+
+/** 一次真实模型测试的结果。 */
+export interface OneshotOutcome {
+  ok: boolean;
+  status?: number | null;
+  latency_ms: number;
+  wire: Protocol;
+  /** 实际打到的出站地址，排查「怎么发到那儿去了」时要有。 */
+  url: string;
+  /** 上游原始回包的截断预览。 */
+  preview: string;
+  /** 解出来的回答文本。 */
+  text: string;
+  usage?: UnifiedUsage | null;
+  error?: string | null;
+}
+
+/* --------------------------- 上游模型目录 --------------------------- */
+
+/**
+ * 目录来源。两家的数据形状差别很大，不是互为备份：
+ * models.dev 覆盖更全更新（kimi / glm / qwen3-max 只有它有），
+ * LiteLLM 模型更多但偏一手大厂。枚举值与后端 serde 的 snake_case 一致。
+ */
+export type CatalogSource = "models_dev" | "lite_llm";
+
+export const CATALOG_SOURCE_LABEL: Record<CatalogSource, string> = {
+  models_dev: "models.dev",
+  lite_llm: "LiteLLM",
+};
+
+/** 目录导入时对某一行的处置。 */
+export type PriceAction = "insert" | "update" | "keep_user_owned" | "unchanged";
+
+export const PRICE_ACTION_LABEL: Record<PriceAction, string> = {
+  insert: "新增",
+  update: "覆盖",
+  keep_user_owned: "跳过（手填）",
+  unchanged: "无变化",
+};
+
+export interface PriceDiffRow {
+  model: string;
+  action: PriceAction;
+  /** 库里的现值。新增时为 null。 */
+  current?: Pricing | null;
+  incoming: Pricing;
+}
+
+export interface PriceImportStats {
+  inserted: number;
+  updated: number;
+  kept_user_owned: number;
+  unchanged: number;
+}
+
+export interface CatalogPreview {
+  source: CatalogSource;
+  source_label: string;
+  /** 目录里的条目总数。 */
+  total: number;
+  /** 其中带价格、且**本项目声明过**的模型数 —— 真正会写库的那批。 */
+  priced: number;
+  rows: PriceDiffRow[];
+  stats: PriceImportStats;
+}
+
+export interface CapabilityImportStats {
+  providers: number;
+  written: number;
+  /** 目录里找不到的模型数（含自建、以及目录还没收录的新模型）。 */
+  missing: number;
+}
+
 /** 接管前置条件。判定在后端，前端只负责展示缺了哪一步。 */
 export interface TakeoverReadiness {
   gateway_running: boolean;
@@ -751,6 +873,31 @@ export const api = {
   /** 拉取上游 `GET {base_url}/v1/models`，返回模型 id 列表。 */
   fetchProviderModels: (id: number) =>
     call<string[]>("fetch_provider_models", { id }),
+
+  /* ---- 上游目录：价格与能力共用同一个网络集成 ---- */
+  /**
+   * 预览「从目录更新价格会改动什么」，不写库。
+   * `refresh` 为真则忽略缓存重新下载（目录本身按天更新，平时不必）。
+   */
+  catalogPricePreview: (source: CatalogSource, refresh = false) =>
+    call<CatalogPreview>("catalog_price_preview", { source, refresh }),
+  /** 应用价格更新。后端会**重新算一遍差异**，不信前端传回来的行。 */
+  catalogPriceApply: (source: CatalogSource) =>
+    call<PriceImportStats>("catalog_price_apply", { source }),
+  /** 从目录导入能力标志。`providerId` 省略则处理所有启用的渠道。 */
+  catalogCapabilitiesImport: (source: CatalogSource, providerId?: number) =>
+    call<CapabilityImportStats>("catalog_capabilities_import", {
+      source,
+      providerId: providerId ?? null,
+    }),
+  listCapabilities: (providerId: number) =>
+    call<CapabilityRecord[]>("list_capabilities", { providerId }),
+  /** 探测一项能力。一次只测一项 —— 每项都要花一次请求的 token。 */
+  probeCapability: (providerId: number, model: string, capability: Capability) =>
+    call<CapabilityRecord>("probe_capability", { providerId, model, capability }),
+  /** 单次模型测试：往这个渠道真发一条最短的对话请求。 */
+  testModel: (providerId: number, model: string) =>
+    call<OneshotOutcome>("test_model", { providerId, model }),
 
   /* ---- routing: rules ---- */
   listRouteRules: () => call<RouteRule[]>("list_route_rules"),

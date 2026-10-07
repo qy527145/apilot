@@ -7,6 +7,7 @@
 pub mod app;
 pub mod billing;
 pub mod cache;
+pub mod catalog;
 pub mod gateway;
 pub mod logs;
 pub mod models;

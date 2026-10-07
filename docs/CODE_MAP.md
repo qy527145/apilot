@@ -16,6 +16,7 @@
   - [gateway — 反向代理与请求管线](#gateway--反向代理与请求管线3364-行)
   - [routing — 模型选择、规则链与热切换](#routing--模型选择规则链与热切换1874-行)
   - [upstream — 上游渠道](#upstream--上游渠道771-行)
+  - [catalog — 上游模型目录](#catalog--上游模型目录价格--能力)
   - [billing — 计费](#billing--计费848-行)
   - [cache — 响应缓存](#cache--响应缓存1109-行)
   - [takeover — 客户端接管](#takeover--客户端接管1763-行)
@@ -176,6 +177,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | `channel.rs` | `Channel` —— 唯一的 HTTP 实现。转发请求头时的**剔除清单**、鉴权头注入、`looks_like_json` 判定 |
 | `registry.rs` | `ProviderRegistry`：`DashMap<String, Arc<dyn Outbound>>` + `ArcSwapOption<String>` 默认渠道 |
 | `client.rs` | 共享 `reqwest::Client` 与**出站代理**。`ProxySpec`（解析结果，也是 `ClientPool` 的缓存键）、`resolve_global` / `resolve_channel`（把设置折算成 spec）、`NO_PROXY_LIST`（回环与私有网段绕过代理） |
+| `oneshot.rs` | **脱离网关管线的单次真实请求**：协议编码 → `prepare` → `dial`。模型测试与能力探测都走它 —— 走管线会写日志、计费、查缓存，对一次探测全是副作用 |
 
 **出站 URL 由渠道的线协议决定，与入站路径无关**：客户端说 Anthropic，
 渠道是 OpenAI 类型时就该发到 `/v1/chat/completions`。
@@ -184,6 +186,28 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 渠道 `Provider.proxy`（跟随全局 / 直连 / 指定地址）。解析成 `ProxySpec` 后按它
 在 `ClientPool` 里取客户端 —— 客户端数量 = 不同代理地址数，不是渠道数。
 `Direct` 分支必须显式 `no_proxy()`，否则 reqwest 会自己读环境变量绕过「直连」。
+
+---
+
+### `catalog/` — 上游模型目录（价格 + 能力）
+
+| 文件 | 内容 |
+|---|---|
+| `mod.rs` | `CatalogSource`（models.dev / LiteLLM）、归一化后的 `CatalogModel`、`to_pricing`（价格 → 倍率）、`index_by_model`（压平去重）、`fetch` |
+| `models_dev.rs` | 按厂商分组的 JSON。价格已是 $/1M，直接用 |
+| `litellm.rs` | 扁平 JSON，价格是 $/token，**要乘 1e6** |
+
+`probe.rs`（顶层模块）是目录的对照面：**主动探测**某渠道某模型支不支持
+思考/工具/多模态。三种能力的判法**刻意不一样** —— 工具和图片不支持时上游会返
+4xx，所以「被接受」即「支持」；思考则不然，OpenAI 系对不认识的 `reasoning_effort`
+是静默忽略，只能看回包里有没有思考块。
+
+**两个来源不是互为备份**：models.dev 覆盖更全更新（kimi / glm / qwen3-max
+只有它有，DeepSeek 已是 v4 命名），LiteLLM 模型更多但偏一手大厂。实测两者对
+个别模型（如 DeepSeek）报价能差一倍，所以界面上必须标出来源。
+
+**为什么不合成一个网络集成**：公开目录本来就同时维护价格和能力标志，分两次
+下载只是把同一个文件拉两遍。
 
 ---
 
@@ -359,7 +383,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 
 ## 数据库
 
-12 张表，SQLite（WAL 模式）。DDL 真源在 `storage/migrations.rs`。
+13 张表，SQLite（WAL 模式）。DDL 真源在 `storage/migrations.rs`。
 
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
@@ -371,7 +395,8 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `route_config` | 单行 `id=1` | 兜底 selector |
 | `request_logs` | `request_id` 唯一 | 请求明细：token、quota、耗时、**TTFB**、缓存命中、估算偏差；以及**方向信息**：入站 `path`、出站 `upstream_url` / `upstream_model` / `upstream_status` |
 | `usage_hourly` | `(bucket_ts, client, provider_tag, model)` | 小时聚合，SUM 后 upsert。**`clear_logs` 不动它** —— 它是计费口径的历史账目 |
-| `model_pricing` | `model` | 单价系数 |
+| `model_pricing` | `model` | 单价系数。`source` 为 NULL = **用户手填**（批量导入一律不动），有值 = 由某份目录导入、可被同来源的下次导入覆盖 |
+| `model_capabilities` | `(provider_id, model, capability)` | 这个**渠道上这个模型**支不支持思考/工具/多模态。`verdict` 是三态（supported / unsupported / inconclusive）—— 探测「支不支持工具」时模型可能只是那一次没调工具，记成布尔就是撒谎。`source` 分 probe（实测，花 token）与 catalog（目录断言，零成本）；**覆盖优先级写在 `storage::capabilities` 的 upsert SQL 里**：实测且明确 > 目录 > 实测但不确定 |
 | `response_cache` | `key`（sha256） | 缓存条目：响应体、usage、原额度、命中数 |
 | `captures` | `request_id` | **两个方向的原文**：入站（客户端→Apilot）与出站（Apilot→上游，含上游 URL / headers / body 与上游原始响应）+ 流式拼接文本（**鉴权头已隐去**）+ 每个 SSE 事件的时间点（`stream_timings`，JSON，供时间轴） |
 | `settings_kv` | `key` | 设置、单价兜底倍率、缓存计数器 |
@@ -386,7 +411,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 | 位置 | 内容 |
 |---|---|
-| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 54 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
+| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 60 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
@@ -394,7 +419,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
 | `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择 + 每渠道的上游模型名，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
-| `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选） |
+| `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选；每行还有**单次模型测试**与三枚**能力徽标**，点徽标即实测一项）；`CatalogCapabilitiesDialog` / `CatalogPriceDialog` 是两个目录导入入口 |
 | `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，

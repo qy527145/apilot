@@ -273,6 +273,39 @@ ALTER TABLE providers ADD COLUMN proxy TEXT;
     r#"
 ALTER TABLE captures ADD COLUMN stream_timings TEXT;
 "#,
+    // --- v7: 模型能力 + 价格来源 ---
+    //
+    // 动机：现在没法回答"这个模型支不支持工具/思考/图片"。协议层虽然完整处理
+    // 这些字段，但编码时是**无条件**发出的 —— 不支持就等上游返 4xx，界面上
+    // 也无从展示。
+    //
+    // 能力按 (渠道, 模型) 存，不只按模型名：同一个模型名挂在不同中转/代理后面
+    // 行为可能不同，而"这条渠道实际给不给过 tools"才是用户真正要的答案。
+    //
+    // `verdict` 存三态（supported / unsupported / inconclusive）而不是布尔：
+    // 探测"支不支持工具"时模型完全可能只是那一次没调工具，记成"不支持"是撒谎。
+    //
+    // `source` 区分来源。目录拉来的（catalog）零成本，但只反映模型本身宣称的
+    // 能力；实测出来的（probe）反映这条渠道的真实行为。优先级规则在
+    // `storage::capabilities` 的 upsert 语句里，不在这里。
+    //
+    // 价格行的 `source` 同理：NULL = 用户手填（老行全是 NULL，这个语义正好对）。
+    // 从目录批量更新时只覆盖 catalog 来源的行，手改过的一律不动 —— 否则用户
+    // 精心调完价，下次点一下更新就全白调了。
+    r#"
+CREATE TABLE IF NOT EXISTS model_capabilities (
+  provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  model       TEXT NOT NULL,
+  capability  TEXT NOT NULL,
+  verdict     TEXT NOT NULL,
+  source      TEXT NOT NULL,
+  evidence    TEXT,
+  checked_at  INTEGER NOT NULL,
+  PRIMARY KEY (provider_id, model, capability)
+);
+CREATE INDEX IF NOT EXISTS idx_model_capabilities_model ON model_capabilities(model);
+ALTER TABLE model_pricing ADD COLUMN source TEXT;
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -284,7 +317,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

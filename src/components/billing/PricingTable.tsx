@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Save, Trash2 } from "lucide-react";
+import { CloudDownload, Plus, Save, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { CatalogPriceDialog } from "@/components/providers/CatalogPriceDialog";
 import { EmptyState } from "@/components/common/EmptyState";
 import { TableSkeleton } from "@/components/common/StatCard";
 import { Button } from "@/components/ui/button";
@@ -62,6 +63,7 @@ export function PricingTable() {
 
   const [rows, setRows] = useState<EditableRow[]>([]);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [catalogOpen, setCatalogOpen] = useState(false);
   const [draft, setDraft] = useState({ model: "", model_ratio: "1" });
 
   useEffect(() => {
@@ -137,11 +139,23 @@ export function PricingTable() {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold">单价系数配置</h2>
-        <Button size="sm" variant="outline" onClick={() => setDialogOpen(true)}>
-          <Plus className="size-4" />
-          新增单价
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setCatalogOpen(true)}
+          >
+            <CloudDownload className="size-4" />
+            从目录更新
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => setDialogOpen(true)}>
+            <Plus className="size-4" />
+            新增单价
+          </Button>
+        </div>
       </div>
+
+      <CatalogPriceDialog open={catalogOpen} onOpenChange={setCatalogOpen} />
 
       {isLoading ? (
         <TableSkeleton rows={4} cols={7} />

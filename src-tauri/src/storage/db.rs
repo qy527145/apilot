@@ -121,6 +121,7 @@ mod tests {
             "request_logs",
             "usage_hourly",
             "model_pricing",
+            "model_capabilities",
             "response_cache",
             "captures",
             "settings_kv",
