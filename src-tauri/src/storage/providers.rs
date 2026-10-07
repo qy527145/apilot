@@ -30,8 +30,6 @@ pub struct ProviderInput {
     pub extra_headers: IndexMap<String, String>,
     #[serde(default)]
     pub param_override: Option<Value>,
-    #[serde(default)]
-    pub model_mapping: IndexMap<String, String>,
     #[serde(default = "default_weight")]
     pub weight: i64,
     #[serde(default)]
@@ -178,7 +176,6 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
 
     let now = now_ms();
     let extra = serde_json::to_string(&input.extra_headers)?;
-    let mapping = serde_json::to_string(&input.model_mapping)?;
     let protocols = serde_json::to_string(&input.protocols)?;
     let proxy = serde_json::to_string(&input.proxy.clone().normalized())?;
     let param_override = match &input.param_override {
@@ -192,10 +189,10 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             let result = sqlx::query(
                 "UPDATE providers SET tag=?1, name=?2, kind=?3, base_url=?4,
                      api_key = COALESCE(?5, api_key), auth_style=?6, protocols=?7,
-                     extra_headers=?8, param_override=?9, model_mapping=?10, weight=?11,
-                     priority=?12, enabled=?13, timeout_ms=?14, updated_at=?15,
-                     proxy=?16
-                 WHERE id=?17",
+                     extra_headers=?8, param_override=?9, weight=?10,
+                     priority=?11, enabled=?12, timeout_ms=?13, updated_at=?14,
+                     proxy=?15
+                 WHERE id=?16",
             )
             .bind(&input.tag)
             .bind(&input.name)
@@ -206,7 +203,6 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(&protocols)
             .bind(&extra)
             .bind(&param_override)
-            .bind(&mapping)
             .bind(input.weight)
             .bind(input.priority)
             .bind(input.enabled as i64)
@@ -225,9 +221,9 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
         None => {
             let result = sqlx::query(
                 "INSERT INTO providers (tag, name, kind, base_url, api_key, auth_style,
-                     protocols, extra_headers, param_override, model_mapping, weight, priority,
+                     protocols, extra_headers, param_override, weight, priority,
                      enabled, timeout_ms, created_at, updated_at, proxy)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,?15)",
             )
             .bind(&input.tag)
             .bind(&input.name)
@@ -238,7 +234,6 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(&protocols)
             .bind(&extra)
             .bind(&param_override)
-            .bind(&mapping)
             .bind(input.weight)
             .bind(input.priority)
             .bind(input.enabled as i64)
@@ -258,6 +253,13 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             result.last_insert_rowid()
         }
     };
+
+    // `model_mapping` 是派生列，真源是 `provider_models`。这里不接收调用方传来的映射，
+    // 而是照真源重算一遍 —— 否则编辑渠道对话框会拿它打开时的旧快照
+    // 把别处刚改好的上游模型名覆盖回去。
+    let mut conn = pool.acquire().await?;
+    rebuild_model_mapping(&mut conn, id).await?;
+    drop(conn);
 
     get(pool, id)
         .await?
@@ -342,7 +344,11 @@ async fn rebuild_model_mapping(
     Ok(())
 }
 
-/// 全量替换某渠道的模型映射（渠道视角：这个渠道提供哪些模型）。
+/// 全量替换某渠道**声明提供**的模型（渠道视角：这个渠道支持哪些模型）。
+///
+/// 只写"有哪些模型"，不碰上游名 —— 面板上那一列已经去掉了，上游名归模型页管
+/// （`set_model_candidates`）。已有的上游名按模型名原样保留，否则在渠道面板
+/// 点一次保存就会把别处配好的重定向全抹掉。
 ///
 /// 写的优先级/权重直接取该渠道自己的值 —— 每模型的 priority/weight 是
 /// `channels_for_model` 的排序依据，默认应当等于渠道级的值，
@@ -350,7 +356,7 @@ async fn rebuild_model_mapping(
 pub async fn set_models(
     pool: &SqlitePool,
     provider_id: i64,
-    models: &[(String, Option<String>)],
+    models: &[String],
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
 
@@ -362,22 +368,41 @@ pub async fn set_models(
     .await?
     .ok_or_else(|| AppError::ProviderNotFound(provider_id.to_string()))?;
 
+    // 删之前先把**不归这个入口管**的列捞出来：上游名和启用状态都归模型页
+    // （`set_model_candidates`）。按渠道全量重插时若不还回去，
+    // 在渠道面板点一次保存就会把别处配好的东西抹掉。
+    let existing: std::collections::HashMap<String, (Option<String>, i64)> = sqlx::query(
+        "SELECT model, upstream_model, enabled FROM provider_models WHERE provider_id = ?1",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|r| (r.get("model"), (r.get("upstream_model"), r.get("enabled"))))
+    .collect();
+
     sqlx::query("DELETE FROM provider_models WHERE provider_id = ?1")
         .bind(provider_id)
         .execute(&mut *tx)
         .await?;
 
-    for (model, upstream) in models {
+    for model in models {
+        let (upstream, enabled) = existing
+            .get(model)
+            .cloned()
+            .unwrap_or((None, 1));
+
         sqlx::query(
             "INSERT INTO provider_models (provider_id, model, upstream_model, client_group,
                  priority, weight, enabled)
-             VALUES (?1, ?2, ?3, '*', ?4, ?5, 1)",
+             VALUES (?1, ?2, ?3, '*', ?4, ?5, ?6)",
         )
         .bind(provider_id)
         .bind(model)
         .bind(upstream)
         .bind(base_priority)
         .bind(base_weight)
+        .bind(enabled)
         .execute(&mut *tx)
         .await?;
     }
@@ -623,7 +648,6 @@ mod tests {
             protocols: Vec::new(),
             extra_headers: IndexMap::new(),
             param_override: None,
-            model_mapping: IndexMap::new(),
             weight: 1,
             priority: 0,
             enabled: true,
@@ -708,9 +732,7 @@ mod tests {
     async fn delete_removes_row_and_cascades_models() {
         let p = pool().await;
         let c = upsert(&p, &input("del")).await.unwrap();
-        set_models(&p, c.id, &[("m1".into(), None)])
-            .await
-            .unwrap();
+        set_models(&p, c.id, &["m1".into()]).await.unwrap();
 
         delete(&p, c.id).await.unwrap();
         assert!(get(&p, c.id).await.unwrap().is_none());
@@ -729,17 +751,33 @@ mod tests {
         let mut inp = input("json");
         inp.extra_headers
             .insert("X-Custom".into(), "v".into());
-        inp.model_mapping
-            .insert("claude-sonnet-5".into(), "claude-3-5-sonnet".into());
         inp.param_override = Some(serde_json::json!({ "temperature": 0.2 }));
 
         let created = upsert(&p, &inp).await.unwrap();
         assert_eq!(created.extra_headers.get("X-Custom").unwrap(), "v");
-        assert_eq!(
-            created.model_mapping.get("claude-sonnet-5").unwrap(),
-            "claude-3-5-sonnet"
-        );
         assert_eq!(created.param_override.unwrap()["temperature"], 0.2);
+    }
+
+    #[tokio::test]
+    async fn upsert_rebuilds_model_mapping_from_the_real_source() {
+        // model_mapping 是派生列。编辑渠道时若把它当真值写回去，
+        // 对话框里的旧快照会盖掉模型页刚配好的重定向。
+        let p = pool().await;
+        let c = upsert(&p, &input("derived")).await.unwrap();
+        set_model_candidates(&p, "alias", &[cand("derived", Some("up"), 0)])
+            .await
+            .unwrap();
+
+        let mut edit = input("derived");
+        edit.id = Some(c.id);
+        edit.name = "改个名字".into();
+        let after = upsert(&p, &edit).await.unwrap();
+
+        assert_eq!(
+            after.upstream_model("alias"),
+            "up",
+            "改渠道不能把它派生的映射冲掉"
+        );
     }
 
     #[tokio::test]
@@ -748,9 +786,7 @@ mod tests {
 
         // c1 只声明支持 model-a
         let c1 = upsert(&p, &input("c1")).await.unwrap();
-        set_models(&p, c1.id, &[("model-a".into(), None)])
-            .await
-            .unwrap();
+        set_models(&p, c1.id, &["model-a".into()]).await.unwrap();
 
         // c2 没有声明任何模型 → 通吃
         let _c2 = upsert(&p, &input("c2")).await.unwrap();
@@ -798,11 +834,35 @@ mod tests {
         set_models(
             &p,
             c.id,
-            &[
-                ("claude-sonnet-4-5".into(), Some("deepseek-chat".into())),
-                // 同名条目也要进 mapping —— /v1/models 广告的就是它的 keys。
-                ("deepseek-reasoner".into(), None),
-            ],
+            // 声明过的模型都进 mapping —— /v1/models 广告的就是它的 keys。
+            // 没配过重定向的名，映射成同名。
+            &["claude-sonnet-4-5".into(), "deepseek-reasoner".into()],
+        )
+        .await
+        .unwrap();
+
+        let after = get(&p, c.id).await.unwrap().unwrap();
+        assert_eq!(after.upstream_model("claude-sonnet-4-5"), "claude-sonnet-4-5");
+        assert_eq!(after.upstream_model("deepseek-reasoner"), "deepseek-reasoner");
+        assert_eq!(after.model_mapping.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_models_keeps_upstream_names_set_from_the_model_page() {
+        // 渠道面板只管"支持哪些模型"，上游名和单模型的启用状态都归模型页管。
+        // 它保存时把这些冲成默认值的话，用户配好的东西会莫名其妙消失。
+        let p = pool().await;
+        let c = upsert(&p, &input("keep")).await.unwrap();
+
+        let mut off = cand("keep", Some("deepseek-chat"), 0);
+        off.enabled = false;
+        set_model_candidates(&p, "claude-sonnet-4-5", &[off]).await.unwrap();
+
+        // 面板里再加一个模型后保存。
+        set_models(
+            &p,
+            c.id,
+            &["claude-sonnet-4-5".into(), "deepseek-reasoner".into()],
         )
         .await
         .unwrap();
@@ -811,17 +871,23 @@ mod tests {
         assert_eq!(
             after.upstream_model("claude-sonnet-4-5"),
             "deepseek-chat",
-            "面板里填的上游名必须真的参与请求改写"
+            "已有的上游名必须原样保留"
         );
         assert_eq!(after.upstream_model("deepseek-reasoner"), "deepseek-reasoner");
-        assert_eq!(after.model_mapping.len(), 2);
+
+        let rows = candidates_for_model(&p, "claude-sonnet-4-5").await.unwrap();
+        assert!(!rows[0].enabled, "已有的启用状态也必须原样保留");
+
+        // 新加的那行则按默认值来。
+        let rows = candidates_for_model(&p, "deepseek-reasoner").await.unwrap();
+        assert!(rows[0].enabled, "没配过的模型默认启用");
     }
 
     #[tokio::test]
     async fn set_models_with_empty_list_restores_wildcard() {
         let p = pool().await;
         let c = upsert(&p, &input("clear")).await.unwrap();
-        set_models(&p, c.id, &[("m".into(), None)]).await.unwrap();
+        set_models(&p, c.id, &["m".into()]).await.unwrap();
 
         // 清空声明 == 恢复"通吃"，这也是用户撤销操作的路径。
         set_models(&p, c.id, &[]).await.unwrap();
@@ -834,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn set_models_on_missing_provider_is_an_error() {
         let p = pool().await;
-        assert!(set_models(&p, 999, &[("m".into(), None)]).await.is_err());
+        assert!(set_models(&p, 999, &["m".into()]).await.is_err());
     }
 
     #[tokio::test]
@@ -848,7 +914,7 @@ mod tests {
             "只建渠道但没声明模型的渠道是通吃的，仍视为未就绪"
         );
 
-        set_models(&p, c.id, &[("m".into(), None)]).await.unwrap();
+        set_models(&p, c.id, &["m".into()]).await.unwrap();
         assert!(has_declared_models(&p).await.unwrap());
 
         let mut off = input("wild");
@@ -1003,7 +1069,7 @@ mod tests {
         let p = pool().await;
         add(&p, "a", 42).await;
 
-        set_models(&p, 1, &[("m".into(), None)]).await.unwrap();
+        set_models(&p, 1, &["m".into()]).await.unwrap();
 
         let rows = candidates_for_model(&p, "m").await.unwrap();
         assert_eq!(rows[0].priority, 42, "没单独配过的模型应继承渠道的优先级");

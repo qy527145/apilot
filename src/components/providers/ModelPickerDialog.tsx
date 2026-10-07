@@ -31,8 +31,10 @@ interface Props {
 /**
  * 从上游 `GET /v1/models` 拉模型列表，让用户勾选要使用的模型。
  *
- * 这里只负责"选哪些上游模型"，不碰入站名 —— 入站名由面板左列决定，
- * 因为只有用户知道客户端会发什么名字（Claude Code 发的是 claude-*）。
+ * 拉回来的是**上游**的模型名。勾选后它们会被当作声明名原样填进面板 ——
+ * 若客户端发的名字与上游不同（Claude Code 发的是 claude-*），
+ * 手动改面板里的名字、再去路由页配上游名。这里不做那层推断：
+ * 只有用户知道客户端到底会发什么。
  */
 export function ModelPickerDialog({
   open,
@@ -97,8 +99,8 @@ export function ModelPickerDialog({
         <DialogHeader>
           <DialogTitle>从上游获取模型</DialogTitle>
           <DialogDescription>
-            读取「{providerName}」的 /v1/models。勾选后的模型会出现在映射列表里，
-            再用左列指定客户端会发来的模型名。
+            读取「{providerName}」的 /v1/models。勾选后的模型会加进这个渠道的
+            模型列表。客户端发的名字跟上游不一样时，在列表里改完再去路由页配上游名。
           </DialogDescription>
         </DialogHeader>
 
@@ -124,7 +126,7 @@ export function ModelPickerDialog({
           </div>
         ) : models.length === 0 ? (
           <p className="text-muted-foreground py-6 text-center text-sm">
-            上游没有返回任何模型。可以在映射面板里手工添加模型名。
+            上游没有返回任何模型。可以在渠道行展开后手工添加模型名。
           </p>
         ) : (
           <>

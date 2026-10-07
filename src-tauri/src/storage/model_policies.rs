@@ -104,7 +104,6 @@ mod tests {
                 protocols: Vec::new(),
                 extra_headers: Default::default(),
                 param_override: None,
-                model_mapping: Default::default(),
                 weight: 1,
                 priority: 0,
                 enabled: true,

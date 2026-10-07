@@ -69,7 +69,6 @@ export interface ProviderInput {
   protocols: ProtocolEndpoint[];
   extra_headers: Record<string, string>;
   param_override?: unknown | null;
-  model_mapping: Record<string, string>;
   weight: number;
   priority: number;
   enabled: boolean;
@@ -746,7 +745,8 @@ export const api = {
   testProvider: (id: number) => call<ProbeResult>("test_provider", { id }),
   listProviderModels: (providerId: number) =>
     call<ProviderModel[]>("list_provider_models", { providerId }),
-  setProviderModels: (providerId: number, models: ProviderModel[]) =>
+  /** 全量替换该渠道声明支持的模型名。上游重定向名走 `setModelCandidates`。 */
+  setProviderModels: (providerId: number, models: string[]) =>
     call<null>("set_provider_models", { providerId, models }),
   /** 拉取上游 `GET {base_url}/v1/models`，返回模型 id 列表。 */
   fetchProviderModels: (id: number) =>

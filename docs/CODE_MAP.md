@@ -263,12 +263,17 @@ quota           += tool_call_surcharge × 工具调用次数
 每条用 `IF NOT EXISTS` 保证幂等，版本号是下标。
 
 **模型声明的两张表分工**（容易踩坑）：
-- `provider_models` 是**真源**：声明「该渠道支持哪些入站模型」，驱动 `channels_for_model`
-  的候选筛选。没有行的渠道视为通吃。
+- `provider_models` 是**真源**：声明「该渠道支持哪些入站模型」以及「该模型在这个渠道上
+  真正叫什么」（`upstream_model`），驱动 `channels_for_model` 的候选筛选。
+  没有行的渠道视为通吃。
 - `providers.model_mapping` 是它的**派生读模型**：请求改写（`Provider::upstream_model`）
-  和网关 `GET /v1/models` 都读这里。`set_models` 在同一个事务里把前者同步过来。
-  手工 `upsert_provider` **不会**反向写 `provider_models` —— 否则在渠道对话框点一次保存
-  就会把用户在映射面板里逐条编好的声明冲掉。
+  与网关 `GET /v1/models` 都读这里。任何一处写完都在同一个事务里重算它，
+  `upsert_provider` 也是 —— 它**不收**调用方传来的映射，否则编辑渠道对话框会拿
+  打开时的旧快照把别处刚配好的重定向覆盖回去。
+- 两个写入口是同一张表的两个视角，各自全量替换自己那一维，所以谁都不能把对方那一列
+  冲成默认值：`set_models`（渠道页，「这个渠道有哪些模型」）保留已有的
+  `upstream_model` / `enabled`；`set_model_candidates`（路由页，「这个模型在哪些渠道上、
+  上游叫什么」）保留渠道维。
 
 ---
 
@@ -317,7 +322,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 |---|---|---|
 | `app.rs` | 5 | `app_info`、`get_settings`、`update_settings`、`set_model_policy`（只改模型策略，避免整份 `AppSettings` 回传冲掉别处刚改的设置）、`validate_model_script`（只编译不执行，给脚本文本框做行内报错） |
 | `gateway.rs` | 3 | `gateway_start` / `stop` / `status` |
-| `providers.rs` | 7 | 渠道 CRUD、`test_provider`、模型映射、`fetch_provider_models`（拉上游 `/v1/models`）；同文件的 **`probe()`** 是普通函数而非命令，被路由页复用 |
+| `providers.rs` | 7 | 渠道 CRUD、`test_provider`、模型声明（`set_provider_models` 只收模型名，上游名归 `models.rs`）、`fetch_provider_models`（拉上游 `/v1/models`）；同文件的 **`probe()`** 是普通函数而非命令，被路由页复用 |
 | `routing.rs` | 10 | 规则 CRUD + 排序、selector CRUD + **`switch_selector`**（热切换）、`run_urltest` |
 | `billing.rs` | 6 | 单价 CRUD、`billing_summary` / `totals` / `timeseries` |
 | `cache.rs` | 4 | `cache_stats`、`clear_cache`、策略读写 |
@@ -352,8 +357,8 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
 | `model_policies` | `model` | 每个模型的渠道选择策略（priority / latency / weight + 手动选中的渠道）。**没有行 = 交给 selector 与路由规则** |
-| `providers` | `tag` 唯一 | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、模型映射、权重、超时、**代理覆盖**（`proxy`，NULL = 跟随全局） |
-| `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃**。`set_models` 会把声明同步派生成 `providers.model_mapping`（见下） |
+| `providers` | `tag` 唯一 | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、派生的模型映射、权重、超时、**代理覆盖**（`proxy`，NULL = 跟随全局） |
+| `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃**。`upstream_model` 就是「客户端发这个名，上游该收哪个名」。写入都会重算 `providers.model_mapping`（见上） |
 | `route_rules` | `id` | 规则链，按 `sort_index` 求值；`items` / `action` 存 JSON |
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |
 | `route_config` | 单行 `id=1` | 兜底 selector |
@@ -378,11 +383,11 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
-| `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings。**两页分工**：Models 只管**模型名**（全局 + 客户端两级替换、模型并集列表只读）；Routing 管**渠道**（selector 热切换、规则链、每个模型走哪个渠道）。Providers 是渠道视角 —— 同一份 `provider_models` 的三个方向 |
+| `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings。**两页分工**：Models 只管**模型名**（全局 + 客户端两级替换、模型并集列表只读）；Routing 管**渠道**（selector 热切换、规则链、每个模型走哪个渠道、以及该渠道上的**上游模型名**）。Providers 是渠道视角 —— 同一份 `provider_models` 的三个方向 |
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
-| `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择，挂在路由页） |
+| `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择 + 每渠道的上游模型名，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
-| `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明）、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
+| `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选） |
 | `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，

@@ -301,18 +301,15 @@ pub async fn list_provider_models(
     crate::storage::providers::list_models(&shell.db, provider_id).await
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModelMappingInput {
-    pub model: String,
-    #[serde(default)]
-    pub upstream_model: Option<String>,
-}
-
+/// 全量替换某渠道**声明提供**的模型名。
+///
+/// 只收模型名：上游重定向名归模型页管（`set_model_candidates`），
+/// 从这个入口写不了，已有的那份会被原样保留。
 #[tauri::command]
 pub async fn set_provider_models(
     shell: State<'_, Arc<AppShell>>,
     provider_id: i64,
-    models: Vec<ModelMappingInput>,
+    models: Vec<String>,
 ) -> AppResult<()> {
     // 先确认渠道存在，否则外键会在写入时才报错，错误信息不够直白。
     if crate::storage::providers::get(&shell.db, provider_id)
@@ -322,12 +319,7 @@ pub async fn set_provider_models(
         return Err(AppError::ProviderNotFound(provider_id.to_string()));
     }
 
-    let pairs: Vec<(String, Option<String>)> = models
-        .into_iter()
-        .map(|m| (m.model, m.upstream_model.filter(|s| !s.is_empty())))
-        .collect();
-
-    crate::storage::providers::set_models(&shell.db, provider_id, &pairs).await?;
+    crate::storage::providers::set_models(&shell.db, provider_id, &models).await?;
 
     // 映射会同步进 providers.model_mapping，而请求改写读的是内存里 Channel 持有的
     // Provider 快照 —— 不重载的话新映射要等重启才生效。

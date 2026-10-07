@@ -14,8 +14,8 @@ import { toast } from "sonner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
 import { PageShell } from "@/components/layout/PageShell";
-import { ModelMappingPanel } from "@/components/providers/ModelMappingPanel";
 import { ProviderDialog } from "@/components/providers/ProviderDialog";
+import { ProviderModelsPanel } from "@/components/providers/ProviderModelsPanel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -108,7 +108,7 @@ export default function ProvidersPage() {
   return (
     <PageShell
       title="渠道管理"
-      description="配置上游 LLM 渠道、鉴权与模型映射"
+      description="配置上游 LLM 渠道、鉴权与可用模型"
       actions={
         <Button onClick={openCreate}>
           <Plus className="size-4" />
@@ -274,7 +274,7 @@ export default function ProvidersPage() {
                       {isOpen && (
                         <TableRow>
                           <TableCell colSpan={9} className="bg-muted/20 p-0">
-                            <ModelMappingPanel
+                            <ProviderModelsPanel
                               providerId={p.id}
                               providerName={p.name}
                             />

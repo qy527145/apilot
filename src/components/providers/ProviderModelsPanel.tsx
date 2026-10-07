@@ -12,14 +12,21 @@ import { api } from "@/lib/api";
 
 interface Row {
   model: string;
+  /** 上游名。这里只读展示 —— 改它去模型页。 */
   upstream_model: string;
 }
 
-/** 该行实际会发给上游的模型名：留空表示与入站名同名。 */
+/** 该行实际会发给上游的模型名：留空表示与声明名同名。 */
 const effectiveUpstream = (r: Row) => (r.upstream_model || r.model).trim();
 
-/** 渠道行展开后的模型映射编辑器：入站模型名 → 上游模型名 */
-export function ModelMappingPanel({
+/**
+ * 渠道行展开后的模型声明编辑器：**这个渠道支持哪些模型**。
+ *
+ * 只管"有哪些"，不管"叫什么"——上游名归模型页管（那边按「模型 × 渠道」列候选，
+ * 是同一张 provider_models 表的另一个视角）。两处都能全量替换自己那一维，
+ * 所以这里的保存必须按模型名保留已有的上游名，见 `providers::set_models`。
+ */
+export function ProviderModelsPanel({
   providerId,
   providerName,
 }: {
@@ -47,30 +54,25 @@ export function ModelMappingPanel({
   }, [data]);
 
   const save = useMutation({
-    mutationFn: () => {
-      const cleaned = rows
-        .filter((r) => r.model.trim())
-        .map((r) => ({
-          model: r.model.trim(),
-          upstream_model: r.upstream_model?.trim() ? r.upstream_model.trim() : null,
-        }));
-      return api.setProviderModels(providerId, cleaned);
-    },
+    mutationFn: () =>
+      api.setProviderModels(
+        providerId,
+        rows.map((r) => r.model.trim()).filter(Boolean),
+      ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.providerModels(providerId) });
-      // 保存会把映射同步进 providers.model_mapping，渠道对话框拿的是旧快照；
-      // 不刷新的话，之后在渠道对话框点保存会用旧映射把它覆盖回去。
-      qc.invalidateQueries({ queryKey: qk.providers });
       // 模型页的目录是从 provider_models 派生的，声明变了它也得变。
       qc.invalidateQueries({ queryKey: qk.modelCatalog });
       // 接管页的就绪判定取决于"有没有声明过模型"，改完得让它重新问一次后端。
       qc.invalidateQueries({ queryKey: qk.takeoverReadiness });
-      toast.success("模型映射已保存");
+      toast.success("已保存该渠道支持的模型");
     },
   });
 
-  const update = (idx: number, key: keyof Row, value: string) => {
-    setRows((rs) => rs.map((r, i) => (i === idx ? { ...r, [key]: value } : r)));
+  const update = (idx: number, value: string) => {
+    setRows((rs) =>
+      rs.map((r, i) => (i === idx ? { ...r, model: value } : r)),
+    );
   };
 
   const selectedUpstreams = useMemo(
@@ -122,7 +124,7 @@ export function ModelMappingPanel({
   if (isError) {
     return (
       <div className="p-4 text-xs">
-        <span className="text-destructive">加载模型映射失败。 </span>
+        <span className="text-destructive">加载模型声明失败。 </span>
         <button className="underline" onClick={() => refetch()}>
           重试
         </button>
@@ -133,7 +135,7 @@ export function ModelMappingPanel({
   return (
     <div className="bg-muted/30 space-y-3 rounded-md p-4">
       <div className="flex items-center justify-between">
-        <p className="text-xs font-medium">模型映射（入站 → 上游）</p>
+        <p className="text-xs font-medium">该渠道支持的模型</p>
         <div className="flex items-center gap-2">
           <Button
             variant="outline"
@@ -148,48 +150,55 @@ export function ModelMappingPanel({
             onClick={() => save.mutate()}
             disabled={save.isPending}
           >
-            {save.isPending ? "保存中…" : "保存映射"}
+            {save.isPending ? "保存中…" : "保存"}
           </Button>
         </div>
       </div>
 
       <p className="text-muted-foreground text-xs">
-        左列是客户端发来的模型名，右列是该渠道真正接受的模型名。
-        右列留空表示同名。没声明任何模型的渠道会被视为「通吃」，任何模型名都会转发过去。
+        填客户端会发来的模型名，它决定模型页的目录和路由的候选渠道。
+        想让某个名字在上游换成另一个模型（例如把{" "}
+        <code>claude-sonnet-4-5</code> 打到 DeepSeek 的{" "}
+        <code>deepseek-chat</code>），去<b>路由页</b>的「模型的渠道选择」里改。
+        没声明任何模型的渠道会被视为「通吃」，任何模型名都会转发过去。
       </p>
 
       <div className="space-y-2">
-        {rows.map((r, idx) => (
-          <div key={idx} className="flex items-center gap-2">
-            <Input
-              value={r.model}
-              placeholder="入站模型名，例如 claude-sonnet-4-5"
-              onChange={(e) => update(idx, "model", e.target.value)}
-              className="flex-1"
-            />
-            <span className="text-muted-foreground text-xs">→</span>
-            <Input
-              value={r.upstream_model}
-              placeholder="上游模型名（留空表示同名）"
-              onChange={(e) => update(idx, "upstream_model", e.target.value)}
-              className="flex-1"
-            />
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() =>
-                setRows((rs) => {
-                  const next = rs.filter((_, i) => i !== idx);
-                  return next.length > 0
-                    ? next
-                    : [{ model: "", upstream_model: "" }];
-                })
-              }
-            >
-              <Trash2 className="size-4 text-destructive" />
-            </Button>
-          </div>
-        ))}
+        {rows.map((r, idx) => {
+          const upstream = r.upstream_model.trim();
+          return (
+            <div key={idx} className="flex items-center gap-2">
+              <Input
+                value={r.model}
+                placeholder="客户端发来的模型名，例如 claude-sonnet-4-5"
+                onChange={(e) => update(idx, e.target.value)}
+                className="flex-1"
+              />
+              {upstream && upstream !== r.model.trim() && (
+                <span
+                  className="text-muted-foreground shrink-0 truncate font-mono text-[11px]"
+                  title={`实际发给上游：${upstream}`}
+                >
+                  → {upstream}
+                </span>
+              )}
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() =>
+                  setRows((rs) => {
+                    const next = rs.filter((_, i) => i !== idx);
+                    return next.length > 0
+                      ? next
+                      : [{ model: "", upstream_model: "" }];
+                  })
+                }
+              >
+                <Trash2 className="size-4 text-destructive" />
+              </Button>
+            </div>
+          );
+        })}
       </div>
 
       <Button
@@ -198,7 +207,7 @@ export function ModelMappingPanel({
         onClick={() => setRows((rs) => [...rs, { model: "", upstream_model: "" }])}
       >
         <Plus className="size-4" />
-        添加映射
+        添加模型
       </Button>
 
       <ModelPickerDialog

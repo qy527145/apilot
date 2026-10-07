@@ -68,6 +68,9 @@ export default function RoutingPage() {
             qc.invalidateQueries({ queryKey: qk.modelCatalog });
             // 换了渠道策略会直接影响选择器的热切换结果，一并刷新。
             qc.invalidateQueries({ queryKey: qk.selectors });
+            // 上游模型名和渠道页展开的那份列表同源（都是 provider_models），
+            // 改完不刷新的话切回渠道页看到的还是旧名字。
+            qc.invalidateQueries({ queryKey: qk.providerModelsAll });
           }}
         />
 

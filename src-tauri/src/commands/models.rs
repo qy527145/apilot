@@ -156,7 +156,12 @@ pub async fn set_model_candidates(
     if model.trim().is_empty() {
         return Err(AppError::msg("模型名不能为空"));
     }
-    crate::storage::providers::set_model_candidates(&shell.db, &model, &candidates).await
+    crate::storage::providers::set_model_candidates(&shell.db, &model, &candidates).await?;
+
+    // 上游模型名改了要重载渠道快照：请求改写读的是内存里那份 Provider，
+    // 不重载的话新名要等重启才生效。
+    shell.reload_providers().await?;
+    Ok(())
 }
 
 /// 对某模型的候选渠道跑一次测速，结果按延迟升序返回并写进缓存。

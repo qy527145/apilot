@@ -179,6 +179,47 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
     }
   }, [open, provider]);
 
+  /**
+   * 新建渠道后顺手把上游的模型列表拉回来声明上。
+   *
+   * 没这份声明，这个渠道就是「通吃」：模型页里看不到它的模型，
+   * 路由也没法按模型把它选出来。拉不到（服务商没有 /v1/models）不阻断创建 ——
+   * 退回到原来的通吃语义，用户仍可在渠道行展开后手填。
+   */
+  const autoDeclareModels = async (id: number) => {
+    let models: string[] = [];
+    try {
+      models = await api.fetchProviderModels(id);
+    } catch {
+      toast.success("渠道已创建", {
+        description: "没拉到模型列表，可在渠道行展开后手动添加。",
+      });
+      return;
+    }
+
+    if (models.length === 0) {
+      toast.success("渠道已创建", {
+        description: "上游没返回模型，可在渠道行展开后手动添加。",
+      });
+      return;
+    }
+
+    try {
+      await api.setProviderModels(id, models);
+      qc.invalidateQueries({ queryKey: qk.providerModels(id) });
+      qc.invalidateQueries({ queryKey: qk.modelCatalog });
+      toast.success(`渠道已创建，已声明 ${models.length} 个模型`, {
+        // 声明之后这个渠道就不再"通吃"了：客户端发来的名字必须在列表里才会路由过来。
+        // 不说清楚的话，用户会觉得"刚加的渠道怎么不接我的请求"。
+        description: "客户端要用的模型名得在列表里才会走这个渠道；需要改名去路由页配。",
+      });
+    } catch {
+      toast.success("渠道已创建", {
+        description: "自动写入模型列表失败，可在渠道行展开后手动添加。",
+      });
+    }
+  };
+
   const mutation = useMutation({
     mutationFn: (input: ProviderInput) => api.upsertProvider(input),
     onSuccess: (saved) => {
@@ -186,8 +227,13 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
       // 改渠道的启用状态 / 删渠道都会影响模型页的候选列表。
       qc.invalidateQueries({ queryKey: qk.modelCatalog });
       qc.invalidateQueries({ queryKey: qk.providerModels(saved.id) });
-      toast.success(provider ? "渠道已更新" : "渠道已创建");
       onOpenChange(false);
+
+      if (provider) {
+        toast.success("渠道已更新");
+        return;
+      }
+      void autoDeclareModels(saved.id);
     },
   });
 
@@ -256,7 +302,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
       }),
       extra_headers: form.extra_headers,
       param_override: paramOverride,
-      model_mapping: provider?.model_mapping ?? {},
       weight: Number(form.weight) || 0,
       priority: Number(form.priority) || 0,
       enabled: form.enabled,
@@ -276,7 +321,7 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
         <DialogHeader>
           <DialogTitle>{provider ? "编辑渠道" : "新建渠道"}</DialogTitle>
           <DialogDescription>
-            上游 LLM 服务地址与鉴权方式。模型映射可在渠道列表中展开编辑。
+            上游 LLM 服务地址与鉴权方式。新建时会自动获取该渠道支持的模型。
           </DialogDescription>
         </DialogHeader>
 
