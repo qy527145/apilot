@@ -151,6 +151,28 @@ Anthropic 本来就是这口径；OpenAI / Responses 的 `prompt_tokens` **含**
 增量里的 stop_reason 暴露出来，所以这种情况下 `finish_reason` 固定是 `Stop`。
 正文是完整的，只有终止原因是近似值。
 
+### 8. 自由格式（`custom`）工具转到 Chat 会退化成「空 schema 的 function」
+
+Responses 里 `{"type":"custom"}` 的工具（Codex 的 `apply_patch`、code mode 的 `exec`）
+是**自由格式**的：模型回的不是 JSON，而是一段原文（patch 文本 / JS 源码），
+客户端按原文处理。
+
+**Chat Completions 没有这个概念**，它只有 JSON schema 的 function。所以跨到 Chat 时：
+
+- 工具定义退化成 `parameters: {"type":"object"}` 的 function —— `custom` 这个属性没地方放，
+  模型拿不到「这里是原文」的提示，也给不出原文；
+- 回程更硬：上游的 `tool_calls` 会被编成 Responses 的 `function_call`，而 Codex 的
+  `apply_patch` / `exec` **只接受 `custom_tool_call`**（`ToolPayload::Function` 会被
+  handler 明确拒掉，报 "expects raw ... source text"）。
+
+**结论：给会用到自由格式工具的上游保留 Responses 直通，别为了"简单"降到 Chat。**
+实测 DeepSeek 的 `/responses` 原生支持它 —— 顶层 `custom` 工具被接受，回的是标准
+`custom_tool_call`（`input` 就是原始 patch 文本），function 工具同时也正常。
+
+要真正做到 Chat 侧无损，需要 IR 层认识「自由格式工具」，出去时降成
+「单个字符串参数的 function」、回来时再还原成 `custom_tool_call` + 对应历史条目。
+**目前没做**，所以这条损耗是实打实的。
+
 ---
 
 ## 用路径覆盖修 404
