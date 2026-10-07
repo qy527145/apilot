@@ -147,7 +147,16 @@ impl GatewayServer {
         if let Some(base_url) = self.base_url() {
             match crate::takeover::clients::repoint_taken_over(&base_url, &shell.settings()) {
                 Ok(changed) if !changed.is_empty() => {
-                    tracing::info!(%base_url, clients = ?changed, "已把接管的客户端指向新地址");
+                    let names: Vec<&str> = changed.iter().map(|c| c.display_name()).collect();
+                    tracing::info!(%base_url, clients = ?names, "已把接管的客户端指向新地址");
+
+                    // 地址变了，Codex 的常驻 app-server 也还指着老地址（它只在启动时读
+                    // 配置）。不重启的话，TUI / 桌面版会一直连不上，而用户看到的是
+                    // "网关明明在跑"。见 `takeover::codex_daemon`。
+                    if changed.contains(&crate::takeover::clients::ClientId::Codex) {
+                        let outcome = crate::takeover::codex_daemon::restart_if_running();
+                        tracing::info!(?outcome, "Codex 地址已变，同步重启其后台进程");
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("同步客户端 base_url 失败（客户端可能仍指向旧地址）: {e}"),

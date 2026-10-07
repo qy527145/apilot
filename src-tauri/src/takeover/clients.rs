@@ -156,7 +156,11 @@ pub fn describe_all(engine: &TakeoverEngine) -> Vec<ClientInfo> {
 /// 只碰已被我们改过的客户端：没接管的那些，base_url 是用户自己写的，网关监听在
 /// 哪儿跟它没关系 —— 顺手改掉就是越界，而且会毁掉用户手写的配置。
 ///
-/// 返回**真正被改动**的客户端名；没有变化时是空数组（绝大多数调用都是这种）。
+/// 返回**真正被改动**的客户端；没有变化时是空数组（绝大多数调用都是这种）。
+///
+/// 给的是 [`ClientId`] 而不是展示名：调用方要据此判断「Codex 被改了吗 —— 那它的
+/// 常驻 app-server 也得重启」（见 `takeover::codex_daemon`），拿名字做字符串比对
+/// 太脆。
 ///
 /// `settings` 用来取每个客户端各自要写的模型名（`AppSettings::client_model` 是按客户端
 /// 算的 —— 模型策略允许给单个客户端单独指定）。判据只看地址，所以改开关本身不会触发
@@ -164,7 +168,7 @@ pub fn describe_all(engine: &TakeoverEngine) -> Vec<ClientInfo> {
 pub fn repoint_taken_over(
     base_url: &str,
     settings: &crate::config::AppSettings,
-) -> AppResult<Vec<String>> {
+) -> AppResult<Vec<ClientId>> {
     let engine = TakeoverEngine::new();
     let mut changed = Vec::new();
 
@@ -191,7 +195,7 @@ pub fn repoint_taken_over(
         // 走 commit 而不是直接写：备份是「还原」的唯一依据，这里必须和接管同一条路径，
         // 否则重新指向之后再点还原就找不到原始文件了。已备份过时 commit 不会覆盖备份。
         engine.commit(&plan, &patches)?;
-        changed.push(id.display_name().to_string());
+        changed.push(id);
     }
 
     Ok(changed)

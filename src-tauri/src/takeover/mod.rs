@@ -11,6 +11,7 @@
 //! 中途手动改过配置时必然出错。
 
 pub mod clients;
+pub mod codex_daemon;
 pub mod diff;
 pub mod engine;
 pub mod floor;

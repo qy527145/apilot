@@ -7,9 +7,33 @@ use tauri::State;
 use crate::error::{AppError, AppResult};
 use crate::shell::AppShell;
 use crate::takeover::clients::{self, ClientId, ClientInfo};
+use crate::takeover::codex_daemon;
 use crate::takeover::diff;
 use crate::takeover::engine::{TakeoverEngine, TakeoverPlan, TakeoverResult};
 use crate::takeover::patch;
+
+/// 改完 Codex 的配置后，顺手重启它的常驻 app-server。
+///
+/// **为什么必须做**：Codex 的 TUI / 桌面版连的是一个常驻 app-server 进程，provider、
+/// `base_url`、模型元数据都是**那个进程启动时**读的 —— 光重启客户端没用，用户看到的是
+/// 「明明接管了却不生效」。详见 `takeover::codex_daemon`。
+///
+/// 只有 Codex 需要：Claude Code / Gemini CLI 都是自己读配置发请求的。
+///
+/// 放 `spawn_blocking`：这是个真起进程的同步调用，不该占着异步运行时。返回的是给用户
+/// 看的那句话（没什么可说时是 `None`）。
+async fn restart_codex_daemon(id: ClientId) -> Option<String> {
+    if id != ClientId::Codex {
+        return None;
+    }
+    match tokio::task::spawn_blocking(codex_daemon::restart_if_running).await {
+        Ok(outcome) => {
+            tracing::info!(?outcome, "已尝试重启 Codex 后台进程");
+            outcome.note()
+        }
+        Err(e) => Some(format!("重启 Codex 后台进程的任务失败（{e}），请手动重启 Codex。")),
+    }
+}
 
 #[tauri::command]
 pub fn detect_clients() -> Vec<ClientInfo> {
@@ -81,11 +105,16 @@ pub async fn apply_takeover(
 
     let mut result = engine.commit(&plan, &patches)?;
     result.client = id.as_str().to_string();
-    result.message = format!(
+    let mut message = format!(
         "已接管 {}，base_url 指向 {}。重启该客户端后生效。",
         id.display_name(),
         base_url
     );
+    if let Some(note) = restart_codex_daemon(id).await {
+        message.push(' ');
+        message.push_str(&note);
+    }
+    result.message = message;
 
     tracing::info!(client = id.as_str(), %base_url, "已接管客户端");
     Ok(result)
@@ -126,7 +155,14 @@ pub async fn restore_client(
 
     let mut result = engine.restore(id.as_str(), &id.config_paths())?;
     if result.applied {
-        result.message = format!("已还原 {}", id.display_name());
+        let mut message = format!("已还原 {}", id.display_name());
+        // 还原同样要重启：不重启的话，Codex 的常驻进程还攥着指向网关的那份配置，
+        // 用户会以为"还原没生效"。
+        if let Some(note) = restart_codex_daemon(id).await {
+            message.push(' ');
+            message.push_str(&note);
+        }
+        result.message = message;
     }
 
     tracing::info!(client = id.as_str(), "已还原客户端");
