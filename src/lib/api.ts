@@ -330,15 +330,26 @@ export interface TimeRange {
 
 export type GroupBy = "client" | "model" | "provider";
 
+/** 被折叠进某个生效模型的「客户端请求的模型」（模型策略改写 / 兜底替换）。 */
+export interface RequestModelAlias {
+  model: string;
+  requests: number;
+}
+
 export interface BillingBucket {
   key: string;
   requests: number;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  /** 上游提示缓存命中率：缓存读 /（新鲜输入 + 缓存读）。 */
+  prompt_cache_hit_rate: number;
   quota: number;
+  /** 命中**本地响应缓存**的请求条数，与上一行不是一回事。 */
   cache_hits: number;
   saved_quota: number;
+  /** 只有「按模型」维度非空，其余维度恒为空数组。 */
+  request_models: RequestModelAlias[];
 }
 
 export interface HourlyPoint {
@@ -355,8 +366,12 @@ export interface BillingSummary {
   cost_usd: number;
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens: number;
   cache_saved_quota: number;
-  cache_hit_rate: number;
+  /** 命中本地响应缓存的请求占比 —— 不是上游提示缓存的命中率。 */
+  local_cache_hit_rate: number;
+  /** 上游提示缓存命中率：缓存读 /（新鲜输入 + 缓存读）。 */
+  prompt_cache_hit_rate: number;
   p50_ttfb_ms?: number | null;
 }
 

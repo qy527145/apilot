@@ -355,6 +355,7 @@ pub async fn handle(
             ts: recorder.record.ts,
             client: recorder.record.client.clone(),
             model: recorder.record.model.clone(),
+            request_model: recorder.record.request_model.clone(),
             path: recorder.record.path.clone(),
             protocol_in: protocol.as_str().to_string(),
             provider_tag: primary.tag().to_string(),
@@ -928,6 +929,10 @@ async fn try_outbound(
             client: recorder.record.client.clone(),
             path: recorder.record.path.clone(),
             model: req.model.clone(),
+            // `Recorder` 在流式这条路上会被丢掉（收尾全在 `finalize_stream` 里），
+            // 所以它记着的那个「客户端请求的名字」必须在这里带过去 —— 到了
+            // `finalize_stream` 再想拿，原始值已经不存在了。
+            request_model: recorder.record.request_model.clone(),
             provider_tag: outbound.tag().to_string(),
             protocol_in,
             protocol_out: wire,
@@ -1163,7 +1168,11 @@ struct StreamContext {
     request_id: String,
     client: String,
     path: String,
+    /// 生效模型（计费、缓存键按它算）。
     model: String,
+    /// 客户端请求的原始名字。只作展示，但**必须活着送到收尾** ——
+    /// 少了它，监控页就只剩生效模型一个名字，"我发的 A 怎么按 B 计费"查不出来。
+    request_model: String,
     provider_tag: String,
     protocol_in: Protocol,
     protocol_out: Protocol,
@@ -1190,6 +1199,7 @@ fn finalize_stream(
         client,
         path,
         model,
+        request_model,
         provider_tag,
         protocol_in,
         protocol_out,
@@ -1256,7 +1266,7 @@ fn finalize_stream(
             provider_tag: Some(provider_tag),
             channel_kind,
             model: model.clone(),
-            request_model: model.clone(),
+            request_model,
             path,
             upstream_url,
             upstream_model,

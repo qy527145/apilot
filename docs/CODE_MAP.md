@@ -147,7 +147,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 | 字段 | 含义 | 用在哪 |
 |---|---|---|
-| `request_model` | 客户端请求的名字 | 只作展示 |
+| `request_model` | 客户端请求的名字 | 展示；也进 `usage_hourly` 供统计页标出改写 |
 | `model` | 生效模型（全局策略 + 规则改写之后） | 计费、聚合、**缓存键**、模型列表筛选 |
 | `upstream_model` | 渠道 `model_mapping` 之后真正发出去的名字 | 只在出站报文里 |
 
@@ -288,7 +288,7 @@ quota           += tool_call_surcharge × 工具调用次数
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
 | `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站 / **发给客户端的响应头**）；`query`（动态过滤：时间、客户端、模型、协议、状态、是否流式）、`get_detail`、`facets`（筛选下拉的候选值）、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧 |
 | `model_policies.rs` | 每模型的渠道选择策略读写。**没有行 = 交给 selector 与路由规则** |
-| `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` |
+| `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb`。按模型汇总时额外返回 `request_models`（被折叠进该生效模型的客户端模型名），供统计页标出改写 |
 
 **迁移规则**：`MIGRATIONS` 数组**只追加，不修改已发布的条目**。
 每条用 `IF NOT EXISTS` 保证幂等，版本号是下标。
@@ -394,7 +394,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |
 | `route_config` | 单行 `id=1` | 兜底 selector |
 | `request_logs` | `request_id` 唯一 | 请求明细：token、quota、耗时、**TTFB**、缓存命中、估算偏差；以及**方向信息**：入站 `path`、出站 `upstream_url` / `upstream_model` / `upstream_status` |
-| `usage_hourly` | `(bucket_ts, client, provider_tag, model)` | 小时聚合，SUM 后 upsert。**`clear_logs` 不动它** —— 它是计费口径的历史账目 |
+| `usage_hourly` | `(bucket_ts, client, provider_tag, model, request_model)` | 小时聚合，SUM 后 upsert。`model` 是**生效模型**（计费口径），`request_model` 是客户端原名 —— 两者一起进主键，统计页才答得出"我发的 gpt-6-sol 怎么算在 deepseek-flash 这行"。**`clear_logs` 不动它** —— 它是计费口径的历史账目 |
 | `model_pricing` | `model` | 单价系数。`source` 为 NULL = **用户手填**（批量导入一律不动），有值 = 由某份目录导入、可被同来源的下次导入覆盖 |
 | `model_capabilities` | `(provider_id, model, capability)` | 这个**渠道上这个模型**支不支持思考/工具/多模态。`verdict` 是三态（supported / unsupported / inconclusive）—— 探测「支不支持工具」时模型可能只是那一次没调工具，记成布尔就是撒谎。`source` 分 probe（实测，花 token）与 catalog（目录断言，零成本）；**覆盖优先级写在 `storage::capabilities` 的 upsert SQL 里**：实测且明确 > 目录 > 实测但不确定 |
 | `response_cache` | `key`（sha256） | 缓存条目：响应体、usage、原额度、命中数 |

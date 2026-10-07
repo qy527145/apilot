@@ -148,9 +148,10 @@ export default function OverviewPage({ onNavigate }: Props) {
           />
           <StatCard
             label="缓存命中率"
-            value={formatPercent(totals.data?.cache_hit_rate)}
+            value={formatPercent(totals.data?.prompt_cache_hit_rate)}
             icon={<Gauge className="size-4" />}
             loading={totals.isLoading}
+            hint="上游提示缓存（缓存读 / 全部输入）"
           />
           <StatCard
             label="P50 TTFB"
@@ -259,7 +260,33 @@ export default function OverviewPage({ onNavigate }: Props) {
                       <TableRow key={r.request_id}>
                         <TableCell className="text-muted-foreground">{formatTime(r.ts)}</TableCell>
                         <TableCell>{truncate(r.client, 16)}</TableCell>
-                        <TableCell className="max-w-[180px] truncate">{r.model}</TableCell>
+                        <TableCell className="max-w-[180px]">
+                          <div className="truncate" title={r.model}>
+                            {r.model}
+                          </div>
+                          {/*
+                            三个模型名是一条链，缺一个就断在中间。这里沿用监控页的
+                            写法：生效模型当主行，"客户端原本要的"和"真发出去的"
+                            各挂一行小字。少了它们，"我明明发的 A，怎么按 B 计费"
+                            在概览这一眼扫过去的地方照样看不出来。
+                          */}
+                          {r.request_model && r.request_model !== r.model && (
+                            <div
+                              className="text-muted-foreground truncate text-[11px]"
+                              title={`客户端请求的模型：${r.request_model}`}
+                            >
+                              ← {r.request_model}
+                            </div>
+                          )}
+                          {r.upstream_model && r.upstream_model !== r.model && (
+                            <div
+                              className="text-muted-foreground truncate text-[11px]"
+                              title={`实际发给上游：${r.upstream_model}`}
+                            >
+                              ↑ {r.upstream_model}
+                            </div>
+                          )}
+                        </TableCell>
                         <TableCell>{truncate(r.provider_tag, 18)}</TableCell>
                         <TableCell>
                           <Badge variant={r.status_code < 400 ? "success" : "destructive"}>

@@ -5,7 +5,7 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{ConnectOptions, SqlitePool};
 
-use super::migrations::{MIGRATIONS, SCHEMA_VERSION};
+use super::migrations::{MIGRATIONS, SCHEMA_VERSION, USAGE_HOURLY_V8_DDL};
 use crate::error::AppResult;
 
 /// 打开（必要时创建）数据库并跑完所有迁移。
@@ -55,7 +55,11 @@ async fn migrate(pool: &SqlitePool) -> AppResult<()> {
         .await?;
 
     if current >= SCHEMA_VERSION {
+        // 版本号比我们新，不等于结构比我们新：v7/v8 那次拆分把某些库的版本戳
+        // 顶到了 8，此后**每一条**新迁移都会被这里跳掉。两道修复各自先看表的
+        // 真实形状，健康就立刻返回，所以对正常的库是纯读。
         repair_legacy_model_capabilities(pool).await?;
+        ensure_usage_hourly_v8(pool).await?;
         return Ok(());
     }
 
@@ -80,6 +84,53 @@ async fn migrate(pool: &SqlitePool) -> AppResult<()> {
     }
 
     repair_legacy_model_capabilities(pool).await?;
+    ensure_usage_hourly_v8(pool).await?;
+    Ok(())
+}
+
+/// 补跑 v8（`usage_hourly.request_model`）。
+///
+/// 判据与 `repair_legacy_model_capabilities` 同源：**看表的实际形状，不看版本号**。
+/// 版本戳停在 8 而 `SCHEMA_VERSION` 也是 8 的库会走进上面的早返回，v8 那条迁移
+/// 永远轮不上 —— 症状很隐：`AggregateBuffer::flush` 每 10 秒报一次 `no such column`
+/// 然后被吞掉，统计页从此不再增长，没有任何一处会报错给用户看。
+async fn ensure_usage_hourly_v8(pool: &SqlitePool) -> AppResult<()> {
+    let has_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('usage_hourly') WHERE name = 'request_model'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_column > 0 {
+        return Ok(());
+    }
+    // 表都不在（理论上到不了这里：早返回意味着迁移全跑过）—— 留给下一轮启动，
+    // 别在一个结构未知的库上做重建。
+    let table_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'usage_hourly'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if table_exists == 0 {
+        return Ok(());
+    }
+
+    tracing::warn!("usage_hourly 缺少 request_model 列，补跑 v8 迁移");
+
+    let mut tx = pool.begin().await?;
+    for stmt in split_statements(USAGE_HOURLY_V8_DDL) {
+        sqlx::query(&stmt).execute(&mut *tx).await?;
+    }
+    let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *tx)
+        .await?;
+    if current != SCHEMA_VERSION {
+        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .execute(&mut *tx)
+            .await?;
+        tracing::warn!(from = current, to = SCHEMA_VERSION, "版本戳已拉回当前 schema 版本");
+    }
+    tx.commit().await?;
+
     Ok(())
 }
 
@@ -366,6 +417,66 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+    }
+
+    /// 版本戳比 `SCHEMA_VERSION` 还大的库，新迁移会被整体跳过 —— 只能靠表的形状补跑。
+    ///
+    /// 复现的是 v7/v8 那次拆分留下的状态：出事的库 `user_version` 停在 8，而当时
+    /// `SCHEMA_VERSION` 是 7，后来涨到 8 之后，`current >= SCHEMA_VERSION` 正好成立，
+    /// v8 这条新迁移永远轮不上。少了兜底，`usage_hourly` 会一直缺 `request_model`，
+    /// 而症状只是聚合**静默**停止增长 —— 每 10 秒一条 warn，用户那边什么都看不到。
+    #[tokio::test]
+    async fn a_database_stuck_at_a_newer_version_still_gets_v8() {
+        use std::str::FromStr;
+
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true)
+            .disable_statement_logging();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+
+        // 跑到 v7 为止（v8 是本次新加的），然后**把版本戳顶到 8**。
+        for ddl in &MIGRATIONS[..SCHEMA_VERSION as usize - 1] {
+            for stmt in split_statements(ddl) {
+                sqlx::query(&stmt).execute(&pool).await.unwrap();
+            }
+        }
+        sqlx::query("PRAGMA user_version = 8")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 老账目，重建表不能把它弄丢（这正是修复与"从头再来"的区别）。
+        sqlx::query(
+            "INSERT INTO usage_hourly (bucket_ts, client, provider_tag, model, requests, quota)
+             VALUES (0, 'codex', 'deepseek', 'deepseek-flash', 3, 900)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(usage_hourly)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| sqlx::Row::get::<String, _>(r, "name"))
+            .collect();
+        assert!(cols.iter().any(|c| c == "request_model"), "实际列：{cols:?}");
+
+        let (requests, request_model): (i64, String) = sqlx::query_as(
+            "SELECT requests, request_model FROM usage_hourly WHERE client = 'codex'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(requests, 3, "老账目必须还在");
+        assert_eq!(request_model, "deepseek-flash", "老行回填成生效模型名");
     }
 
     #[tokio::test]

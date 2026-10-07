@@ -181,6 +181,7 @@ export default function TrafficPage() {
         ts: p.ts,
         client: p.client,
         model: p.model,
+        request_model: p.request_model,
         path: p.path,
         protocol_in: p.protocol_in,
         provider_tag: p.provider_tag,
@@ -410,6 +411,14 @@ export default function TrafficPage() {
                     </span>
                     <span>{truncate(r.client, 14)}</span>
                     <span className="font-mono">{r.model}</span>
+                    {r.request_model && r.request_model !== r.model && (
+                      <span
+                        className="text-muted-foreground text-[11px]"
+                        title={`客户端请求的模型：${r.request_model}`}
+                      >
+                        ← {r.request_model}
+                      </span>
+                    )}
                     <span className="text-muted-foreground">{r.provider_tag}</span>
                     <span className="text-muted-foreground tabular-nums">
                       {r.frames.length} 帧

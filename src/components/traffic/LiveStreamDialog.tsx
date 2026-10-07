@@ -22,7 +22,10 @@ export interface LiveRequest {
   request_id: string;
   ts: number;
   client: string;
+  /** 生效模型（计费口径）。 */
   model: string;
+  /** 客户端请求的原始名字；与 `model` 不同时说明被模型策略改写过了。 */
+  request_model: string;
   path: string;
   protocol_in: string;
   provider_tag: string;

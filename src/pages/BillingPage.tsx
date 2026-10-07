@@ -115,10 +115,11 @@ export default function BillingPage() {
           />
           <StatCard
             label="缓存命中率 / P50 TTFB"
-            value={`${formatPercent(totals.data?.cache_hit_rate)} · ${formatMs(
+            value={`${formatPercent(totals.data?.prompt_cache_hit_rate)} · ${formatMs(
               totals.data?.p50_ttfb_ms,
             )}`}
             loading={totals.isLoading}
+            hint="上游提示缓存（缓存读 / 全部输入）"
           />
         </div>
 
@@ -140,7 +141,7 @@ export default function BillingPage() {
           </CardHeader>
           <CardContent className="space-y-6">
             {buckets.isLoading ? (
-              <TableSkeleton rows={5} cols={6} />
+              <TableSkeleton rows={5} cols={8} />
             ) : buckets.isError ? (
               <ErrorState onRetry={() => buckets.refetch()} />
             ) : bucketData.length === 0 ? (
@@ -248,7 +249,8 @@ export default function BillingPage() {
                         <TableHead className="text-right">输入 Token</TableHead>
                         <TableHead className="text-right">输出 Token</TableHead>
                         <TableHead className="text-right">缓存读</TableHead>
-                        <TableHead className="text-right">缓存命中</TableHead>
+                        <TableHead className="text-right">缓存命中率</TableHead>
+                        <TableHead className="text-right">本地缓存命中</TableHead>
                         <TableHead className="text-right">费用</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -256,7 +258,22 @@ export default function BillingPage() {
                       {bucketData.map((b) => (
                         <TableRow key={b.key}>
                           <TableCell className="font-medium">
-                            {b.key || "(未知)"}
+                            <div className="truncate">{b.key || "(未知)"}</div>
+                            {/*
+                              把被折叠进来的客户端模型名露出来。聚合按**生效模型**记
+                              （计费口径不能动），所以只看这一列永远答不出"我发的
+                              gpt-6-sol 怎么跑到 deepseek-flash 这行来了"。
+                              与监控页的模型列用同一套写法（← / 小字 / 静音色）。
+                            */}
+                            {b.request_models.map((a) => (
+                              <div
+                                key={a.model}
+                                className="text-muted-foreground truncate text-[11px] font-normal"
+                                title={`客户端请求的模型：${a.model}`}
+                              >
+                                ← {a.model}（{formatNumber(a.requests)}）
+                              </div>
+                            ))}
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {formatNumber(b.requests)}
@@ -269,6 +286,9 @@ export default function BillingPage() {
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {formatNumber(b.cache_read_tokens)}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {formatPercent(b.prompt_cache_hit_rate)}
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {formatNumber(b.cache_hits)}

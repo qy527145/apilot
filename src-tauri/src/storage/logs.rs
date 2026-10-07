@@ -1241,8 +1241,9 @@ mod tests {
         let p = pool().await;
         insert(&p, &rec("r1", "a", "m")).await.unwrap();
         sqlx::query(
-            "INSERT INTO usage_hourly (bucket_ts, client, provider_tag, model, requests, quota)
-             VALUES (0, 'a', 'p1', 'm', 1, 300)",
+            "INSERT INTO usage_hourly
+                 (bucket_ts, client, provider_tag, model, request_model, requests, quota)
+             VALUES (0, 'a', 'p1', 'm', 'm', 1, 300)",
         )
         .execute(&p)
         .await

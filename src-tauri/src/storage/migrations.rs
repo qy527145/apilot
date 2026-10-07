@@ -3,6 +3,42 @@
 //! 手写 DDL 顺序数组，**不用 sqlx 的编译期宏** —— 那样需要 `.sqlx` 离线元数据目录，
 //! 每次改 schema 都要额外生成一次。运行时 `sqlx::query` 只需字符串，改完直接生效。
 
+/// v8 的 DDL，单独拎出来是为了让 `db.rs` 能对「版本戳比 schema 还新」的库补跑它
+/// （见 `db::ensure_usage_hourly_v8`）。写成常量而不是抄一份，漂移就不会发生。
+pub const USAGE_HOURLY_V8_DDL: &str = r#"
+CREATE TABLE usage_hourly_v8 (
+  bucket_ts             INTEGER NOT NULL,
+  client                TEXT NOT NULL,
+  provider_tag          TEXT NOT NULL,
+  model                 TEXT NOT NULL,
+  request_model         TEXT NOT NULL,
+  requests              INTEGER NOT NULL DEFAULT 0,
+  failed_requests       INTEGER NOT NULL DEFAULT 0,
+  input_tokens          INTEGER NOT NULL DEFAULT 0,
+  output_tokens         INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  quota                 INTEGER NOT NULL DEFAULT 0,
+  cache_hits            INTEGER NOT NULL DEFAULT 0,
+  saved_quota           INTEGER NOT NULL DEFAULT 0,
+  latency_sum_ms        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket_ts, client, provider_tag, model, request_model)
+);
+INSERT INTO usage_hourly_v8
+    (bucket_ts, client, provider_tag, model, request_model, requests, failed_requests,
+     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, quota,
+     cache_hits, saved_quota, latency_sum_ms)
+SELECT bucket_ts, client, provider_tag, model, model, requests, failed_requests,
+     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, quota,
+     cache_hits, saved_quota, latency_sum_ms
+FROM usage_hourly;
+DROP TABLE usage_hourly;
+ALTER TABLE usage_hourly_v8 RENAME TO usage_hourly;
+CREATE INDEX IF NOT EXISTS idx_hourly_model    ON usage_hourly(model, bucket_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_hourly_provider ON usage_hourly(provider_tag, bucket_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_hourly_client   ON usage_hourly(client, bucket_ts DESC);
+"#;
+
 /// 按顺序执行的迁移。**只追加，不修改已发布的条目**。
 ///
 /// 每条迁移用 `IF NOT EXISTS` 保证幂等；版本号靠 `PRAGMA user_version` 记录已执行到的下标。
@@ -306,6 +342,20 @@ CREATE TABLE IF NOT EXISTS model_capabilities (
 CREATE INDEX IF NOT EXISTS idx_model_capabilities_model ON model_capabilities(model);
 ALTER TABLE model_pricing ADD COLUMN source TEXT;
 "#,
+    // --- v8: 聚合行记住「客户端请求的模型名」 ---
+    //
+    // 动机：`usage_hourly` 的 `model` 是**生效模型**，统计页「按模型」因此只看得到
+    // `deepseek-flash` —— 看不到客户端原本要的 `gpt-6-sol`。而"我发的 gpt-6-sol
+    // 怎么按 deepseek-flash 计费"正是用户最想查的一件事。明细表 `request_logs`
+    // 记着这条链路，但它会被定期清理（也会被「清空日志」清掉），撑不起长期统计。
+    //
+    // `request_model` 必须进主键：同一小时同一个生效模型可能由多个请求模型折叠
+    // 而来，不进主键的话 `ON CONFLICT DO UPDATE` 会把它们并成一行、先写的那个
+    // 名字被后写的顶掉，别名就永久丢了。SQLite 不能改主键，只能重建表。
+    //
+    // 老行回填 `request_model = model`：那时压根没记这件事，等价于"这一行没有
+    // 被改写"。不编造，界面据此不显示别名。
+    USAGE_HOURLY_V8_DDL,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -317,7 +367,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 7);
+        assert_eq!(SCHEMA_VERSION, 8);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

@@ -147,7 +147,11 @@ pub struct RequestStarted {
     pub request_id: String,
     pub ts: i64,
     pub client: String,
+    /// 生效模型（计费口径）。
     pub model: String,
+    /// 客户端请求的原始名字。与 `model` 不同时，界面要把它一并露出来 ——
+    /// 这条请求还在跑的时候，正是最需要看清"我发的 A 现在跑在 B 上"的时刻。
+    pub request_model: String,
     pub path: String,
     pub protocol_in: String,
     /// 主渠道 tag。
