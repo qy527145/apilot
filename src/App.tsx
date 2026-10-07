@@ -17,6 +17,7 @@ import { useAppInfo, useGatewayStatus } from "@/hooks/queries";
 import {
   UnsavedChangesProvider,
   useHasUnsavedChanges,
+  useSaveAllChanges,
 } from "@/lib/unsaved";
 
 import OverviewPage from "@/pages/OverviewPage";
@@ -54,7 +55,9 @@ function Shell() {
   });
   /** 被未保存改动拦下来的目标页；非空即表示确认弹窗开着。 */
   const [pendingView, setPendingView] = useState<ViewKey | null>(null);
+  const [saving, setSaving] = useState(false);
   const hasUnsaved = useHasUnsavedChanges();
+  const saveAllChanges = useSaveAllChanges();
 
   useEffect(() => {
     localStorage.setItem(VIEW_STORAGE_KEY, view);
@@ -66,6 +69,24 @@ function Shell() {
     if (next === view) return;
     if (hasUnsaved) setPendingView(next);
     else setView(next);
+  };
+
+  const leave = (target: ViewKey | null) => {
+    if (target) setView(target);
+    setPendingView(null);
+  };
+
+  const saveAndLeave = async () => {
+    const target = pendingView;
+    if (!target) return;
+    setSaving(true);
+    try {
+      // 保存失败就停在本页：错误已由 api 层 toast 过，这里不重复提示，
+      // 但绝不能继续切页 —— 那等于把用户以为已经存下的改动丢了。
+      if (await saveAllChanges()) leave(target);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const { data: info } = useAppInfo();
@@ -93,27 +114,32 @@ function Shell() {
 
       <Dialog
         open={pendingView !== null}
-        onOpenChange={(o) => !o && setPendingView(null)}
+        onOpenChange={(o) => !o && !saving && setPendingView(null)}
       >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>有未保存的更改</DialogTitle>
             <DialogDescription className="text-xs">
-              当前页面还有改动没有保存，离开后这些改动会丢失。
+              当前页面还有改动没有保存。可以先存下来再离开，也可以直接丢弃。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingView(null)}>
+            <Button
+              variant="outline"
+              disabled={saving}
+              onClick={() => setPendingView(null)}
+            >
               留在本页
             </Button>
             <Button
               variant="destructive"
-              onClick={() => {
-                setView(pendingView as ViewKey);
-                setPendingView(null);
-              }}
+              disabled={saving}
+              onClick={() => leave(pendingView)}
             >
               放弃更改并离开
+            </Button>
+            <Button disabled={saving} onClick={saveAndLeave}>
+              {saving ? "保存中…" : "保存并离开"}
             </Button>
           </DialogFooter>
         </DialogContent>

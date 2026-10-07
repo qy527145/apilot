@@ -85,8 +85,6 @@ export function ModelPolicyCard({ models }: { models: string[] }) {
     if (server && !dirtyRef.current) setDraft(server);
   }, [server]);
 
-  useUnsavedChanges(dirty);
-
   const save = useMutation({
     mutationFn: (policy: ModelPolicy) => api.setModelPolicy(policy),
     onSuccess: (saved) => {
@@ -99,6 +97,23 @@ export function ModelPolicyCard({ models }: { models: string[] }) {
       toast.success("已保存");
     },
   });
+
+  // 页头和「保存并离开」共用一个入口，返回是否成功 —— 切页拦截那边要靠它
+  // 决定到底走不走。失败时不吞掉，返回 false 让调用方停下来。
+  //
+  // 直接闭包捕获 draft 即可：useUnsavedChanges 把传入的回调存进 ref，
+  // 每次渲染都会刷新，所以它拿到的永远是最新那份草稿。
+  const doSave = async (): Promise<boolean> => {
+    if (!draft) return false;
+    try {
+      await save.mutateAsync(draft);
+      return true;
+    } catch {
+      return false; // api 层已经 toast 过具体错误
+    }
+  };
+
+  useUnsavedChanges(dirty, doSave);
 
   const policy = draft;
 
@@ -160,7 +175,7 @@ export function ModelPolicyCard({ models }: { models: string[] }) {
             <Button
               size="sm"
               disabled={!dirty || save.isPending}
-              onClick={() => draft && save.mutate(draft)}
+              onClick={() => void doSave()}
             >
               <Save className="size-4" />
               {save.isPending ? "保存中…" : "保存"}
