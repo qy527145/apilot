@@ -50,6 +50,13 @@ export interface CustomRuleEditorProps {
   models: string[];
   /** 客户端标识 → 显示名，给「只对这个客户端」那一栏用。 */
   clients: Array<{ id: string; name: string }>;
+  /**
+   * 是否显示行上的客户端过滤器。
+   *
+   * 客户端那一栏（`ClientRow`）里要关掉：整张表本来就是写给那个客户端的，
+   * 再选一次是重复的，而且选岔了会变成一行永不命中的死配置。
+   */
+  showClientFilter?: boolean;
 }
 
 /**
@@ -63,6 +70,7 @@ export function CustomRuleEditor({
   onChange,
   models,
   clients,
+  showClientFilter = true,
 }: CustomRuleEditorProps) {
   const patch = (next: Partial<CustomRules>) => onChange({ ...value, ...next });
 
@@ -89,6 +97,7 @@ export function CustomRuleEditor({
           onChange={(table) => patch({ table })}
           models={models}
           clients={clients}
+          showClientFilter={showClientFilter}
         />
       )}
     </div>
@@ -104,11 +113,13 @@ function TableEditor({
   onChange,
   models,
   clients,
+  showClientFilter,
 }: {
   rows: MappingRow[];
   onChange: (rows: MappingRow[]) => void;
   models: string[];
   clients: Array<{ id: string; name: string }>;
+  showClientFilter: boolean;
 }) {
   // 后端会把「还没写完」的行清掉（空表达式、编译不过的正则）—— 它必须这么做，
   // 一个空的前缀表达式等于匹配一切。所以这里保留一份本地草稿：半成品只留在
@@ -127,9 +138,14 @@ function TableEditor({
   }, [rows]);
 
   const update = (next: MappingRow[]) => {
-    setDraft(next);
+    // 不显示过滤器时一并把 client 抹掉：界面上既然没得选，存下去就不该有。
+    const cleaned = showClientFilter
+      ? next
+      : next.map((r) => (r.client ? { ...r, client: null } : r));
 
-    const complete = next.filter(isCompleteRow);
+    setDraft(cleaned);
+
+    const complete = cleaned.filter(isCompleteRow);
     if (sameRows(complete, emitted.current)) return;
     emitted.current = complete;
     onChange(complete);
@@ -168,6 +184,7 @@ function TableEditor({
           last={i === draft.length - 1}
           clients={clients}
           models={models}
+          showClientFilter={showClientFilter}
           onChange={(next) => replace(i, next)}
           onMoveUp={() => move(i, i - 1)}
           onMoveDown={() => move(i, i + 1)}
@@ -194,8 +211,7 @@ function TableEditor({
         自上而下，第一条命中的生效；一条都没命中就不改写。
         表达式的改动失焦时保存，写不对的那一行会留在界面上等你改，
         不会被悄悄存下去。
-      </p>
-    </div>
+      </p>    </div>
   );
 }
 
@@ -227,6 +243,7 @@ function RowEditor({
   last,
   clients,
   models,
+  showClientFilter,
   onChange,
   onMoveUp,
   onMoveDown,
@@ -237,6 +254,7 @@ function RowEditor({
   last: boolean;
   clients: Array<{ id: string; name: string }>;
   models: string[];
+  showClientFilter: boolean;
   onChange: (row: MappingRow) => void;
   onMoveUp: () => void;
   onMoveDown: () => void;
@@ -270,24 +288,26 @@ function RowEditor({
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-2">
-        <Select
-          value={row.client ?? ANY_CLIENT}
-          onValueChange={(v) =>
-            onChange({ ...row, client: v === ANY_CLIENT ? null : v })
-          }
-        >
-          <SelectTrigger size="sm" className="h-8 w-32 shrink-0">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ANY_CLIENT}>全部客户端</SelectItem>
-            {clients.map((c) => (
-              <SelectItem key={c.id} value={c.id}>
-                {c.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {showClientFilter && (
+          <Select
+            value={row.client ?? ANY_CLIENT}
+            onValueChange={(v) =>
+              onChange({ ...row, client: v === ANY_CLIENT ? null : v })
+            }
+          >
+            <SelectTrigger size="sm" className="h-8 w-32 shrink-0">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ANY_CLIENT}>全部客户端</SelectItem>
+              {clients.map((c) => (
+                <SelectItem key={c.id} value={c.id}>
+                  {c.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
 
         <Select
           value={row.match_kind}

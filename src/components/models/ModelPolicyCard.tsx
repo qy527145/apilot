@@ -291,6 +291,8 @@ function ClientRow({
             onChange={(custom) => onChange({ mode, model: rule?.model ?? null, custom })}
             models={models}
             clients={clients}
+            // 整张表本来就是写给这个客户端的，再选一次客户端是重复的。
+            showClientFilter={false}
           />
         </div>
       )}
