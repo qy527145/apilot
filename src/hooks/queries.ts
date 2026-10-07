@@ -47,6 +47,9 @@ export function useGatewayStatus() {
 
   useApilotEvent("apilot://gateway", (status) => {
     qc.setQueryData(qk.gateway, status);
+    // 网关换地址时后端会把已接管的客户端一并改指到新地址，客户端页那张表
+    // 里的「当前 Base URL」跟着过期了 —— 不刷新的话，用户会以为改端口没生效。
+    qc.invalidateQueries({ queryKey: qk.clients });
   });
 
   return query;

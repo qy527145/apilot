@@ -51,7 +51,8 @@ cargo build
 | 我要… | 主要改动点 |
 |---|---|
 | **加一个新协议**（如 Gemini） | `protocol/dto.rs` 加 `Protocol` 变体 → 新建 `protocol/<name>/`（request/response/stream/mod）→ `protocol/codec.rs::CodecRegistry::new` 注册 → 按需加 `gateway/router.rs` 路由 |
-| **加一个新客户端接管** | `takeover/clients.rs` 加 `ClientId` 变体 + `config_paths()` + `plan_apply()`；`config/paths.rs` 加路径函数 |
+| **加一个新客户端接管** | `takeover/clients.rs` 加 `ClientId` 变体 + `config_paths()` + `plan_apply()`（顺带补 `stored_base_url()`）；`config/paths.rs` 加路径函数 |
+| **改「客户端配置里的网关地址」** | 写地址的只有一条路：`gateway/server.rs::base_url()`（通配监听地址会折算成回环）。网关换地址后跟着改的逻辑是 `takeover/clients.rs::repoint_taken_over`，**触发点在 `gateway/server.rs::serve_on` 而不是设置命令里**（只有那里知道网关真正跑在哪）|
 | **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → 同文件 `Provider::auth_header()`（**鉴权头的唯一构造点**，出站转发、连通探测、拉模型列表都走它） |
 | **改「直通还是转换」的判定** | `storage/models.rs::Provider::wire_for`（渠道声明的协议集合命中就直通）+ `gateway/pipeline.rs::prefer_native_protocol`（多渠道路由时同协议优先）→ 同步更新 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md) |
 | **改出站 URL 拼接** | `storage/models.rs::Provider::endpoint`（协议默认路径，会补 `/v1`）/ `endpoint_verbatim`（用户手写路径，**不补** `/v1`） |

@@ -50,7 +50,7 @@ impl GatewayServer {
     pub fn base_url(&self) -> Option<String> {
         let s = self.status();
         if s.running {
-            Some(format!("http://{}:{}", s.host, s.port))
+            Some(format!("http://{}:{}", reachable_host(&s.host), s.port))
         } else {
             None
         }
@@ -134,6 +134,26 @@ impl GatewayServer {
         .await;
 
         tracing::info!(%host, port, actual, "网关已启动");
+
+        // 网关换了地址，已接管的客户端还指着老地址 —— 不改它们，用户看到的就是
+        // "改了端口，客户端全连不上"。
+        //
+        // 放在这里而不是设置命令里，是因为**只有这里知道网关真正跑在哪**：设置里改完
+        // 未必立刻生效（端口被占会退回老地址），端口填 0 时真实端口也是这一刻才分配出来。
+        // 启动、换地址、退回老地址三条路都汇到 serve_on，一处就全覆盖了。
+        //
+        // 没有变化时 `repoint_taken_over` 一个字节都不写，所以每次启动都来问一遍是安全的。
+        // 失败只记日志：客户端配置没跟上不该让网关起不来。
+        if let Some(base_url) = self.base_url() {
+            match crate::takeover::clients::repoint_taken_over(&base_url) {
+                Ok(changed) if !changed.is_empty() => {
+                    tracing::info!(%base_url, clients = ?changed, "已把接管的客户端指向新地址");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("同步客户端 base_url 失败（客户端可能仍指向旧地址）: {e}"),
+            }
+        }
+
         shell.events.gateway(&self.status());
 
         Ok(self.status())
@@ -250,6 +270,18 @@ impl Default for GatewayServer {
     }
 }
 
+/// 写进客户端配置的地址得真的能连上。
+///
+/// 监听地址可以是通配的 `0.0.0.0`（愿意被局域网访问时就这么填），但**客户端去连它
+/// 是不确定的** —— macOS 上干脆连不上。客户端永远在本机，换成回环地址既准确，
+/// 又不改变它实际的可达性。
+fn reachable_host(host: &str) -> &str {
+    match host.trim() {
+        "0.0.0.0" | "::" | "[::]" | "" => "127.0.0.1",
+        h => h,
+    }
+}
+
 /// 绑定失败归一成 `AppError`。端口被占用单独成一类 —— 那是用户最容易撞上、
 /// 也最需要一句人话的错。
 fn bind_error(addr: &str, port: u16, e: std::io::Error) -> AppError {
@@ -297,6 +329,24 @@ mod tests {
         });
         assert_eq!(s.base_url().as_deref(), Some("http://127.0.0.1:8787"));
         assert_eq!(s.port(), 8787);
+    }
+
+    #[test]
+    fn wildcard_listen_hosts_are_written_as_loopback() {
+        // 监听 0.0.0.0 是"愿意被局域网访问"，但把这个地址写进客户端配置就不对了：
+        // 客户端只会从本机连，而某些平台上连 0.0.0.0 根本连不上。
+        assert_eq!(reachable_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(reachable_host("::"), "127.0.0.1");
+        assert_eq!(reachable_host("[::]"), "127.0.0.1");
+        assert_eq!(reachable_host(" 0.0.0.0 "), "127.0.0.1");
+    }
+
+    #[test]
+    fn specific_hosts_are_kept_verbatim() {
+        // 用户特意填了某个网卡地址（比如想让 WSL 里的客户端连进来），不能自作主张改掉。
+        for h in ["127.0.0.1", "localhost", "192.168.1.5", "10.0.0.2"] {
+            assert_eq!(reachable_host(h), h);
+        }
     }
 
     #[test]

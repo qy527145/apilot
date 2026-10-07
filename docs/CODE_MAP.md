@@ -18,7 +18,7 @@
   - [upstream — 上游渠道](#upstream--上游渠道771-行)
   - [billing — 计费](#billing--计费848-行)
   - [cache — 响应缓存](#cache--响应缓存1109-行)
-  - [takeover — 客户端接管](#takeover--客户端接管1432-行)
+  - [takeover — 客户端接管](#takeover--客户端接管1763-行)
   - [storage — 持久化](#storage--持久化3316-行)
   - [traffic — 实时统计与事件](#traffic--实时统计与事件419-行)
   - [commands — Tauri 命令层](#commands--tauri-命令层775-行)
@@ -227,13 +227,13 @@ quota           += tool_call_surcharge × 工具调用次数
 
 ---
 
-### `takeover/` — 客户端接管（1432 行）
+### `takeover/` — 客户端接管（1763 行）
 
 | 文件 | 内容 |
 |---|---|
 | `patch.rs` | 保序补丁器：`patch_json` / `patch_toml` / `patch_dotenv`。**解析失败即中止** |
 | `engine.rs` | `TakeoverEngine`：`ensure_backup` / `write_atomic` / `commit` / `restore`；`rename_with_retry` |
-| `clients.rs` | 每个客户端的 `plan_apply`（Claude / Codex / Gemini）、`config_paths`、`current_base_url`、`describe_all` |
+| `clients.rs` | 每个客户端的 `plan_apply`（Claude / Codex / Gemini）、`config_paths`、`current_base_url`、`stored_base_url`、`describe_all`、`repoint_taken_over`（网关换地址后把**已接管**的客户端改指过去，见下） |
 | `floor.rs` | 共享常量：`LOCAL_PLACEHOLDER_KEY`、`CODEX_PROVIDER_NAME` |
 
 **两条设计原则**：
@@ -242,6 +242,13 @@ quota           += tool_call_surcharge × 工具调用次数
 
 **写入三段式**：先写同目录临时文件 + `fsync`，再原子 `rename`（Windows 上带退避重试）。
 直接 `fs::write` 写到一半被杀会留下截断的 JSON，客户端下次启动直接报配置错误。
+
+**跟着网关地址走**：网关换监听地址后，已接管的客户端配置里还留着老地址。同步逻辑是
+`clients::repoint_taken_over`，触发点却不在设置命令里，而在 **`gateway/server.rs::serve_on`**
+—— 只有那里知道网关真正跑在哪（改完设置未必生效：端口被占会退回老地址；端口填 0 时
+真实端口也是那一刻才分配）。启动、换地址、退回老地址三条路都汇到 `serve_on`，一处全覆盖。
+判据是「客户端现在指的地址 ≠ 目标地址」，不是整份文件比 —— 后者会把用户手加的模型覆盖、
+密钥也当成"不一致"，然后被 `plan_apply` 抹掉。
 
 ---
 

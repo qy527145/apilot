@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::engine::{FilePatch, TakeoverEngine};
+use super::engine::{FilePatch, TakeoverEngine, TakeoverPlan};
 use super::floor;
 use super::patch::{self, DotenvOp, JsonOp, TomlOp, TomlValue};
 use crate::config::paths;
@@ -64,6 +64,17 @@ impl ClientId {
     /// 真出现多文件的那天，这里的"主"要重新定义。
     pub fn primary_config_path(&self) -> Option<PathBuf> {
         self.config_paths().into_iter().next()
+    }
+
+    /// 这个 base_url 会被**以什么形式**记进该客户端的配置里。
+    ///
+    /// 与 `plan_*` 写进去的值必须逐字一致 —— 判断「客户端是不是已经指着这个地址」
+    /// 全靠它。Codex 那边带 `/v1`：它会在 base_url 后面自己拼 `/responses`（见 `plan_codex`）。
+    pub fn stored_base_url(&self, base_url: &str) -> String {
+        match self {
+            Self::Codex => format!("{}/v1", base_url.trim_end_matches('/')),
+            Self::ClaudeCode | Self::GeminiCli => base_url.to_string(),
+        }
     }
 
     /// 该客户端是否已安装（配置文件存在即认为装了）。
@@ -126,6 +137,52 @@ pub fn describe_all(engine: &TakeoverEngine) -> Vec<ClientInfo> {
             current_base_url: c.current_base_url(),
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// 跟随网关地址
+// ---------------------------------------------------------------------------
+
+/// 把**已接管**的客户端重新指向网关当前的地址。
+///
+/// 网关换了监听地址（改端口、换网卡、端口填 0 时由系统分配）之后，客户端配置里
+/// 还留着老地址，用户看到的现象是"改完端口，客户端全连不上"。
+///
+/// 只碰已被我们改过的客户端：没接管的那些，base_url 是用户自己写的，网关监听在
+/// 哪儿跟它没关系 —— 顺手改掉就是越界，而且会毁掉用户手写的配置。
+///
+/// 返回**真正被改动**的客户端名；没有变化时是空数组（绝大多数调用都是这种）。
+pub fn repoint_taken_over(base_url: &str) -> AppResult<Vec<String>> {
+    let engine = TakeoverEngine::new();
+    let mut changed = Vec::new();
+
+    for id in all_clients() {
+        if !id.is_taken_over(&engine) {
+            continue;
+        }
+
+        // 判据只看**地址对不对**，不看整份文件。
+        //
+        // 拿内容逐字节比会把用户自己加的东西（模型覆盖、密钥……）也算成"不一致"，
+        // 然后被 `plan_apply` 顺手抹掉 —— 一次启动就悄悄回退掉用户的手改，
+        // 比不改还糟。地址一样就什么都不做。
+        if id.current_base_url().as_deref() == Some(id.stored_base_url(base_url).as_str()) {
+            continue;
+        }
+
+        // 重跑一遍接管计划：改动只落在 floor keys 上，用户自己写的键原样保留。
+        let patches = id.plan_apply(base_url)?;
+        let plan = TakeoverPlan {
+            client: id.display_name().to_string(),
+            files: Vec::new(),
+        };
+        // 走 commit 而不是直接写：备份是「还原」的唯一依据，这里必须和接管同一条路径，
+        // 否则重新指向之后再点还原就找不到原始文件了。已备份过时 commit 不会覆盖备份。
+        engine.commit(&plan, &patches)?;
+        changed.push(id.display_name().to_string());
+    }
+
+    Ok(changed)
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +459,60 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("MY_TOKEN=abc"));
         assert!(text.contains("OTHER=1"));
+    }
+
+    // --- 跟随网关地址 ---
+
+    #[test]
+    fn codex_stored_base_url_keeps_the_v1_suffix() {
+        // Codex 自己会再拼 `/responses`，所以接管时写进去的是带 /v1 的。
+        // 判据也得按带 /v1 的算，否则每次都判定"地址不一致"，白白重写一遍。
+        assert_eq!(
+            ClientId::Codex.stored_base_url("http://127.0.0.1:8787"),
+            "http://127.0.0.1:8787/v1"
+        );
+        assert_eq!(
+            ClientId::Codex.stored_base_url("http://127.0.0.1:8787/"),
+            "http://127.0.0.1:8787/v1",
+            "尾部斜杠不该拼出 //v1"
+        );
+        assert_eq!(
+            ClientId::ClaudeCode.stored_base_url("http://127.0.0.1:8787"),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(
+            ClientId::GeminiCli.stored_base_url("http://127.0.0.1:8787"),
+            "http://127.0.0.1:8787"
+        );
+    }
+
+    #[test]
+    fn stored_base_url_matches_what_the_plans_actually_write() {
+        // 「要不要重新指向」的判据就是这个等式。两边一旦漂移，要么每次网关启动
+        // 都无谓地重写一遍用户的配置，要么该跟着换的时候不换。
+        let url = "http://127.0.0.1:8787";
+
+        let claude = plan_claude(url).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(claude[0].content.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["env"]["ANTHROPIC_BASE_URL"].as_str(),
+            Some(ClientId::ClaudeCode.stored_base_url(url).as_str())
+        );
+
+        let codex = plan_codex(url).unwrap();
+        let doc: toml_edit::DocumentMut =
+            String::from_utf8(codex[0].content.clone().unwrap()).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["model_providers"][floor::CODEX_PROVIDER_NAME]["base_url"].as_str(),
+            Some(ClientId::Codex.stored_base_url(url).as_str())
+        );
+
+        let gemini = String::from_utf8(plan_gemini(url).unwrap()[0].content.clone().unwrap()).unwrap();
+        assert!(gemini.contains(&format!(
+            "GOOGLE_GEMINI_BASE_URL={}",
+            ClientId::GeminiCli.stored_base_url(url)
+        )));
     }
 
     // --- 路径 ---
