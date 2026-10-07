@@ -63,6 +63,9 @@ const ANY = "__any__";
 const PAGE_SIZE = 100;
 const MAX_LIMIT = 1000;
 
+/** 流结束后，实时条目在内存里再留多久。够用户看完最后几帧，又不至于一直占着。 */
+const DONE_TTL_MS = 120_000;
+
 /** 时间范围快捷项。**只给下界** —— 给上界会把窗口冻在打开页面的那一刻，
  *  之后新来的请求永远不出现，而这正是监控页最不该有的行为。 */
 type RangePreset = "all" | "5m" | "1h" | "24h" | "today";
@@ -150,11 +153,29 @@ export default function TrafficPage() {
   // --- 进行中的请求 ---
   //
   // 流式请求在整条流结束前不落库，所以这份表只能靠事件攒。
+  //
+  // 流结束后**不立刻删**，只标 `done`：用户大多正开着实时流弹窗盯着看，
+  // 一结束就把它抽走等于把看到一半的内容抢掉。由下面的过期清理负责回收。
   const [inflight, setInflight] = useState<Map<string, LiveRequest>>(new Map());
+
+  const markDone = (cur: LiveRequest, error?: string | null): LiveRequest => ({
+    ...cur,
+    done: true,
+    done_at: Date.now(),
+    error: error ?? cur.error,
+  });
+
+  /** 回收看完了的条目，免得长驻进程里越攒越多。 */
+  const pruneDone = (m: Map<string, LiveRequest>, now: number) => {
+    for (const [id, r] of m) {
+      if (r.done && now - (r.done_at ?? now) > DONE_TTL_MS) m.delete(id);
+    }
+  };
 
   useApilotEvent("apilot://request-start", (p) => {
     setInflight((prev) => {
       const next = new Map(prev);
+      pruneDone(next, Date.now());
       next.set(p.request_id, {
         request_id: p.request_id,
         ts: p.ts,
@@ -175,13 +196,12 @@ export default function TrafficPage() {
   useApilotEvent("apilot://stream", (batch) => {
     setInflight((prev) => {
       const cur = prev.get(batch.request_id);
-      // 没有对应条目：缓存重放的流（不发 start）或早已结束的那条，忽略即可。
+      // 没有对应条目：缓存重放的流（不发 start）或早已过期的，忽略即可。
       if (!cur) return prev;
 
       const next = new Map(prev);
       if (batch.done) {
-        // 结束就移出「进行中」。列表本身有 1 秒轮询，不必在这里触发刷新。
-        next.delete(batch.request_id);
+        next.set(batch.request_id, markDone(cur, batch.error));
         return next;
       }
 
@@ -197,15 +217,21 @@ export default function TrafficPage() {
 
   useApilotEvent("apilot://request-end", (p) => {
     setInflight((prev) => {
-      if (!prev.has(p.request_id)) return prev;
+      const cur = prev.get(p.request_id);
+      if (!cur) return prev;
       const next = new Map(prev);
-      next.delete(p.request_id);
+      // 非流式请求没有逐帧内容可看，直接移走；流式的标结束、留在弹窗里。
+      if (cur.is_stream) next.set(p.request_id, markDone(cur, p.error));
+      else next.delete(p.request_id);
       return next;
     });
   });
 
   const inflightList = useMemo(
-    () => [...inflight.values()].sort((a, b) => b.ts - a.ts),
+    () =>
+      [...inflight.values()]
+        .filter((r) => !r.done)
+        .sort((a, b) => b.ts - a.ts),
     [inflight],
   );
 

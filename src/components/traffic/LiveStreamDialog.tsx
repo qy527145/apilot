@@ -29,6 +29,8 @@ export interface LiveRequest {
   frames: StreamFrame[];
   /** 流已结束（正常结束、出错或客户端断连）。 */
   done: boolean;
+  /** 结束的墙钟时间。结束后的条目靠它算保留期 —— 用开始时间会把长回答立刻清掉。 */
+  done_at?: number | null;
   truncated: boolean;
   error?: string | null;
 }
@@ -183,6 +185,11 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
 
         {live?.error && (
           <p className="text-destructive text-xs">流未正常结束：{live.error}</p>
+        )}
+        {live?.done && !live.error && (
+          <p className="text-muted-foreground text-xs">
+            流已结束。这里只保留最近若干帧，完整报文在列表里点这一行看明细。
+          </p>
         )}
 
         <div className="grid min-h-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,17rem)_minmax(0,1fr)]">
