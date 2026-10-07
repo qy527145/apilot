@@ -628,6 +628,12 @@ export interface RequestDetail extends RequestLog {
   client_stream_raw?: string | null;
   /** 原始 SSE 帧是否因超过上限被截断。 */
   stream_raw_truncated: boolean;
+  /**
+   * 每个 SSE 事件的时间点（`StreamTimings` 的 JSON 文本）。
+   *
+   * 老日志没有这一项 —— 改动之前没记。用 `parseTimings` 解，解不出来就别画时间轴。
+   */
+  stream_timings?: string | null;
 
   views: DetailViews;
 }

@@ -95,7 +95,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | `pipeline.rs` | **核心编排**。`handle()` 串起整条链路；`Recorder` 收口记账；`detect_client()` 识别来源；`decode_sse_as_response()` 兜住「上游无视 stream 参数」 |
 | `server.rs` | `GatewayServer`：`start` / `stop` / `status` / `base_url`，用 oneshot + graceful shutdown |
 | `router.rs` | axum 路由表、`/health`、`/v1/models`、路径兜底（按路径特征猜协议） |
-| `stream.rs` | `translate_stream()`（上游流 → 下游流）、`stream_from_response()`（缓存重放流）、**`ContentAccumulator`**（从增量重建完整内容，供缓存写入） |
+| `stream.rs` | `translate_stream()`（上游流 → 下游流）、`stream_from_response()`（缓存重放流）、**`ContentAccumulator`**（从增量重建完整内容，供缓存写入）、**`StreamTimings`**（每个事件的时间点，供时间轴；平行数组 + 名字表，两千帧几 KB）。`delta_display_name()` 那套名字**必须与前端 `StreamDelta` 的 serde 标签逐字相同**，有测试钉着 |
 | `sse.rs` | SSE 原语：`take_sse_block`（两种分隔符取最早）、`append_utf8_safe`（跨 chunk 多字节）、`parse_event` / `encode_event` |
 | `proxy_e2e.rs` | 端到端测试：起真实上游 HTTP 服务跑通全链路 |
 
@@ -354,7 +354,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `usage_hourly` | `(bucket_ts, client, provider_tag, model)` | 小时聚合，SUM 后 upsert。**`clear_logs` 不动它** —— 它是计费口径的历史账目 |
 | `model_pricing` | `model` | 单价系数 |
 | `response_cache` | `key`（sha256） | 缓存条目：响应体、usage、原额度、命中数 |
-| `captures` | `request_id` | **两个方向的原文**：入站（客户端→Apilot）与出站（Apilot→上游，含上游 URL / headers / body 与上游原始响应）+ 流式拼接文本（**鉴权头已隐去**） |
+| `captures` | `request_id` | **两个方向的原文**：入站（客户端→Apilot）与出站（Apilot→上游，含上游 URL / headers / body 与上游原始响应）+ 流式拼接文本（**鉴权头已隐去**）+ 每个 SSE 事件的时间点（`stream_timings`，JSON，供时间轴） |
 | `settings_kv` | `key` | 设置、单价兜底倍率、缓存计数器 |
 
 时间约定：`request_logs.ts` 是 **unix 毫秒**；`usage_hourly.bucket_ts` 是**整点 unix 秒**。
@@ -376,7 +376,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明）、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
-| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应」两段，内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间线 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库） |
+| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
 只会在运行时静默失败。

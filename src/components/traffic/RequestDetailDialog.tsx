@@ -5,6 +5,10 @@ import { ArrowRight, Loader2 } from "lucide-react";
 import { CopyButton } from "@/components/common/CopyButton";
 import { RawBody } from "@/components/common/RawBody";
 import { ResponseView, RequestView } from "@/components/traffic/InspectViews";
+import {
+  StreamTimeline,
+  parseTimings,
+} from "@/components/traffic/StreamTimeline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -40,6 +44,9 @@ interface Props {
 
 /** 三种查看方式。表达的是"我在核对报文"还是"我在看语义"，与具体是哪一段无关。 */
 type ViewMode = "visual" | "formatted" | "raw";
+
+/** 顶层页签。时间轴单独一个 —— 它不看报文，看的是每个事件花了多久。 */
+type DetailTab = "request" | "response" | "timeline";
 
 /**
  * 响应侧「原始」视图取哪份数据。
@@ -106,6 +113,7 @@ function formattedOf(d: RequestDetail, side: "client" | "upstream"): string | nu
 
 export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
   const [view, setView] = useState<ViewMode>("visual");
+  const [tab, setTab] = useState<DetailTab>("request");
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: qk.requestDetail(requestId ?? ""),
@@ -113,6 +121,13 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
     enabled: !!requestId,
     retry: 1,
   });
+
+  // 时间轴的数据是**后加的**：改动之前落库的请求没有它。没有就不显示那个页签，
+  // 而不是给一份空轴让人以为这个请求一个事件都没发。
+  const timeline = parseTimings(data?.stream_timings);
+  // 换了一条没有时间轴的请求时，别停在那个已经消失的页签上 —— 那样正文会是空白。
+  const activeTab: DetailTab =
+    tab === "timeline" && !timeline ? "request" : tab;
 
   return (
     <Dialog open={!!requestId} onOpenChange={onOpenChange}>
@@ -151,13 +166,17 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
               </div>
             )}
 
-            <Tabs defaultValue="request">
+            <Tabs value={activeTab} onValueChange={(v) => setTab(v as DetailTab)}>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <TabsList>
                   <TabsTrigger value="request">请求</TabsTrigger>
                   <TabsTrigger value="response">响应</TabsTrigger>
+                  {timeline && <TabsTrigger value="timeline">时间轴</TabsTrigger>}
                 </TabsList>
-                <ViewToggle value={view} onChange={setView} />
+                {/* 「可视化 / 格式化 / 原始」说的是报文怎么看，时间轴上没有报文。 */}
+                {activeTab !== "timeline" && (
+                  <ViewToggle value={view} onChange={setView} />
+                )}
               </div>
 
               <TabsContent value="request">
@@ -232,6 +251,16 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
                   unavailable="这次没有请求上游，没有上游响应"
                 />
               </TabsContent>
+
+              {timeline && (
+                <TabsContent value="timeline" className="pt-3">
+                  <StreamTimeline
+                    entries={timeline.entries}
+                    truncated={timeline.truncated}
+                    barClassName="w-40"
+                  />
+                </TabsContent>
+              )}
             </Tabs>
 
             {data.is_stream && data.stream_raw_truncated && (

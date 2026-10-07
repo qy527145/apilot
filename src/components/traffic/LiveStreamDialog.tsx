@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Radio } from "lucide-react";
 
 import { CopyButton } from "@/components/common/CopyButton";
+import { StreamTimeline } from "@/components/traffic/StreamTimeline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,7 +15,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PROTOCOL_LABEL, type Protocol } from "@/lib/api";
 import type { StreamFrame } from "@/lib/events";
-import { cn, formatMs, formatTime } from "@/lib/utils";
+import { cn, formatTime } from "@/lib/utils";
 
 /** 一条正在跑（或刚跑完）的流式请求在内存里的样子。 */
 export interface LiveRequest {
@@ -141,6 +142,12 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
 
   const frames = live?.frames ?? [];
   const blocks = useMemo(() => accumulate(frames), [frames]);
+  // 时间轴吃的是 (时间点, 名字) 两样，与明细那边从库里读出来的形态一致 ——
+  // 同一个组件因此能给两种数据源画同一张图。
+  const entries = useMemo(
+    () => frames.map((f) => ({ at_ms: f.at_ms, name: frameName(f) })),
+    [frames],
+  );
 
   // 跟随最新：不这么做的话，长回答滚上去之后就再也看不到新内容了。
   useEffect(() => {
@@ -192,11 +199,11 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
           </p>
         )}
 
-        <div className="grid min-h-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,17rem)_minmax(0,1fr)]">
+        <div className="grid min-h-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
           {/* ---- 左：事件时间线 ---- */}
           <div className="flex min-h-0 flex-col gap-2">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-medium">事件</span>
+              <span className="text-xs font-medium">事件时间轴</span>
               <Button
                 variant="ghost"
                 size="sm"
@@ -206,41 +213,24 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
                 {follow ? "停止跟随" : "跟随最新"}
               </Button>
             </div>
-            <div className="max-h-[52vh] min-h-32 overflow-y-auto rounded-md border">
+            <div className="max-h-[52vh] min-h-32 overflow-y-auto pr-1">
               {frames.length === 0 ? (
                 <p className="text-muted-foreground flex items-center justify-center gap-2 py-8 text-xs">
                   <Loader2 className="size-3 animate-spin" />
                   等待上游第一个事件…
                 </p>
               ) : (
-                frames.map((f) => (
-                  <button
-                    key={f.seq}
-                    onClick={() => {
-                      setSelectedSeq(f.seq);
-                      setFollow(false);
-                    }}
-                    className={cn(
-                      "flex w-full cursor-pointer items-baseline gap-2 border-b px-2 py-1 text-left text-[11px] last:border-b-0",
-                      selected?.seq === f.seq && "bg-accent",
-                    )}
-                  >
-                    <span className="text-muted-foreground w-8 shrink-0 tabular-nums">
-                      {f.seq}
-                    </span>
-                    <span className="min-w-0 flex-1 truncate font-mono">
-                      {frameName(f)}
-                    </span>
-                    <span className="text-muted-foreground shrink-0 tabular-nums">
-                      +{formatMs(f.at_ms)}
-                    </span>
-                    {f.raw_truncated && (
-                      <span className="text-amber-500" title="本帧原文已截断">
-                        ✂
-                      </span>
-                    )}
-                  </button>
-                ))
+                <StreamTimeline
+                  entries={entries}
+                  truncated={live?.truncated}
+                  selected={selected?.seq ?? null}
+                  onSelect={(seq) => {
+                    setSelectedSeq(seq);
+                    setFollow(false);
+                  }}
+                  barClassName="w-12"
+                  showAbsolute={false}
+                />
               )}
               <div ref={bottomRef} />
             </div>
