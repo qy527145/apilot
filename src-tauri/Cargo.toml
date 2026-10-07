@@ -53,7 +53,13 @@ http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls",
+  # 用系统根证书而不是 reqwest 默认的 webpki-roots：后者是编译期打包进二进制的
+  # Mozilla 根集合，**永远不读操作系统证书存储**。桌面应用上这会造成一个很难
+  # 排查的现象 —— 抓包工具（mitmproxy / Fiddler / Charles）的 CA 明明已经装进
+  # Windows 根存储，`certutil -store Root` 也查得到，客户端却照样报
+  # `invalid peer certificate: UnknownIssuer`，因为 rustls 压根没去那儿找。
+  # reqwest 的 `rustls-tls` 特性就等价于 `rustls-tls-webpki-roots`。
+  "rustls-tls-native-roots",
   "json",
   "stream",
   "gzip",

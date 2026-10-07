@@ -231,12 +231,30 @@ fn classify_reqwest_error(e: &reqwest::Error) -> UpstreamError {
     if e.is_timeout() {
         UpstreamError::Timeout
     } else if e.is_connect() {
-        UpstreamError::Connect(e.to_string())
+        UpstreamError::Connect(describe_error_chain(e))
     } else if e.is_request() || e.is_builder() {
-        UpstreamError::Build(e.to_string())
+        UpstreamError::Build(describe_error_chain(e))
     } else {
-        UpstreamError::Io(e.to_string())
+        UpstreamError::Io(describe_error_chain(e))
     }
+}
+
+/// 把一条错误链摊平成一行。
+///
+/// 不能只用 `to_string()`：reqwest 的 `Display` 只写到「error sending request for
+/// url (...)」就停了，真正的原因（`invalid peer certificate: UnknownIssuer`、
+/// `tcp connect error: Connection refused`）全在 `source()` 里。只打 Display 的话，
+/// 代理没生效、代理生效但 TLS 握手被拒、上游不可达这三种完全不同的故障长得一模一样，
+/// 排查得靠猜。
+fn describe_error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cursor = e.source();
+    while let Some(cause) = cursor {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        cursor = cause.source();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -461,5 +479,41 @@ mod tests {
         }
         .is_retryable());
         assert!(!UpstreamError::Build("x".into()).is_retryable());
+    }
+
+    /// 手工造一条三层错误链，验证摊平逻辑本身。
+    ///
+    /// 刻意不真的发一个请求去拿 reqwest 的错误：那要依赖某个端口一定是关着的，
+    /// 而这里要守的只是"链有没有走到底"，用假错误就能覆盖。
+    #[derive(Debug, thiserror::Error)]
+    #[error("error sending request for url (https://api.deepseek.com/v1/responses)")]
+    struct Outer(#[source] Middle);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("client error (Connect)")]
+    struct Middle(#[source] Inner);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("invalid peer certificate: UnknownIssuer")]
+    struct Inner;
+
+    #[test]
+    fn error_chain_keeps_the_root_cause_that_display_drops() {
+        let e = Outer(Middle(Inner));
+        let described = describe_error_chain(&e);
+        // 根因必须在 —— 少了它，"代理没生效"和"代理生效但证书被拒"没法区分。
+        assert!(described.contains("UnknownIssuer"), "丢掉了根因: {described}");
+        assert!(described.contains("client error (Connect)"), "丢掉了中间层: {described}");
+        // 顺序是从外到内，读起来才是"因为 A 因为 B"。
+        assert!(
+            described.find("error sending request").unwrap()
+                < described.find("UnknownIssuer").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_single_layer_error_needs_no_separator() {
+        // 没有 source 时不能多出一个尾巴冒号。
+        assert_eq!(describe_error_chain(&Inner), "invalid peer certificate: UnknownIssuer");
     }
 }
