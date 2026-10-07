@@ -62,8 +62,8 @@ impl AppShell {
         let settings = AppSettings::load(&db).await?;
 
         // --- 上游渠道 ---
-        let shared_client = client::build();
-        let registry = Arc::new(ProviderRegistry::new(shared_client));
+        let registry = Arc::new(ProviderRegistry::with_pool(Arc::new(client::ClientPool::new())));
+        registry.set_global_proxy(settings.proxy.clone());
         let providers = crate::storage::providers::list_enabled(&db).await?;
         registry.reload(&providers);
 
@@ -278,9 +278,13 @@ impl AppShell {
         self.started_at
     }
 
-    /// 持久化后原子替换内存副本，并同步缓存策略。
+    /// 持久化后原子替换内存副本，并同步缓存策略与出站代理。
     pub async fn update_settings(&self, new: AppSettings) -> AppResult<()> {
         let new = new.normalized();
+        // 代理变了才重载渠道：reload 会重建全部渠道对象，而「跟随全局」的渠道
+        // 必须拿到新代理对应的客户端才能生效。（只换客户端不重载的话，
+        // 在途与后续请求都还挂着旧的那个。）
+        let proxy_changed = self.settings().proxy != new.proxy;
         new.save(&self.db).await?;
 
         self.cache.set_policy(crate::cache::CachePolicy {
@@ -290,6 +294,10 @@ impl AppShell {
         });
 
         self.settings.store(Arc::new(new));
+        if proxy_changed {
+            self.registry.set_global_proxy(self.settings().proxy.clone());
+            self.reload_providers().await?;
+        }
         Ok(())
     }
 

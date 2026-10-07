@@ -77,6 +77,50 @@ impl AuthStyle {
     }
 }
 
+/// 渠道级代理怎么选。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelProxyMode {
+    /// 跟随全局设置。默认。
+    #[default]
+    Inherit,
+    /// 强制直连。本地模型服务（ollama / LM Studio）用这个 ——
+    /// 全局配了公司代理时，它是唯一能让请求留在本机的开关。
+    Direct,
+    /// 用 `url` 指定的地址，无视全局与环境变量。
+    Manual,
+    /// 认不出的取值。同 `ProxyMode::Unknown`：一个错别字不该让整条渠道打不开。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 某个渠道的代理设置。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelProxy {
+    pub mode: ChannelProxyMode,
+    /// 支持 `http:// https:// socks5:// socks5h://`。
+    pub url: Option<String>,
+}
+
+impl ChannelProxy {
+    /// 修剪空白、把坏取值折回默认。
+    pub fn normalized(mut self) -> Self {
+        if self.mode == ChannelProxyMode::Unknown {
+            self.mode = ChannelProxyMode::Inherit;
+        }
+        self.url = self
+            .url
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
+        // 选了「自定义」却没填地址：折回跟随全局，而不是留一条什么都不做的配置。
+        if self.mode == ChannelProxyMode::Manual && self.url.is_none() {
+            self.mode = ChannelProxyMode::Inherit;
+        }
+        self
+    }
+}
+
 /// 服务商在某种协议下的接入点。
 ///
 /// 一个服务商常常同时提供多种协议（比如同一家既给 `/v1/messages` 也给
@@ -130,6 +174,9 @@ pub struct Provider {
     pub priority: i64,
     pub enabled: bool,
     pub timeout_ms: i64,
+    /// 该渠道走不走代理、走哪个。
+    #[serde(default)]
+    pub proxy: ChannelProxy,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -350,9 +397,50 @@ mod tests {
             priority: 0,
             enabled: true,
             timeout_ms: 600_000,
+            proxy: Default::default(),
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 渠道级代理
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_channel_proxy_defaults_to_inheriting_the_global_setting() {
+        // 数据库里 NULL / '{}' 都走这条路：老行不必回填就是"跟随全局"。
+        let from_empty: ChannelProxy = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty.mode, ChannelProxyMode::Inherit);
+        assert_eq!(from_empty, ChannelProxy::default());
+    }
+
+    #[test]
+    fn channel_proxy_roundtrips_through_json() {
+        let p = ChannelProxy {
+            mode: ChannelProxyMode::Manual,
+            url: Some("socks5://127.0.0.1:1080".into()),
+        };
+        let back: ChannelProxy = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn a_misspelled_channel_proxy_mode_falls_back_to_inherit() {
+        let p: ChannelProxy = serde_json::from_str(r#"{"mode":"socks","url":"x"}"#).unwrap();
+        assert_eq!(p.mode, ChannelProxyMode::Unknown);
+        assert_eq!(p.normalized().mode, ChannelProxyMode::Inherit);
+    }
+
+    #[test]
+    fn channel_proxy_manual_without_a_url_normalizes_to_inherit() {
+        let p = ChannelProxy {
+            mode: ChannelProxyMode::Manual,
+            url: Some("   ".into()),
+        };
+        let n = p.normalized();
+        assert_eq!(n.mode, ChannelProxyMode::Inherit);
+        assert_eq!(n.url, None);
     }
 
     #[test]

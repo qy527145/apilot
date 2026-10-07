@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
-use super::models::{AuthStyle, ProtocolEndpoint, Provider, ProviderKind, ProviderModel};
+use super::models::{
+    AuthStyle, ChannelProxy, ProtocolEndpoint, Provider, ProviderKind, ProviderModel,
+};
 use crate::error::{AppError, AppResult};
 use crate::util::now_ms;
 
@@ -38,6 +40,9 @@ pub struct ProviderInput {
     pub enabled: bool,
     #[serde(default = "default_timeout")]
     pub timeout_ms: i64,
+    /// 该渠道走不走代理。省略表示跟随全局。
+    #[serde(default)]
+    pub proxy: ChannelProxy,
 }
 
 fn default_auth_style() -> AuthStyle {
@@ -79,13 +84,22 @@ impl ProviderInput {
         if self.timeout_ms < 1000 {
             return Err("超时不能小于 1 秒".into());
         }
+        // 代理地址在保存时就拦下来 —— 等到构造客户端才发现写错了，
+        // 表现是"请求都失败"而没有任何指向配置的提示。
+        if let Some(url) = self.proxy.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            if !crate::upstream::client::is_supported_proxy_url(url) {
+                return Err(format!(
+                    "代理地址「{url}」不受支持，只能是 http:// 、https:// 或 socks5:// 开头"
+                ));
+            }
+        }
         Ok(())
     }
 }
 
 const SELECT_COLUMNS: &str = "id, tag, name, kind, base_url, api_key, auth_style, \
      protocols, extra_headers, param_override, model_mapping, weight, priority, enabled, \
-     timeout_ms, created_at, updated_at";
+     timeout_ms, proxy, created_at, updated_at";
 
 fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Provider {
     let json_map = |s: String| -> IndexMap<String, String> {
@@ -112,6 +126,11 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Provider {
         priority: row.get("priority"),
         enabled: row.get::<i64, _>("enabled") != 0,
         timeout_ms: row.get("timeout_ms"),
+        // NULL / 坏 JSON 都退化成"跟随全局" —— 一条脏数据不该让渠道打不开。
+        proxy: row
+            .get::<Option<String>, _>("proxy")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -161,6 +180,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
     let extra = serde_json::to_string(&input.extra_headers)?;
     let mapping = serde_json::to_string(&input.model_mapping)?;
     let protocols = serde_json::to_string(&input.protocols)?;
+    let proxy = serde_json::to_string(&input.proxy.clone().normalized())?;
     let param_override = match &input.param_override {
         Some(v) => Some(serde_json::to_string(v)?),
         None => None,
@@ -173,8 +193,9 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
                 "UPDATE providers SET tag=?1, name=?2, kind=?3, base_url=?4,
                      api_key = COALESCE(?5, api_key), auth_style=?6, protocols=?7,
                      extra_headers=?8, param_override=?9, model_mapping=?10, weight=?11,
-                     priority=?12, enabled=?13, timeout_ms=?14, updated_at=?15
-                 WHERE id=?16",
+                     priority=?12, enabled=?13, timeout_ms=?14, updated_at=?15,
+                     proxy=?16
+                 WHERE id=?17",
             )
             .bind(&input.tag)
             .bind(&input.name)
@@ -191,6 +212,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(input.enabled as i64)
             .bind(input.timeout_ms)
             .bind(now)
+            .bind(&proxy)
             .bind(id)
             .execute(pool)
             .await?;
@@ -204,8 +226,8 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             let result = sqlx::query(
                 "INSERT INTO providers (tag, name, kind, base_url, api_key, auth_style,
                      protocols, extra_headers, param_override, model_mapping, weight, priority,
-                     enabled, timeout_ms, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+                     enabled, timeout_ms, created_at, updated_at, proxy)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16)",
             )
             .bind(&input.tag)
             .bind(&input.name)
@@ -222,6 +244,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(input.enabled as i64)
             .bind(input.timeout_ms)
             .bind(now)
+            .bind(&proxy)
             .execute(pool)
             .await
             .map_err(|e| {
@@ -586,6 +609,7 @@ pub async fn channels_for_model(pool: &SqlitePool, model: &str) -> AppResult<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::models::ChannelProxyMode;
 
     fn input(tag: &str) -> ProviderInput {
         ProviderInput {
@@ -604,6 +628,7 @@ mod tests {
             priority: 0,
             enabled: true,
             timeout_ms: 600_000,
+            proxy: Default::default(),
         }
     }
 
@@ -996,5 +1021,80 @@ mod tests {
             .unwrap();
 
         assert_eq!(all_declared_models(&p).await.unwrap(), vec!["a", "z"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 代理
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_new_channel_inherits_the_global_proxy() {
+        let p = pool().await;
+        let created = upsert(&p, &input("a")).await.unwrap();
+        assert_eq!(created.proxy, ChannelProxy::default());
+    }
+
+    #[tokio::test]
+    async fn the_channel_proxy_roundtrips_through_the_database() {
+        let p = pool().await;
+        let mut i = input("a");
+        i.proxy = ChannelProxy {
+            mode: ChannelProxyMode::Manual,
+            url: Some("socks5://127.0.0.1:1080".into()),
+        };
+        let created = upsert(&p, &i).await.unwrap();
+        assert_eq!(created.proxy.mode, ChannelProxyMode::Manual);
+
+        let read = get(&p, created.id).await.unwrap().unwrap();
+        assert_eq!(
+            read.proxy.url.as_deref(),
+            Some("socks5://127.0.0.1:1080"),
+            "重新读出来必须还是那个代理，否则重启后渠道会悄悄改走直连"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_can_switch_a_channel_back_to_direct() {
+        let p = pool().await;
+        let mut i = input("a");
+        i.proxy = ChannelProxy {
+            mode: ChannelProxyMode::Direct,
+            url: None,
+        };
+        let created = upsert(&p, &i).await.unwrap();
+
+        let mut upd = input("a");
+        upd.id = Some(created.id);
+        upd.proxy = ChannelProxy::default();
+        let saved = upsert(&p, &upd).await.unwrap();
+        assert_eq!(saved.proxy.mode, ChannelProxyMode::Inherit);
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_proxy_scheme_is_rejected_before_it_reaches_the_database() {
+        // 拖到构造客户端才发现写错，表现是"请求全失败"而没有任何指向配置的提示。
+        let p = pool().await;
+        let mut i = input("a");
+        i.proxy = ChannelProxy {
+            mode: ChannelProxyMode::Manual,
+            url: Some("ftp://127.0.0.1:21".into()),
+        };
+        let err = upsert(&p, &i).await.unwrap_err().to_string();
+        assert!(err.contains("代理地址"), "错误要指明是代理写错了: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_row_predating_the_proxy_column_reads_as_inherit() {
+        // 迁移只加列不回填，老库里的行是 NULL。
+        let p = pool().await;
+        let created = upsert(&p, &input("a")).await.unwrap();
+        sqlx::query("UPDATE providers SET proxy = NULL WHERE id = ?1")
+            .bind(created.id)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        let read = get(&p, created.id).await.unwrap().unwrap();
+        assert_eq!(read.proxy.mode, ChannelProxyMode::Inherit);
     }
 }

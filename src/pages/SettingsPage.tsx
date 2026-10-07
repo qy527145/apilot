@@ -10,9 +10,29 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { qk, useAppInfo, useSettings } from "@/hooks/queries";
-import { api, type AppSettings } from "@/lib/api";
+import { api, type AppSettings, type ProxyMode } from "@/lib/api";
+
+const PROXY_MODE_LABEL: Record<ProxyMode, string> = {
+  system: "跟随环境变量",
+  direct: "始终直连",
+  manual: "使用指定代理",
+};
+
+const PROXY_MODE_HINT: Record<ProxyMode, string> = {
+  system:
+    "按 HTTPS_PROXY / ALL_PROXY / HTTP_PROXY（大小写都看）决定。没配就直连。",
+  direct: "不走任何代理，环境变量里配了也不走。",
+  manual: "所有渠道默认走下面这个地址。留空等同于直连。",
+};
 
 export default function SettingsPage() {
   const qc = useQueryClient();
@@ -134,6 +154,58 @@ export default function SettingsPage() {
                   />
                 </div>
               </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">网络代理</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>出站方式</Label>
+                  <Select
+                    value={form.proxy.mode}
+                    onValueChange={(v) =>
+                      set("proxy", { ...form.proxy, mode: v as ProxyMode })
+                    }
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(Object.keys(PROXY_MODE_LABEL) as ProxyMode[]).map((m) => (
+                        <SelectItem key={m} value={m}>
+                          {PROXY_MODE_LABEL[m]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label>代理地址</Label>
+                  <Input
+                    value={form.proxy.url ?? ""}
+                    disabled={form.proxy.mode !== "manual"}
+                    onChange={(e) =>
+                      set("proxy", { ...form.proxy, url: e.target.value })
+                    }
+                    placeholder="socks5://127.0.0.1:1080"
+                  />
+                </div>
+              </div>
+              <p className="text-muted-foreground text-xs">
+                {PROXY_MODE_HINT[form.proxy.mode]}
+                <br />
+                支持 <code>http://</code>、<code>https://</code>、
+                <code>socks5://</code>、<code>socks5h://</code>
+                （<code>socks5h</code> 由代理解析域名，能绕开 DNS 污染）。
+                <br />
+                回环与私有网段（<code>127.0.0.1</code>、<code>192.168.*</code>{" "}
+                等）始终直连，本地模型服务不会因为这里配了代理而连不上。
+                单个渠道可以在渠道对话框里单独设置。
+              </p>
             </CardContent>
           </Card>
 

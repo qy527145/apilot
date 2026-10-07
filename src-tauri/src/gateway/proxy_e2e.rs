@@ -21,7 +21,13 @@ use crate::protocol::oai_chat::{ChatStreamDecoder, ChatStreamEncoder};
 use crate::protocol::dto::Protocol;
 use crate::storage::models::{AuthStyle, Provider, ProviderKind};
 use crate::upstream::channel::Channel;
+use crate::upstream::client::{build_with, ProxySpec};
 use crate::upstream::outbound::{Outbound, UpstreamBody};
+
+/// e2e 都打本地假上游，直连即可 —— 也用不上宿主机的环境代理。
+fn direct_client() -> reqwest::Client {
+    build_with(&ProxySpec::Direct)
+}
 
 /// 上游收到的请求快照，用于断言出站请求确实带上了该带的东西。
 #[derive(Debug, Default, Clone)]
@@ -109,6 +115,7 @@ fn provider(base_url: &str, kind: ProviderKind) -> Provider {
         priority: 0,
         enabled: true,
         timeout_ms: 30_000,
+        proxy: Default::default(),
         created_at: 0,
         updated_at: 0,
     }
@@ -195,7 +202,7 @@ async fn run_pipeline(
 #[tokio::test]
 async fn cross_protocol_stream_end_to_end() {
     let (base, captured) = spawn_upstream(ANTHROPIC_SSE).await;
-    let channel = Channel::new(provider(&base, ProviderKind::Anthropic), crate::upstream::client::build());
+    let channel = Channel::new(provider(&base, ProviderKind::Anthropic), direct_client());
 
     let (bytes, outcome, _) = run_pipeline(&channel, true).await;
     let downstream = String::from_utf8_lossy(&bytes).to_string();
@@ -238,7 +245,7 @@ async fn cross_protocol_stream_end_to_end() {
 #[tokio::test]
 async fn same_protocol_stream_passes_through_byte_for_byte() {
     let (base, _captured) = spawn_upstream(ANTHROPIC_SSE).await;
-    let channel = Channel::new(provider(&base, ProviderKind::Anthropic), crate::upstream::client::build());
+    let channel = Channel::new(provider(&base, ProviderKind::Anthropic), direct_client());
 
     let (bytes, outcome, _) = run_pipeline(&channel, false).await;
     let downstream = String::from_utf8_lossy(&bytes).to_string();
@@ -262,7 +269,7 @@ async fn outbound_url_follows_channel_protocol_not_client_protocol() {
     let (base, captured) = spawn_upstream(CHAT_SSE).await;
     let channel = Channel::new(
         provider(&base, ProviderKind::OpenAiChat),
-        crate::upstream::client::build(),
+        direct_client(),
     );
 
     let prepared = channel
@@ -291,7 +298,7 @@ async fn chat_upstream_to_anthropic_client_end_to_end() {
     let (base, _captured) = spawn_upstream(CHAT_SSE).await;
     let channel = Channel::new(
         provider(&base, ProviderKind::OpenAiChat),
-        crate::upstream::client::build(),
+        direct_client(),
     );
 
     let prepared = channel
@@ -334,7 +341,7 @@ async fn unreachable_upstream_reports_a_connect_error() {
     // 指向一个没人监听的端口
     let channel = Channel::new(
         provider("http://127.0.0.1:1", ProviderKind::Anthropic),
-        crate::upstream::client::build(),
+        direct_client(),
     );
 
     let prepared = channel
@@ -364,7 +371,7 @@ async fn request_direction_conversion_reaches_upstream_correctly() {
     let (base, captured) = spawn_upstream(CHAT_SSE).await;
     let channel = Channel::new(
         provider(&base, ProviderKind::OpenAiChat),
-        crate::upstream::client::build(),
+        direct_client(),
     );
 
     let codecs = crate::protocol::codec::CodecRegistry::new();
@@ -455,7 +462,7 @@ async fn sse_body_can_be_decoded_into_a_complete_response() {
 async fn bare_sse_body_is_reconstructible_from_single_chunk() {
     // 模拟"上游一次性返回整个 SSE 正文"的场景（非流式请求打到了只回 SSE 的上游）
     let (base, _cap) = spawn_upstream(ANTHROPIC_SSE).await;
-    let channel = Channel::new(provider(&base, ProviderKind::Anthropic), crate::upstream::client::build());
+    let channel = Channel::new(provider(&base, ProviderKind::Anthropic), direct_client());
 
     let prepared = channel
         .prepare(Protocol::AnthropicMessages, &HeaderMap::new(), Bytes::from_static(b"{}"), false) // 非流式
@@ -500,7 +507,7 @@ async fn buffered_upstream_response_is_handled() {
 
     let channel = Channel::new(
         provider(&format!("http://{addr}"), ProviderKind::Anthropic),
-        crate::upstream::client::build(),
+        direct_client(),
     );
     let prepared = channel
         .prepare(
@@ -540,7 +547,7 @@ async fn client_protocol_is_used_verbatim_when_the_channel_supports_it() {
     let (base, captured) = spawn_upstream(ANTHROPIC_SSE).await;
     let mut p = provider(&base, ProviderKind::Anthropic);
     declare_both_protocols(&mut p);
-    let channel = Channel::new(p, crate::upstream::client::build());
+    let channel = Channel::new(p, direct_client());
 
     let raw = br#"{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
     let wire = channel.wire_for(Protocol::AnthropicMessages);
@@ -567,7 +574,7 @@ async fn channel_without_the_incoming_protocol_converts_to_its_preferred_one() {
     let (base, captured) = spawn_upstream(CHAT_SSE).await;
     let channel = Channel::new(
         provider(&base, ProviderKind::OpenAiChat),
-        crate::upstream::client::build(),
+        direct_client(),
     );
 
     let wire = channel.wire_for(Protocol::AnthropicMessages);
@@ -581,4 +588,30 @@ async fn channel_without_the_incoming_protocol_converts_to_its_preferred_one() {
     let _ = channel.dial(prepared).await.unwrap();
     let reqs = captured.lock().unwrap();
     assert_eq!(reqs[0].path, "/v1/chat/completions");
+}
+
+/// 配了代理也不能把回环地址送出去。
+///
+/// 这是「回环与私有网段必须直连」那条铁律的端到端验证：本地模型服务
+/// （ollama / LM Studio）常年跑在 127.0.0.1，一旦被送到代理上就是 502，
+/// 表现为"本地模型连不上"，而日志里只看得见一次失败的连接。
+///
+/// 代理指向一个必然连不上的端口 —— 只要请求真的走了代理，这条就会失败。
+#[tokio::test]
+async fn a_configured_proxy_never_swallows_loopback_requests() {
+    let (base, captured) = spawn_upstream(ANTHROPIC_SSE).await;
+
+    for url in ["http://127.0.0.1:1", "socks5://127.0.0.1:1"] {
+        let channel = Channel::new(
+            provider(&base, ProviderKind::Anthropic),
+            build_with(&ProxySpec::Proxied { url: url.into() }),
+        );
+        let (bytes, _, _) = run_pipeline(&channel, false).await;
+        assert!(
+            !bytes.is_empty(),
+            "{url}: 目标是回环地址，必须直连而不是交给代理"
+        );
+    }
+
+    assert_eq!(captured.lock().unwrap().len(), 2, "两次都该真的打到上游");
 }

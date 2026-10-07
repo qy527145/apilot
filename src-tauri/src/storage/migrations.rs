@@ -254,6 +254,14 @@ UPDATE provider_models SET
   priority = COALESCE((SELECT p.priority FROM providers p WHERE p.id = provider_models.provider_id), priority),
   weight   = COALESCE((SELECT p.weight   FROM providers p WHERE p.id = provider_models.provider_id), weight);
 "#,
+    // --- v5: 渠道级代理 ---
+    //
+    // 上游服务商经常连不上，得走代理；但本地模型服务又必须直连。所以代理要能
+    // 按渠道覆盖，不能只有一个全局开关。存 JSON（与 extra_headers 同形态），
+    // NULL / '{}' 都表示"跟随全局" —— 老行不需要回填。
+    r#"
+ALTER TABLE providers ADD COLUMN proxy TEXT;
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -265,7 +273,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

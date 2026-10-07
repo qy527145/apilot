@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 
 use super::channel::Channel;
+use super::client::{self, ClientPool};
 use super::outbound::Outbound;
-use crate::storage::models::Provider;
+use crate::config::settings::ProxySettings;
+use crate::storage::models::{ChannelProxy, Provider};
 
 /// 全部渠道的热可换注册表。
 ///
@@ -16,20 +18,53 @@ use crate::storage::models::Provider;
 pub struct ProviderRegistry {
     by_tag: DashMap<String, Arc<dyn Outbound>>,
     default_tag: ArcSwapOption<String>,
-    client: reqwest::Client,
+    /// 按代理记忆化的客户端池。渠道用哪个由它的 `ChannelProxy` 与全局设置共同决定。
+    clients: Arc<ClientPool>,
+    /// 全局代理设置。`reload` 用它解析"跟随全局"的渠道。
+    global_proxy: ArcSwap<ProxySettings>,
+    /// 探测 / 拉模型列表用的客户端（= 全局设置解析出来的那个）。
+    default_client: ArcSwap<reqwest::Client>,
 }
 
 impl ProviderRegistry {
+    /// 用现成的客户端建注册表。所有渠道、所有代理设置都用它 —— 测试用这个，
+    /// 免得每个用例都真去建连接池。
     pub fn new(client: reqwest::Client) -> Self {
-        Self {
-            by_tag: DashMap::new(),
-            default_tag: ArcSwapOption::empty(),
-            client,
-        }
+        Self::with_pool(Arc::new(ClientPool::fixed(client)))
     }
 
-    pub fn client(&self) -> &reqwest::Client {
-        &self.client
+    pub fn with_pool(clients: Arc<ClientPool>) -> Self {
+        let registry = Self {
+            by_tag: DashMap::new(),
+            default_tag: ArcSwapOption::empty(),
+            clients,
+            global_proxy: ArcSwap::from_pointee(ProxySettings::default()),
+            default_client: ArcSwap::from_pointee(reqwest::Client::new()),
+        };
+        registry.refresh_default_client();
+        registry
+    }
+
+    /// 探测 / 拉模型列表用的客户端（跟随全局代理设置）。
+    pub fn client(&self) -> reqwest::Client {
+        self.default_client.load().as_ref().clone()
+    }
+
+    /// 某个渠道实际该用的客户端。探测与真实请求必须走同一条解析路径，
+    /// 否则会出现"测试连通走全局代理、真发请求走渠道代理"这种自相矛盾的结论。
+    pub fn client_for(&self, proxy: &ChannelProxy) -> reqwest::Client {
+        let spec = client::resolve_channel(proxy, &self.global_proxy.load());
+        self.clients.get(spec)
+    }
+
+    pub fn set_global_proxy(&self, proxy: ProxySettings) {
+        self.global_proxy.store(Arc::new(proxy));
+        self.refresh_default_client();
+    }
+
+    fn refresh_default_client(&self) {
+        let spec = client::resolve_global(&self.global_proxy.load());
+        self.default_client.store(Arc::new(self.clients.get(spec)));
     }
 
     pub fn insert(&self, outbound: Arc<dyn Outbound>) {
@@ -60,11 +95,13 @@ impl ProviderRegistry {
         v
     }
 
-    /// 全量替换。旧渠道的 `Arc` 若仍被在途请求持有，会自然存活到请求结束。
+    /// 全量替换。旧渠道的 `Arc` 若仍被在途请求持有，会自然存活到请求结束 ——
+    /// 所以换代理不会打断在途请求，也不需要重启。
     pub fn reload(&self, providers: &[Provider]) {
         self.by_tag.clear();
         for p in providers {
-            let ch = Channel::new(p.clone(), self.client.clone());
+            let client = self.client_for(&p.proxy);
+            let ch = Channel::new(p.clone(), client);
             self.insert(Arc::new(ch));
         }
     }
@@ -106,6 +143,7 @@ mod tests {
             priority: 0,
             enabled: true,
             timeout_ms: 600_000,
+            proxy: Default::default(),
             created_at: 0,
             updated_at: 0,
         }

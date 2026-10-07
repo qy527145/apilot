@@ -168,10 +168,15 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | `outbound.rs` | `Outbound` trait（`tag` / `wire` / `prepare` / `dial`）、`PreparedRequest`、`UpstreamResponse` / `UpstreamBody`、`UpstreamError::is_retryable` |
 | `channel.rs` | `Channel` —— 唯一的 HTTP 实现。转发请求头时的**剔除清单**、鉴权头注入、`looks_like_json` 判定 |
 | `registry.rs` | `ProviderRegistry`：`DashMap<String, Arc<dyn Outbound>>` + `ArcSwapOption<String>` 默认渠道 |
-| `client.rs` | 共享 `reqwest::Client`，**`NO_PROXY_LIST`**（回环与私有网段绕过系统代理） |
+| `client.rs` | 共享 `reqwest::Client` 与**出站代理**。`ProxySpec`（解析结果，也是 `ClientPool` 的缓存键）、`resolve_global` / `resolve_channel`（把设置折算成 spec）、`NO_PROXY_LIST`（回环与私有网段绕过代理） |
 
 **出站 URL 由渠道的线协议决定，与入站路径无关**：客户端说 Anthropic，
 渠道是 OpenAI 类型时就该发到 `/v1/chat/completions`。
+
+**代理分两级**：全局 `AppSettings.proxy`（跟随环境变量 / 直连 / 指定地址），
+渠道 `Provider.proxy`（跟随全局 / 直连 / 指定地址）。解析成 `ProxySpec` 后按它
+在 `ClientPool` 里取客户端 —— 客户端数量 = 不同代理地址数，不是渠道数。
+`Direct` 分支必须显式 `no_proxy()`，否则 reqwest 会自己读环境变量绕过「直连」。
 
 ---
 
@@ -310,7 +315,7 @@ apilot://cache             → CacheStats
 |---|---|
 | `shell.rs` | **`AppShell`** —— 所有共享依赖的唯一所有权根（db / settings / registry / selectors / router / pricing / cache / aggregates / traffic / events / gateway）。`bootstrap()` 装配全部状态；`reload_*()` 做配置热重载；`spawn_background_tasks()` 跑流量推送、聚合落库、日志清理 |
 | `config/paths.rs` | 全部路径解析。用 `dirs::home_dir()` 而非 `HOME` 环境变量；`APILOT_HOME` 可覆盖数据根目录 |
-| `config/settings.rs` | `AppSettings`（单条 JSON 存 `settings_kv`）、`normalized()` 夹取非法值。`ModelPolicy` 也在这里：两级模式 + 客户端覆盖 + 自定义规则，**`normalized()` 同时负责老存档的折算**（`"off"` 靠 serde alias，`per_client` 的字符串值靠 untagged —— 认不出一个枚举串会让整份设置回落默认值） |
+| `config/settings.rs` | `AppSettings`（单条 JSON 存 `settings_kv`）、`normalized()` 夹取非法值。`ModelPolicy` 也在这里：两级模式 + 客户端覆盖 + 自定义规则，**`normalized()` 同时负责老存档的折算**（`"off"` 靠 serde alias，`per_client` 的字符串值靠 untagged —— 认不出一个枚举串会让整份设置回落默认值）。`ProxySettings` 同理：`#[serde(other)]` 的 `Unknown` 兜住拼错的模式串 |
 | `error.rs` | `AppError`：同时实现 `Serialize`（给 Tauri）与 `IntoResponse`（给 axum） |
 | `util.rs` | `now_ms` / `now_secs` / `hour_bucket` / `mask_secret` |
 
@@ -323,7 +328,7 @@ apilot://cache             → CacheStats
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
 | `model_policies` | `model` | 每个模型的渠道选择策略（priority / latency / weight + 手动选中的渠道）。**没有行 = 交给 selector 与路由规则** |
-| `providers` | `tag` 唯一 | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、模型映射、权重、超时 |
+| `providers` | `tag` 唯一 | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、模型映射、权重、超时、**代理覆盖**（`proxy`，NULL = 跟随全局） |
 | `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃**。`set_models` 会把声明同步派生成 `providers.model_mapping`（见下） |
 | `route_rules` | `id` | 规则链，按 `sort_index` 求值；`items` / `action` 存 JSON |
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |

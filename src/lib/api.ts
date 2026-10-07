@@ -9,6 +9,23 @@ export type Protocol = "anthropic" | "openai_chat" | "openai_responses";
 export type ProviderKind = "anthropic" | "openai_chat" | "openai_responses";
 export type AuthStyle = "bearer" | "x-api-key" | "none";
 
+/** 渠道级代理怎么选。与后端 `ChannelProxyMode` 一一对应。 */
+export type ChannelProxyMode = "inherit" | "direct" | "manual";
+
+export interface ChannelProxy {
+  mode: ChannelProxyMode;
+  /** 支持 http:// / https:// / socks5:// / socks5h://。 */
+  url?: string | null;
+}
+
+/** 全局出站代理怎么选。与后端 `ProxyMode` 一一对应。 */
+export type ProxyMode = "direct" | "system" | "manual";
+
+export interface ProxySettings {
+  mode: ProxyMode;
+  url?: string | null;
+}
+
 /** 协议名 → 中文标签。多处复用，避免同一个名字在三个页面里写法不一致。 */
 export const PROTOCOL_LABEL: Record<Protocol, string> = {
   anthropic: "Anthropic Messages",
@@ -57,6 +74,8 @@ export interface ProviderInput {
   priority: number;
   enabled: boolean;
   timeout_ms: number;
+  /** 该渠道走不走代理。省略表示跟随全局设置。 */
+  proxy?: ChannelProxy;
 }
 
 export interface Provider {
@@ -74,6 +93,7 @@ export interface Provider {
   priority: number;
   enabled: boolean;
   timeout_ms: number;
+  proxy: ChannelProxy;
   created_at: number;
   updated_at: number;
 }
@@ -213,6 +233,8 @@ export interface AppSettings {
   cache_max_entries: number;
   /** 模型替换。默认 `mode: "passthrough"`（不改写）。 */
   model_policy: ModelPolicy;
+  /** 全局出站代理。默认 `mode: "system"`（跟随环境变量）。 */
+  proxy: ProxySettings;
 }
 
 /* ------------------------------ 路由规则 ------------------------------ */

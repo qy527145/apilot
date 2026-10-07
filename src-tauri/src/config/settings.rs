@@ -350,6 +350,48 @@ fn is_valid_regex(pattern: &str) -> bool {
     regex::Regex::new(pattern).is_ok()
 }
 
+/// 全局出站代理怎么选。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    /// 强制直连：机器上配着 `HTTPS_PROXY` 也不走。
+    Direct,
+    /// 跟随环境变量（`HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY`，大小写都看）。
+    /// 默认值 —— 与引入本功能之前的行为逐字等价。
+    #[default]
+    System,
+    /// 用 `url` 指定的那个地址。
+    Manual,
+    /// 认不出的取值。理由同 `ModelPolicyMode::Unknown`：不能让一个拼错的串
+    /// 把整份设置打回默认值，那会连带丢掉用户配的监听端口、超时、模型策略。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 全局代理设置。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxySettings {
+    pub mode: ProxyMode,
+    /// `mode == Manual` 时的地址，支持 `http:// https:// socks5:// socks5h://`。
+    pub url: Option<String>,
+}
+
+impl ProxySettings {
+    pub fn normalized(mut self) -> Self {
+        if self.mode == ProxyMode::Unknown {
+            self.mode = ProxyMode::System;
+        }
+        self.url = trimmed(&self.url);
+        // 选了「自定义」却没填地址，等价于直连 —— 在 resolve 里体现，
+        // 这里只把模式收回去，免得界面上显示成"自定义代理"却什么都没配。
+        if self.mode == ProxyMode::Manual && self.url.is_none() {
+            self.mode = ProxyMode::Direct;
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -377,6 +419,9 @@ pub struct AppSettings {
 
     /// 全局模型替换。默认关闭。
     pub model_policy: ModelPolicy,
+
+    /// 全局出站代理。默认跟随环境变量 —— 与引入本功能之前逐字等价。
+    pub proxy: ProxySettings,
 }
 
 impl Default for AppSettings {
@@ -398,6 +443,7 @@ impl Default for AppSettings {
             cache_max_entries: 1000,
 
             model_policy: ModelPolicy::default(), // 默认关闭
+            proxy: ProxySettings::default(),      // 默认跟随环境变量
         }
     }
 }
@@ -424,6 +470,7 @@ impl AppSettings {
         self.cache_max_entries = self.cache_max_entries.clamp(1, 100_000);
         self.capture_max_entries = self.capture_max_entries.clamp(1, 100_000);
         self.model_policy = self.model_policy.normalized();
+        self.proxy = self.proxy.normalized();
         self
     }
 
@@ -749,5 +796,64 @@ mod tests {
             target: target.map(String::from),
             ..Default::default()
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 代理设置
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_old_settings_file_without_a_proxy_block_still_loads() {
+        // 老存档里没有 proxy 字段，必须回落成"跟随环境变量"而不是整份设置打回默认 ——
+        // 后者会连带丢掉用户配的监听端口、超时、模型策略。
+        let old = r#"{"listen_port": 9999, "cache_enabled": true}"#;
+        let s: AppSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.listen_port, 9999);
+        assert_eq!(s.proxy.mode, ProxyMode::System);
+        assert_eq!(s.proxy.url, None);
+    }
+
+    #[test]
+    fn a_misspelled_proxy_mode_falls_back_to_system_not_to_a_reset() {
+        // `#[serde(other)]` 的意义：认不出的枚举串只影响它自己那一项。
+        let raw = r#"{"listen_port": 9999, "proxy": {"mode": "soocks5"}}"#;
+        let s: AppSettings = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.listen_port, 9999);
+        assert_eq!(s.proxy.mode, ProxyMode::Unknown);
+        assert_eq!(s.normalized().proxy.mode, ProxyMode::System);
+    }
+
+    #[test]
+    fn a_blank_proxy_url_is_cleared() {
+        let s = AppSettings {
+            proxy: ProxySettings {
+                mode: ProxyMode::Manual,
+                url: Some("   ".into()),
+            },
+            ..Default::default()
+        };
+        assert_eq!(s.normalized().proxy.url, None);
+    }
+
+    #[test]
+    fn manual_mode_without_a_url_becomes_direct() {
+        // 界面上"选了自定义却没填地址"很常见；留着 Manual 会显示成配了代理，
+        // 实际却不生效，不如直接折成直连。
+        let s = ProxySettings {
+            mode: ProxyMode::Manual,
+            url: None,
+        };
+        assert_eq!(s.normalized().mode, ProxyMode::Direct);
+    }
+
+    #[test]
+    fn a_real_proxy_url_survives_normalization() {
+        let s = ProxySettings {
+            mode: ProxyMode::Manual,
+            url: Some("  socks5://127.0.0.1:1080  ".into()),
+        };
+        let n = s.normalized();
+        assert_eq!(n.mode, ProxyMode::Manual);
+        assert_eq!(n.url.as_deref(), Some("socks5://127.0.0.1:1080"));
     }
 }

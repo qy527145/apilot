@@ -256,6 +256,7 @@ mod tests {
             priority: 0,
             enabled: true,
             timeout_ms: 600_000,
+            proxy: Default::default(),
             created_at: 0,
             updated_at: 0,
         }

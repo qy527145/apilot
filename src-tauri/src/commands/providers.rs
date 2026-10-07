@@ -137,7 +137,10 @@ pub async fn probe(shell: &Arc<AppShell>, provider: &Provider) -> ProbeResult {
     let started = Instant::now();
 
     let url = provider.endpoint("/v1/models");
-    let req = authed_get(shell.registry.client(), provider, &url);
+    // 用该渠道自己的代理：探测结论必须与真实请求一致，否则会出现
+    //「测试连通失败，但网关转发能过」这种自相矛盾的提示。
+    let client = shell.registry.client_for(&provider.proxy);
+    let req = authed_get(&client, provider, &url);
 
     match req
         .timeout(std::time::Duration::from_secs(15))
@@ -246,7 +249,8 @@ pub async fn fetch_provider_models(
         .ok_or_else(|| AppError::ProviderNotFound(id.to_string()))?;
 
     let url = provider.endpoint("/v1/models");
-    let req = authed_get(shell.registry.client(), &provider, &url);
+    let client = shell.registry.client_for(&provider.proxy);
+    let req = authed_get(&client, &provider, &url);
 
     let resp = req
         .timeout(std::time::Duration::from_secs(20))
@@ -425,6 +429,7 @@ mod tests {
             priority: 0,
             enabled: true,
             timeout_ms: 60_000,
+            proxy: Default::default(),
             created_at: 0,
             updated_at: 0,
         };

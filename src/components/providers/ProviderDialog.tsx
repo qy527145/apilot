@@ -31,6 +31,7 @@ import {
   PROTOCOL_DEFAULT_PATH,
   PROTOCOL_LABEL,
   type AuthStyle,
+  type ChannelProxyMode,
   type Protocol,
   type Provider,
   type ProviderInput,
@@ -61,6 +62,8 @@ interface FormState {
   enabled: boolean;
   extra_headers: Record<string, string>;
   param_override: string;
+  proxy_mode: ChannelProxyMode;
+  proxy_url: string;
 }
 
 const EMPTY: FormState = {
@@ -80,6 +83,14 @@ const EMPTY: FormState = {
   enabled: true,
   extra_headers: {},
   param_override: "",
+  proxy_mode: "inherit",
+  proxy_url: "",
+};
+
+const PROXY_MODE_LABEL: Record<ChannelProxyMode, string> = {
+  inherit: "跟随全局设置",
+  direct: "直连（不走代理）",
+  manual: "使用指定代理",
 };
 
 /** 某协议当前生效的路径：覆盖过就用覆盖值，否则用协议默认值。 */
@@ -144,6 +155,9 @@ function toForm(p: Provider): FormState {
     param_override: p.param_override
       ? JSON.stringify(p.param_override, null, 2)
       : "",
+    // 后端可能给 null（老行没迁移过），前端这一栏统一用 inherit 兜底。
+    proxy_mode: p.proxy?.mode ?? "inherit",
+    proxy_url: p.proxy?.url ?? "",
   };
 }
 
@@ -247,6 +261,10 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
       priority: Number(form.priority) || 0,
       enabled: form.enabled,
       timeout_ms: Number(form.timeout_ms) || 60000,
+      proxy: {
+        mode: form.proxy_mode,
+        url: form.proxy_url.trim() ? form.proxy_url.trim() : null,
+      },
     };
     setError(null);
     mutation.mutate(input);
@@ -487,6 +505,39 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
               keyPlaceholder="Header 名"
               valuePlaceholder="Header 值"
             />
+          </div>
+
+          <div className="space-y-2 rounded-md border p-3">
+            <Label className="text-sm">代理</Label>
+            <p className="text-muted-foreground text-xs">
+              「直连」是给本地模型服务（ollama / LM Studio）用的：全局配了公司代理时，
+              只有它能保证请求留在本机。回环与私有网段本来就会绕过代理。
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Select
+                value={form.proxy_mode}
+                onValueChange={(v) => set("proxy_mode", v as ChannelProxyMode)}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {(Object.keys(PROXY_MODE_LABEL) as ChannelProxyMode[]).map(
+                    (m) => (
+                      <SelectItem key={m} value={m}>
+                        {PROXY_MODE_LABEL[m]}
+                      </SelectItem>
+                    ),
+                  )}
+                </SelectContent>
+              </Select>
+              <Input
+                value={form.proxy_url}
+                disabled={form.proxy_mode !== "manual"}
+                onChange={(e) => set("proxy_url", e.target.value)}
+                placeholder="socks5://127.0.0.1:1080"
+              />
+            </div>
           </div>
 
           <div className="space-y-2">

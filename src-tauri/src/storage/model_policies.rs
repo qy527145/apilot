@@ -109,6 +109,7 @@ mod tests {
                 priority: 0,
                 enabled: true,
                 timeout_ms: 60_000,
+                proxy: Default::default(),
             },
         )
         .await
