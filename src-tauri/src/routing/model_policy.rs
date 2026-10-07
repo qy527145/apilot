@@ -695,6 +695,59 @@ mod tests {
         );
     }
 
+    // ---- 跨模块：策略判定 + 真的 JS 引擎 ----
+    //
+    // 判定与执行器各自单测都过、连起来却不工作，是这类功能最典型的坏法。
+    // 下面这几条走的是和管线同一根线：真 policy、真 QuickJS。
+    struct RealScripts {
+        has_channels: bool,
+    }
+
+    impl ModelEnv for RealScripts {
+        fn has_channels(&self, _: &str) -> bool {
+            self.has_channels
+        }
+
+        fn run_script(&self, source: &str, input: &ScriptInput<'_>) -> Option<String> {
+            crate::routing::model_script::run(source, input)
+        }
+    }
+
+    #[test]
+    fn a_script_policy_actually_runs_through_the_real_engine() {
+        let env = RealScripts {
+            has_channels: true,
+        };
+        let p = script_policy(Some(
+            "function resolve(ctx) { return ctx.client === 'codex' ? 'codex-model' : null; }",
+        ));
+
+        assert_eq!(
+            resolve(&p, &req("codex", "gpt-5"), &env).as_deref(),
+            Some("codex-model"),
+            "脚本拿得到客户端，返回值也该被用上"
+        );
+        assert_eq!(
+            resolve(&p, &req("claude-code", "claude-sonnet-5"), &env),
+            None,
+            "返回 null 就是不改写"
+        );
+    }
+
+    #[test]
+    fn a_hanging_script_through_the_real_engine_keeps_the_requested_model() {
+        let env = RealScripts {
+            has_channels: true,
+        };
+        let p = script_policy(Some("function resolve(ctx) { while (true) {} }"));
+
+        assert_eq!(
+            resolve(&p, &req("codex", "gpt-5"), &env),
+            None,
+            "脚本死循环也必须按不改写处理，请求不能失败"
+        );
+    }
+
     // ---- 兜底 ----
 
     #[test]
