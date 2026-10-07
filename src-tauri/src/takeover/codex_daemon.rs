@@ -53,6 +53,21 @@ impl DaemonRestart {
 }
 
 /// 重启 Codex 的 app-server（仅当它正在运行）。
+///
+/// ## 有一类失败是环境造成的，不是代码问题
+///
+/// 实测踩过：Windows 上返回
+/// `this Windows launcher prevents background processes from outliving it`
+/// + `拒绝访问。(os error 5)`。原因在 Codex 那边：它用 `CREATE_BREAKAWAY_FROM_JOB`
+/// 起一个探针进程来判断"我能不能派生一个独立的后台进程"
+/// （`app-server-daemon/src/backend/windows.rs::ensure_detached_launch`，那里的注释写着
+/// *"An outer system job may remain attached"*）。**如果我们这个进程本身处在一个不允许
+/// breakaway 的 Windows 作业对象里**（从 IDE 的调试器 / 任务启动时常见），探针就会拿到
+/// ACCESS_DENIED，Codex 据此拒绝重启守护进程。
+///
+/// 这种情况下我们做什么都没用：从作业对象内部派生不出独立进程，加什么创建标志都一样。
+/// 所以失败路径只负责把话说清楚（见 [`DaemonRestart::note`]），让用户在一个普通终端里
+/// 执行那条命令 —— 从外部启动就不受这个限制了。
 pub fn restart_if_running() -> DaemonRestart {
     match run(&["app-server", "daemon", "version"]) {
         Ok(stdout) if !is_running(&stdout) => DaemonRestart::NotRunning,
@@ -78,12 +93,14 @@ fn is_running(stdout: &str) -> bool {
 fn run(args: &[&str]) -> Result<String, String> {
     let out = spawn(args)?;
     if !out.status.success() {
+        // 只留开头一段：这条消息要嵌进界面上的提示，塞满一整篇 stderr 反而看不清
+        // 重点（真要细节的去日志里找）。
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let tail: String = stderr.trim().chars().take(200).collect();
-        return Err(if tail.is_empty() {
+        let head: String = stderr.trim().chars().take(200).collect();
+        return Err(if head.is_empty() {
             format!("codex {} 退出码 {:?}", args.join(" "), out.status.code())
         } else {
-            tail
+            head
         });
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())

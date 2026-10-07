@@ -241,11 +241,9 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 GPT 系名字，就会落到 Codex 自己的兜底元数据上（那里没有 `apply_patch`），于是
 **「配了目录」和「换了模型名」互相抵消** —— 配了半天一点用没有。
 
-**接管不会自动用它。** 默认那条路是「给客户端换一个它不认识的模型名」（见上面 takeover
-一节）：一行配置、不联网、不依赖客户端开关，代价是没有 `apply_patch`。这里这份是给
-**想要完整元数据、特别是想要 `apply_patch` 的人手动配**的 —— 自己写 `model_catalog_url`
-指向 `CATALOG_PATH`，外加 `[features] api_key_model_discovery = true`（不打开这个开关
-Codex 根本不会去取）。早先接管流程自动写过一版，那两个开关让侵入性变得太大，撤了。
+**接管会不会用它，由 `AppSettings::client_model_mode` 决定**（客户端页四选一，默认 `off`）：
+`catalog` / `both` 会把 `model_catalog_url` 写进客户端配置，`off` / `rename` 则会把
+它（和那两个开关）**删掉**。细节与四个模式各自的取舍见上面 takeover 一节。
 
 > 这两条路现在**互补**：目录取到 → 完整元数据（含 `apply_patch`）；取不到（网关没起 /
 > 目录被撤）→ 退回 Codex 兜底，经典工具集、没有 `apply_patch`，但至少不是 Lite。
@@ -336,19 +334,28 @@ quota           += tool_call_surcharge × 工具调用次数
 判据是「客户端现在指的地址 ≠ 目标地址」，不是整份文件比 —— 后者会把用户手加的模型覆盖、
 密钥也当成"不一致"，然后被 `plan_apply` 抹掉。
 
-**Codex 多写的一样东西：模型名**（`plan_codex`，只在开关打开时写）。
+**Codex 还会按模式多写两样东西**（`plan_codex` + `AppSettings::client_model_mode`，
+客户端页四选一，默认 `off`）。两样都在解决同一件事：**别让客户端走 Responses Lite**
+（工具塞进 `input[].additional_tools`）—— 那形状对不少上游是**静默失效**的：收下请求、
+返回 200、工具一个不认，模型只能把调用写成 DSML 正文。
 
-Codex 用不用 Responses Lite 只由模型元数据决定，而 GPT 系名字在它**内置目录**里是
-Lite（工具塞进 `input[].additional_tools`）—— 那个形状对不少上游是**静默失效**的：
-收下请求、返回 200、工具一个不认，模型只能把调用写成 DSML 正文。换成一个它不认识的
-名字，元数据退回兜底那份（经典顶层 `tools`），**不用联网、不依赖任何客户端开关**。
+| 模式 | 写什么 | 换来什么 / 代价 |
+|---|---|---|
+| `off` | 无 | 什么都不碰 |
+| `rename` | `model` | 换成 Codex 不认识的模型名 → 元数据退回兜底那份（经典顶层 `tools`）。**不用联网、不依赖任何客户端开关**；代价是没有 `apply_patch`，且按模型名配的路由规则会跟着变 |
+| `catalog` | `model_catalog_url` + `features.api_key_model_discovery` + `suppress_unstable_features_warning` | 拿到完整元数据（**含 `apply_patch`**）；代价是要多写两个开关、客户端启动时得够得着网关（取不到会静默退回 Lite） |
+| `both` | 上面两套 | 互补：目录取不到时正好轮到名字那条路兜底 |
 
-代价：兜底元数据不带 `apply_patch`（模型改用 shell 写文件），且按模型名配的路由规则会
-跟着变。所以它是**用户显式打开**的（`AppSettings::client_model`，客户端页的开关，默认关）。
+两个细节值得记住：
 
-> 早先还写过一版自动注入 `model_catalog_url` + 两个 feature 开关的（见
-> [`codex/`](#codex--发给客户端的模型目录)），一次接管多三行、其中一个还是 Codex 的
-> 「开发中特性」，侵入性太大，撤成了**手动可选**。
+- **`model` 键只写不删。** 那是用户原本选的模型名，被我们覆盖过之后已经拿不回来了；
+  删掉只会退回 Codex 的默认模型 —— 也就是又走 Lite。想恢复原值只有「还原」。
+  目录那**三个键则会删**：留着不是"无害的残留"（客户端还在拉我们的目录、一个开发中
+  特性还开着、一个全局的「别警告我」开关还挂着，而用户界面上已经关掉了它），所以
+  `patch::TomlOp` 加了 `Remove*`。代价是：万一用户在我们接管**之前**就自己设过同名键，
+  切回 `off` 会把他的值一并清掉 —— 撞车极罕见，且比"留着我们塞进去的东西"好解释；
+  要精确回到原样就用「还原」（写回接管前的原始字节）。
+- **改模式要重新接管一次**才生效（判据只看地址，见下）。
 
 Claude Code / Gemini 那边**没有**注入模型：Claude 的接管反而是**清掉**模型覆盖键的，
 要给它注入得先想清楚和那个动作的关系。

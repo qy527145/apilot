@@ -433,21 +433,88 @@ pub struct AppSettings {
     /// 全局模型替换。默认关闭。
     pub model_policy: ModelPolicy,
 
-    /// 接管客户端时，把「当前配置的模型」也写进客户端配置。
-    ///
-    /// **为什么需要这个开关。** Codex 用不用 Responses Lite 只由模型元数据决定，而
-    /// GPT 系名字内置就是 Lite（工具塞进 `input[].additional_tools`）—— 那个形状对
-    /// 不少上游是**静默失效**的：收下请求、返回 200、工具一个不认，模型只能把调用
-    /// 写成 DSML 正文。换成一个它不认识的名字，元数据就退回兜底那份（经典工具集）。
-    ///
-    /// **为什么默认关。** 它会覆盖用户在客户端里选的模型名；而按模型名配的路由规则、
-    /// 每模型渠道选择都会跟着变。对"模型策略已经把模型定死"的人（`Always` / `Fallback`
-    /// 且指定了 `active_model`）它是无副作用的，但那是用户自己该判断的事。
-    #[serde(default)]
-    pub inject_client_model: bool,
+    /// 接管客户端时怎么让客户端「正确地说话」。默认什么都不做。
+    #[serde(
+        default,
+        // 旧键名。值那边由 `de_client_model_mode` 兼容（`true` = 只写模型名）。
+        alias = "inject_client_model",
+        deserialize_with = "de_client_model_mode"
+    )]
+    pub client_model_mode: ClientModelMode,
 
     /// 全局出站代理。默认跟随环境变量 —— 与引入本功能之前逐字等价。
     pub proxy: ProxySettings,
+}
+
+/// 接管时对客户端模型配置做什么。
+///
+/// 两个手段解决同一件事的两个方面（详见 `crate::codex`）：
+///
+/// - **改模型名**：Codex 用不用 Responses Lite 只由模型元数据决定，而 GPT 系名字在它
+///   内置目录里就是 Lite（工具塞进 `input[].additional_tools`），不少上游对这形状
+///   **收下、200、静默忽略**。换一个它不认识的名字，元数据退回兜底那份 —— 经典顶层
+///   `tools`，不联网、不依赖任何客户端开关。代价是兜底元数据没有 `apply_patch`。
+/// - **下发目录**：把网关的模型目录地址写进客户端，让 Codex 拿完整元数据（**含
+///   `apply_patch`**）。代价是要多写两个 Codex 的开关、且客户端启动时得够得着网关
+///   （取不到会静默退回内置目录，也就是 Lite）。
+///
+/// 两个是**互补**的（`Both`），因为目录取不到时正好轮到名字那条路兜底。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientModelMode {
+    /// 不碰客户端自己选的模型。
+    #[default]
+    Off,
+    /// 只写模型名。
+    Rename,
+    /// 只写模型目录地址（外加让它生效的两个开关）。
+    Catalog,
+    /// 两个都写。
+    Both,
+}
+
+impl ClientModelMode {
+    /// 认不出的值一律当成 [`Self::Off`]。
+    ///
+    /// 不能报错：`AppSettings` 是**整份** JSON 反序列化，任何一处出错都会让 `load()`
+    /// 落到 `Self::default()`，把用户的端口、超时、缓存设置一起冲掉。以后加模式名时，
+    /// 老版本读到新名字也只该是"这个我不认识，那就别动"，而不是把人家设置清空。
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "rename" => Self::Rename,
+            "catalog" => Self::Catalog,
+            "both" => Self::Both,
+            _ => Self::Off,
+        }
+    }
+
+    /// 要不要把模型名写进客户端配置。
+    fn writes_model(self) -> bool {
+        matches!(self, Self::Rename | Self::Both)
+    }
+
+    /// 要不要把目录地址（+ 两个开关）写进客户端配置。
+    fn writes_catalog(self) -> bool {
+        matches!(self, Self::Catalog | Self::Both)
+    }
+}
+
+/// 读模式，顺便吃掉旧存档里那个布尔开关。
+///
+/// 那个字段（`inject_client_model`）只活了一天，但用户已经存过 `true` —— 直接换成枚举
+/// 会让它变成未知字段、静默丢掉，用户会以为"我开的开关怎么自己关了"。`true` 就等于
+/// 现在的「只写模型名」。
+fn de_client_model_mode<'de, D>(deserializer: D) -> Result<ClientModelMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw {
+        serde_json::Value::Bool(true) => ClientModelMode::Rename,
+        serde_json::Value::Bool(false) => ClientModelMode::Off,
+        serde_json::Value::String(s) => ClientModelMode::parse(&s),
+        _ => ClientModelMode::Off,
+    })
 }
 
 impl Default for AppSettings {
@@ -469,7 +536,7 @@ impl Default for AppSettings {
             cache_max_entries: 1000,
 
             model_policy: ModelPolicy::default(), // 默认关闭
-            inject_client_model: false,            // 默认不碰客户端选的模型
+            client_model_mode: ClientModelMode::default(), // 默认不碰客户端的模型配置
             proxy: ProxySettings::default(),      // 默认跟随环境变量
         }
     }
@@ -478,11 +545,11 @@ impl Default for AppSettings {
 impl AppSettings {
     /// 接管 `client` 时要写进它配置的模型名；不该写时是 `None`。
     ///
-    /// 三个条件缺一不可：开关开着、这个客户端的生效规则**指定了**模型、且那个模式
-    /// 真的会用它。`Custom` 和 `Passthrough` 都没有一个「Apilot 指定的模型名」可写 ——
-    /// 前者的模型要跑规则才知道，后者压根不改写，硬写一个名字反而会改变选路。
+    /// 两个条件缺一不可：模式要求写名字、且这个客户端的生效规则**指定了**模型。
+    /// `Custom` 和 `Passthrough` 都没有一个「Apilot 指定的模型名」可写 —— 前者的模型
+    /// 要跑规则才知道，后者压根不改写，硬写一个名字反而会改变选路。
     pub fn client_model(&self, client: &str) -> Option<&str> {
-        if !self.inject_client_model {
+        if !self.client_model_mode.writes_model() {
             return None;
         }
         let rule = self.model_policy.effective(client);
@@ -490,6 +557,11 @@ impl AppSettings {
             ModelPolicyMode::Always | ModelPolicyMode::Fallback => rule.model,
             _ => None,
         }
+    }
+
+    /// 接管时要不要把网关的模型目录地址也写进客户端配置。
+    pub fn inject_catalog(&self) -> bool {
+        self.client_model_mode.writes_catalog()
     }
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.listen_host, self.listen_port)
@@ -799,10 +871,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_client_model_needs_the_switch_and_a_named_model() {
-        // 开关关着时一个字都不写 —— 这是默认，用户选的模型名不该被我们改掉。
+    fn off_mode_writes_nothing() {
+        // 默认：用户自己选的模型名一个字都不该被我们改掉。
         let settings = AppSettings {
-            inject_client_model: false,
+            client_model_mode: ClientModelMode::Off,
             model_policy: ModelPolicy {
                 mode: ModelPolicyMode::Fallback,
                 active_model: Some("deepseek-chat".into()),
@@ -811,13 +883,53 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(settings.client_model("codex"), None);
+        assert!(!settings.inject_catalog());
+    }
 
-        // 打开开关、且策略真的指定了模型 —— 这时才有一个"Apilot 配置的模型"可写。
+    #[test]
+    fn rename_mode_writes_the_named_model_only() {
         let settings = AppSettings {
-            inject_client_model: true,
-            ..settings
+            client_model_mode: ClientModelMode::Rename,
+            model_policy: ModelPolicy {
+                mode: ModelPolicyMode::Fallback,
+                active_model: Some("deepseek-chat".into()),
+                ..Default::default()
+            },
+            ..Default::default()
         };
         assert_eq!(settings.client_model("codex"), Some("deepseek-chat"));
+        assert!(!settings.inject_catalog(), "只写名字时不该顺手塞目录地址");
+    }
+
+    #[test]
+    fn catalog_mode_injects_the_catalog_and_leaves_the_name_alone() {
+        // 「只下发目录」是给"客户端名字别动、但要 apply_patch"的人用的。
+        let settings = AppSettings {
+            client_model_mode: ClientModelMode::Catalog,
+            model_policy: ModelPolicy {
+                mode: ModelPolicyMode::Fallback,
+                active_model: Some("deepseek-chat".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(settings.client_model("codex"), None);
+        assert!(settings.inject_catalog());
+    }
+
+    #[test]
+    fn both_mode_does_both() {
+        let settings = AppSettings {
+            client_model_mode: ClientModelMode::Both,
+            model_policy: ModelPolicy {
+                mode: ModelPolicyMode::Fallback,
+                active_model: Some("deepseek-chat".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(settings.client_model("codex"), Some("deepseek-chat"));
+        assert!(settings.inject_catalog());
     }
 
     #[test]
@@ -825,7 +937,7 @@ mod tests {
         // Passthrough 的意思就是"不改写客户端要的模型"，所以没有一个名字能写进
         // 客户端配置；硬写一个反而会改变选路。
         let settings = AppSettings {
-            inject_client_model: true,
+            client_model_mode: ClientModelMode::Both,
             model_policy: ModelPolicy {
                 mode: ModelPolicyMode::Passthrough,
                 active_model: Some("deepseek-chat".into()),
@@ -850,13 +962,36 @@ mod tests {
             ClientOverride::Legacy("deepseek-reasoner".into()),
         );
         let settings = AppSettings {
-            inject_client_model: true,
+            client_model_mode: ClientModelMode::Rename,
             model_policy: policy,
             ..Default::default()
         };
 
         assert_eq!(settings.client_model("codex"), Some("deepseek-reasoner"));
         assert_eq!(settings.client_model("claude-code"), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn the_old_bool_setting_still_means_rename() {
+        // 那个布尔开关只活了一天，但用户已经存过 true。直接换成枚举会让它变成未知
+        // 字段被静默丢掉，用户会以为"我开的开关怎么自己关了"。
+        let old: AppSettings = serde_json::from_str(r#"{"inject_client_model":true}"#).unwrap();
+        assert_eq!(old.client_model_mode, ClientModelMode::Rename);
+
+        let off: AppSettings = serde_json::from_str(r#"{"inject_client_model":false}"#).unwrap();
+        assert_eq!(off.client_model_mode, ClientModelMode::Off);
+    }
+
+    #[test]
+    fn an_unknown_mode_name_never_resets_the_whole_settings() {
+        // `AppSettings` 是整份反序列化，**任何一处出错**都会让 `load()` 落到默认值，
+        // 把用户的端口、超时、缓存一起冲掉。所以认不出的模式名只能是"我不认识，那我
+        // 别动"，绝不能报错 —— 以后加模式名时，老版本读到新名字才不至于清空设置。
+        let s: AppSettings =
+            serde_json::from_str(r#"{"listen_port":9999,"client_model_mode":"some_future_mode"}"#)
+                .unwrap();
+        assert_eq!(s.client_model_mode, ClientModelMode::Off);
+        assert_eq!(s.listen_port, 9999, "认不出的模式名不该把端口打回默认值");
     }
 
     #[test]

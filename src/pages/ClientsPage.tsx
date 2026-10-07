@@ -12,7 +12,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -30,8 +36,33 @@ import {
 } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { qk, useSettings } from "@/hooks/queries";
-import { api, type AppSettings, type ClientDetect } from "@/lib/api";
+import { api, type AppSettings, type ClientDetect, type ClientModelMode } from "@/lib/api";
 import { cn } from "@/lib/utils";
+
+/// 四种模式各自的说明。文案要能让人在不看源码的情况下选对 —— 尤其"有没有 apply_patch"
+/// 和"依不依赖网关"这两条代价。
+const MODES: { value: ClientModelMode; label: string; hint: string }[] = [
+  {
+    value: "off",
+    label: "不碰客户端配置",
+    hint: "接管只改网关地址。客户端用什么模型由它自己决定 —— 如果它是 GPT 系名字，Codex 会走 Responses Lite。",
+  },
+  {
+    value: "rename",
+    label: "只写模型名",
+    hint: "把 Apilot 当前配置的模型写进客户端。不依赖网关、不用联网，但 Codex 会失去 apply_patch（改用 shell 写文件），且按模型名配的路由规则会跟着变。",
+  },
+  {
+    value: "catalog",
+    label: "只下发模型目录",
+    hint: "让 Codex 来取网关的模型元数据，含 apply_patch。要多写两个 Codex 开关，且客户端启动时网关得可达 —— 取不到会静默退回 Lite。",
+  },
+  {
+    value: "both",
+    label: "两个都写（推荐）",
+    hint: "目录取到 → 完整元数据（含 apply_patch）；取不到（网关没起 / 目录被撤）→ 模型名那条路兜底：经典工具集，没有 apply_patch，但至少不是 Lite。",
+  },
+];
 
 export default function ClientsPage({
   onNavigate,
@@ -58,19 +89,15 @@ export default function ClientsPage({
   });
   const blocked = readiness ? !readiness.ready : false;
 
-  // 这个开关存在全局设置里（`AppSettings.inject_client_model`），但它的效果只在
+  // 这个模式存在全局设置里（`AppSettings.client_model_mode`），但它的效果只在
   // 「接管」这一步发生，所以放在这一页而不是设置页。
   const { data: settings } = useSettings();
-  const saveInject = useMutation({
-    mutationFn: (inject: boolean) =>
-      api.updateSettings({ ...(settings as AppSettings), inject_client_model: inject }),
+  const saveMode = useMutation({
+    mutationFn: (mode: ClientModelMode) =>
+      api.updateSettings({ ...(settings as AppSettings), client_model_mode: mode }),
     onSuccess: (s) => {
       qc.setQueryData(qk.settings, s);
-      toast.success(
-        s.inject_client_model
-          ? "已开启：下次接管会把当前模型写进客户端配置"
-          : "已关闭：接管不再改动客户端选的模型",
-      );
+      toast.success("已保存；重新接管一次才会写进客户端配置");
     },
   });
 
@@ -144,25 +171,34 @@ export default function ClientsPage({
         )}
 
         <Card>
-          <CardContent className="flex items-start justify-between gap-4 py-4">
+          <CardContent className="space-y-3 py-4">
             <div className="space-y-1">
-              <Label>接管时写入当前模型</Label>
+              <Label>接管时怎么处理模型配置</Label>
               <p className="text-muted-foreground text-xs">
-                把「当前配置的模型」写进客户端配置。对 Codex 尤其有用：GPT 系模型名会让
-                它走 Responses Lite，工具被塞进 input 里的 additional_tools；而有些上游
-                收下这种请求、返回 200，工具却一个都不认，模型只能把工具调用当正文吐出来。
-                换成一个它不认识的名字，元数据就退回经典工具集。
-              </p>
-              <p className="text-muted-foreground text-xs">
-                代价：Codex 会失去 apply_patch（改用 shell 写文件），按模型名配的路由规则
-                也会跟着变。改完这个开关要重新接管一次才生效。
+                Codex 用不用 Responses Lite 只由它的模型元数据决定，而 GPT 系名字内置就是
+                Lite —— 工具被塞进 input 里的 additional_tools。有些上游收下这种请求、返回
+                200，工具却一个都不认，模型只能把工具调用当正文吐出来。
               </p>
             </div>
-            <Switch
-              checked={settings?.inject_client_model ?? false}
-              onCheckedChange={(v) => saveInject.mutate(v)}
-              disabled={!settings || saveInject.isPending}
-            />
+            <Select
+              value={settings?.client_model_mode ?? "off"}
+              onValueChange={(v) => saveMode.mutate(v as ClientModelMode)}
+              disabled={!settings || saveMode.isPending}
+            >
+              <SelectTrigger className="w-full sm:w-80">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {MODES.map((m) => (
+                  <SelectItem key={m.value} value={m.value}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-muted-foreground text-xs">
+              {MODES.find((m) => m.value === (settings?.client_model_mode ?? "off"))?.hint}
+            </p>
           </CardContent>
         </Card>
 

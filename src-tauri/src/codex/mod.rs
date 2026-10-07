@@ -93,6 +93,15 @@ const GENERIC_PROMPT: &str = include_str!("../../assets/codex/prompt.md");
 /// 以及客户端启动时必须够得着网关 —— 取不到会静默退回它内置那份（也就是 Lite）。
 pub const CATALOG_PATH: &str = "/codex/models";
 
+/// 交给客户端的 `model_catalog_url`。
+///
+/// 和 `ClientId::stored_base_url` 一样，是「网关地址 → 写进客户端配置的地址」这条唯一
+/// 路径的一部分：网关换地址时 `repoint_taken_over` 会重新生成，所以这里不接受任何别处
+/// 来的地址。
+pub fn catalog_url(base_url: &str) -> String {
+    format!("{}{CATALOG_PATH}", base_url.trim_end_matches('/'))
+}
+
 /// 打过补丁的内置目录（`{"models": [...]}`），首次访问时构建。
 ///
 /// 用 `OnceLock` 而不是每次重算：四百多 KB 的解析没必要每个请求做一遍。**只有内置

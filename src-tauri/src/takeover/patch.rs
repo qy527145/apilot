@@ -120,6 +120,14 @@ pub enum TomlOp {
         key: String,
         value: TomlValue,
     },
+    /// 删掉顶层键。不存在时是空操作。
+    ///
+    /// 为什么需要"删"：接管会写下一些键，当用户把对应的选项关掉时，**留着它们就是
+    /// 静默的副作用**（客户端还在拉我们的目录、一个开发中特性还开着）。"我拥有的键，
+    /// 不要了就清掉"和"只动我拥有的键"是同一条原则的两面。
+    RemoveTop { key: String },
+    /// 删掉某个表下的键。表或键不存在时是空操作（**不会**顺手把表建出来）。
+    RemoveInTable { table: String, key: String },
 }
 
 #[derive(Debug, Clone)]
@@ -158,10 +166,28 @@ pub fn patch_toml(original: &[u8], ops: &[TomlOp]) -> AppResult<Vec<u8>> {
                 let t = get_or_create_table(doc.as_table_mut(), &split_path(table));
                 t[key.as_str()] = value.clone().into_item();
             }
+            TomlOp::RemoveTop { key } => {
+                doc.as_table_mut().remove(key.as_str());
+            }
+            TomlOp::RemoveInTable { table, key } => {
+                // 走"找"而不是"建"：删一个不存在的表是空操作，绝不能顺手把表建出来。
+                if let Some(t) = find_table(doc.as_table_mut(), &split_path(table)) {
+                    t.remove(key.as_str());
+                }
+            }
         }
     }
 
     Ok(doc.to_string().into_bytes())
+}
+
+/// 逐级取子表，任一环缺失就返回 `None`（**不创建**）。
+fn find_table<'a>(table: &'a mut Table, parts: &[&str]) -> Option<&'a mut Table> {
+    let Some((head, rest)) = parts.split_first() else {
+        return Some(table);
+    };
+    let next = table.get_mut(*head)?.as_table_mut()?;
+    find_table(next, rest)
 }
 
 /// 按 `.` 切分表路径。

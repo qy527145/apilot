@@ -228,8 +228,18 @@ export interface GatewayStatus {
   error?: string | null;
 }
 
-export interface AppSettings {
-  listen_host: string;
+/**
+ * 接管客户端时对它模型配置做什么。
+ *
+ * - `off`：不碰（默认）。
+ * - `rename`：写模型名。绕开 Codex 的 Responses Lite，不依赖网关，代价是没有 apply_patch。
+ * - `catalog`：下发模型目录地址。拿到完整元数据（含 apply_patch），代价是要多写两个
+ *   Codex 开关、且客户端启动时得够得着网关。
+ * - `both`：两个都写 —— 目录取不到时正好轮到名字那条路兜底。
+ */
+export type ClientModelMode = "off" | "rename" | "catalog" | "both";
+
+export interface AppSettings {  listen_host: string;
   listen_port: number;
   autostart_gateway: boolean;
   first_byte_timeout_ms: number;
@@ -243,12 +253,11 @@ export interface AppSettings {
   /** 模型替换。默认 `mode: "passthrough"`（不改写）。 */
   model_policy: ModelPolicy;
   /**
-   * 接管客户端时，把「当前配置的模型」也写进客户端配置。
+   * 接管客户端时怎么让客户端「正确地说话」。默认 `"off"`（不碰客户端配置）。
    *
-   * 默认关。主要给 Codex 用：GPT 系模型名在它内置目录里会走 Responses Lite，
-   * 工具被塞进 `input[].additional_tools`，而有些上游对这形状是静默失效的。
+   * 两个手段解决同一件事的两面，详见 `src-tauri/src/codex/mod.rs`。
    */
-  inject_client_model: boolean;
+  client_model_mode: ClientModelMode;
   /** 全局出站代理。默认 `mode: "system"`（跟随环境变量）。 */
   proxy: ProxySettings;
 }

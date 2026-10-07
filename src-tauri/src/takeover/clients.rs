@@ -93,14 +93,11 @@ impl ClientId {
 
     /// 生成接管改动。
     ///
-    /// `client_model` 是要写进客户端配置的模型名（见 `AppSettings::client_model`）；
-    /// `None` 表示不碰客户端自己选的模型。**目前只有 Codex 消费它** —— 那儿的动机是
-    /// 绕开 Responses Lite（见 `plan_codex`）；Claude Code 那边我们反而是**清掉**模型
-    /// 覆盖键的，真要给它注入模型得先想清楚和那个动作的关系。
-    pub fn plan_apply(&self, base_url: &str, client_model: Option<&str>) -> AppResult<Vec<FilePatch>> {
+    /// `plan` 是接管时要写进它配置的东西（见 [`ClientPlan`]）。
+    pub fn plan_apply(&self, base_url: &str, plan: ClientPlan<'_>) -> AppResult<Vec<FilePatch>> {
         match self {
             Self::ClaudeCode => plan_claude(base_url),
-            Self::Codex => plan_codex(base_url, client_model),
+            Self::Codex => plan_codex(base_url, plan),
             Self::GeminiCli => plan_gemini(base_url),
         }
     }
@@ -111,10 +108,37 @@ impl ClientId {
     }
 }
 
+/// 接管时要写进客户端配置的东西。
+///
+/// 由 `AppSettings` 按客户端算好再传进来 —— 这里不直接依赖设置，接管计划才能拿固定
+/// 输入测试。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientPlan<'a> {
+    /// 写进配置的模型名；`None` = 不碰客户端自己选的模型。
+    ///
+    /// **目前只有 Codex 消费它** —— 那儿的动机是绕开 Responses Lite（见 `plan_codex`）；
+    /// Claude Code 那边我们反而是**清掉**模型覆盖键的，真要给它注入得先想清楚和那个
+    /// 动作的关系。
+    pub model: Option<&'a str>,
+    /// 是否把网关的模型目录地址（+ 让目录生效的那两个开关）也写进配置。
+    ///
+    /// 目录是 Codex 独有的东西，所以同样只有它消费。
+    pub catalog: bool,
+}
+
+impl<'a> ClientPlan<'a> {
+    /// 从设置里读：同一个客户端，接管和重新指向两条路都要用一致的值。
+    pub fn from_settings(settings: &'a crate::config::AppSettings, client: &str) -> Self {
+        Self {
+            model: settings.client_model(client),
+            catalog: settings.inject_catalog(),
+        }
+    }
+}
+
 /// 客户端的展示信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientInfo {
-    pub id: String,
+pub struct ClientInfo {    pub id: String,
     pub name: String,
     pub config_path: String,
     pub detected: bool,
@@ -187,7 +211,8 @@ pub fn repoint_taken_over(
         }
 
         // 重跑一遍接管计划：改动只落在 floor keys 上，用户自己写的键原样保留。
-        let patches = id.plan_apply(base_url, settings.client_model(id.as_str()))?;
+        let plan = ClientPlan::from_settings(settings, id.as_str());
+        let patches = id.plan_apply(base_url, plan)?;
         let plan = TakeoverPlan {
             client: id.display_name().to_string(),
             files: Vec::new(),
@@ -258,7 +283,7 @@ fn read_claude_base_url() -> Option<String> {
 // Codex
 // ---------------------------------------------------------------------------
 
-fn plan_codex(base_url: &str, client_model: Option<&str>) -> AppResult<Vec<FilePatch>> {
+fn plan_codex(base_url: &str, plan: ClientPlan<'_>) -> AppResult<Vec<FilePatch>> {
     let path = paths::codex_config_path();
     let original = patch::read_optional(&path)?.unwrap_or_default();
 
@@ -266,7 +291,7 @@ fn plan_codex(base_url: &str, client_model: Option<&str>) -> AppResult<Vec<FileP
     // 自定义 provider 走 experimental_bearer_token，不依赖 auth.json。
     Ok(vec![FilePatch {
         path,
-        content: Some(codex_config(&original, base_url, client_model)?),
+        content: Some(codex_config(&original, base_url, plan)?),
     }])
 }
 
@@ -277,7 +302,7 @@ fn plan_codex(base_url: &str, client_model: Option<&str>) -> AppResult<Vec<FileP
 fn codex_config(
     original: &[u8],
     base_url: &str,
-    client_model: Option<&str>,
+    plan: ClientPlan<'_>,
 ) -> AppResult<Vec<u8>> {
     let table = format!("model_providers.{}", floor::CODEX_PROVIDER_NAME);
     // Codex 会在 base_url 后面拼 `/responses`，所以这里带上 /v1。
@@ -312,7 +337,8 @@ fn codex_config(
             value: TomlValue::Bool(false),
         },
         TomlOp::SetInTable {
-            table,
+            // 后面两半还要用这个名字，所以这里只克隆。
+            table: table.clone(),
             key: "experimental_bearer_token".into(),
             value: TomlValue::Str(floor::LOCAL_PLACEHOLDER_KEY.into()),
         },
@@ -324,12 +350,64 @@ fn codex_config(
     // 退回兜底那份 —— 经典顶层 `tools`，不用联网、不依赖任何开关。
     //
     // 代价要认：兜底元数据不带 `apply_patch`，模型会改用 shell 写文件；而且按模型名配的
-    // 路由规则会跟着变。所以这是**用户显式打开**的开关，不是默认行为。
-    if let Some(model) = client_model {
+    // 路由规则会跟着变。所以这是**用户显式选**的模式，不是默认行为。
+    //
+    // 反过来的情况（模式不再要名字了）**不删这个键**：那是用户原本选的名字，被我们
+    // 覆盖过之后已经拿不回来了，删掉只会退回 Codex 的默认模型 —— 也就是又走 Lite。
+    // 想恢复原值只有「还原」（备份里有）。
+    if let Some(model) = plan.model {
         ops.push(TomlOp::SetTop {
             key: "model".into(),
             value: TomlValue::Str(model.to_string()),
         });
+    }
+
+    // 目录那三行：让 Codex 来取我们这份元数据（**含 `apply_patch`**）。取到就有完整
+    // 元数据，取不到它会静默退回内置目录 —— 所以这个模式要和「写模型名」一起用才有
+    // 兜底，理由见 `crate::codex`。
+    if plan.catalog {
+        ops.extend([
+            TomlOp::SetInTable {
+                table: table.clone(),
+                key: "model_catalog_url".into(),
+                value: TomlValue::Str(crate::codex::catalog_url(base_url)),
+            },
+            // 拉 `model_catalog_url` 挂在 `api_key_model_discovery` 后面，不开就永远
+            // 不去取，上面那行等于白写（实测才发现，0.160.x 里它还是开发中特性）。
+            TomlOp::SetInTable {
+                table: "features".into(),
+                key: "api_key_model_discovery".into(),
+                value: TomlValue::Bool(true),
+            },
+            // 上一条会被归到「开发中特性」，每开一次会话都提示「可能行为不可预期」。
+            // 这个开关只关掉警告本身，不影响它提示别的开发中特性。
+            TomlOp::SetTop {
+                key: "suppress_unstable_features_warning".into(),
+                value: TomlValue::Bool(true),
+            },
+        ]);
+    } else {
+        // 模式关掉了就把它们清掉。留着不是"无害的残留"：客户端还在拉我们的目录、一个
+        // 开发中特性还开着、一个全局的「别警告我」开关还挂着，而用户在界面上已经关掉了
+        // 它 —— 静默的副作用。
+        //
+        // 取舍说明白：这三个键是我们写进去的，所以关掉时也由我们清掉。万一用户在我们
+        // 接管**之前**就自己设过同名键，切回 off 会把他的值一并清掉 —— 这种撞车极罕见，
+        // 而且比"留着我们塞进去的东西"更容易解释；真要精确回到原样，用「还原」（它写的
+        // 是接管前的原始字节）。
+        ops.extend([
+            TomlOp::RemoveInTable {
+                table,
+                key: "model_catalog_url".into(),
+            },
+            TomlOp::RemoveInTable {
+                table: "features".into(),
+                key: "api_key_model_discovery".into(),
+            },
+            TomlOp::RemoveTop {
+                key: "suppress_unstable_features_warning".into(),
+            },
+        ]);
     }
 
     patch::patch_toml(original, &ops)
@@ -459,14 +537,30 @@ name = "kt"
 base_url = "http://192.168.31.1:3000/v1"
 "#;
 
-    fn codex_doc(original: &[u8], model: Option<&str>) -> toml_edit::DocumentMut {
-        let out = codex_config(original, "http://127.0.0.1:8787", model).unwrap();
+    fn codex_doc(original: &[u8], plan: ClientPlan<'_>) -> toml_edit::DocumentMut {
+        let out = codex_config(original, "http://127.0.0.1:8787", plan).unwrap();
         String::from_utf8(out).unwrap().parse().unwrap()
+    }
+
+    /// 只写模型名、不写目录。
+    fn model_named(name: &str) -> ClientPlan<'_> {
+        ClientPlan {
+            model: Some(name),
+            catalog: false,
+        }
+    }
+
+    /// 只写目录、不碰模型名。
+    fn with_catalog() -> ClientPlan<'static> {
+        ClientPlan {
+            model: None,
+            catalog: true,
+        }
     }
 
     #[test]
     fn codex_plan_sets_provider_and_wire_api() {
-        let doc = codex_doc(CODEX_ORIGINAL, None);
+        let doc = codex_doc(CODEX_ORIGINAL, ClientPlan::default());
 
         assert_eq!(
             doc["model_provider"].as_str(),
@@ -492,7 +586,7 @@ base_url = "http://192.168.31.1:3000/v1"
         // 而这形状对不少上游是**静默失效**的（收下请求、返回 200、工具一个不认）。
         // 换成一个它不认识的名字，元数据就退回兜底那份 —— 经典顶层 `tools`，
         // 不联网、不依赖任何客户端开关。
-        let doc = codex_doc(CODEX_ORIGINAL, Some("deepseek-flash"));
+        let doc = codex_doc(CODEX_ORIGINAL, model_named("deepseek-flash"));
         assert_eq!(doc["model"].as_str(), Some("deepseek-flash"));
     }
 
@@ -500,7 +594,7 @@ base_url = "http://192.168.31.1:3000/v1"
     fn codex_plan_model_injection_keeps_neighbouring_keys() {
         // 铁律：只动「我拥有」的键。往顶层写 `model` 不能顺手抹掉旁边的设置，
         // 也不能碰用户别的 provider。
-        let doc = codex_doc(CODEX_ORIGINAL, Some("deepseek-flash"));
+        let doc = codex_doc(CODEX_ORIGINAL, model_named("deepseek-flash"));
 
         assert_eq!(doc["model_reasoning_effort"].as_str(), Some("medium"));
         assert_eq!(
@@ -510,15 +604,65 @@ base_url = "http://192.168.31.1:3000/v1"
     }
 
     #[test]
+    fn catalog_mode_writes_the_three_keys_and_leaves_the_name_alone() {
+        // 「下发目录」是给"想保留客户端自己的模型名、但要有 apply_patch"的人用的：
+        // 这三行一个都不能少 —— 少了 `api_key_model_discovery`，Codex 根本不去取那个
+        // 地址，上一行等于白写（实测过）。
+        let doc = codex_doc(CODEX_ORIGINAL, with_catalog());
+
+        let provider = &doc["model_providers"][floor::CODEX_PROVIDER_NAME];
+        assert_eq!(
+            provider["model_catalog_url"].as_str(),
+            Some("http://127.0.0.1:8787/codex/models")
+        );
+        assert_eq!(
+            doc["features"]["api_key_model_discovery"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            doc["suppress_unstable_features_warning"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(doc["model"].as_str(), Some("gpt-6-sol"), "不该动客户端的模型名");
+    }
+
+    #[test]
+    fn turning_the_catalog_back_off_removes_its_keys() {
+        // 留着不是"无害的残留"：客户端还在拉我们的目录、一个开发中特性还开着，而用户
+        // 在界面上已经关掉了它。用户自己写在同一张表里的其他键不能被顺手清掉。
+        let already = br#"model_provider = "apilot"
+model_catalog_url_present = "noop"
+
+[features]
+api_key_model_discovery = true
+keep_me = true
+"#;
+        // 先按「开」写进去，模拟用户之前开着。
+        let on = codex_config(already, "http://127.0.0.1:8787", with_catalog()).unwrap();
+        let then_off = codex_config(&on, "http://127.0.0.1:8787", ClientPlan::default()).unwrap();
+        let doc: toml_edit::DocumentMut =
+            String::from_utf8(then_off).unwrap().parse().unwrap();
+
+        assert!(doc["model_providers"][floor::CODEX_PROVIDER_NAME]
+            .get("model_catalog_url")
+            .is_none());
+        assert!(doc["features"].get("api_key_model_discovery").is_none());
+        assert!(doc.get("suppress_unstable_features_warning").is_none());
+        assert_eq!(doc["features"]["keep_me"].as_bool(), Some(true));
+        // 顶层的无关键也不能被删模式扫掉。
+        assert_eq!(doc["model_catalog_url_present"].as_str(), Some("noop"));
+    }
+
+    #[test]
     fn codex_plan_only_touches_config_toml() {
-        let patches = plan_codex("http://127.0.0.1:8787", None).unwrap();
+        let patches = plan_codex("http://127.0.0.1:8787", ClientPlan::default()).unwrap();
         assert_eq!(patches.len(), 1, "auth.json 必须不被触碰");
         assert!(patches[0].path.ends_with("config.toml"));
     }
 
     #[test]
     fn codex_plan_trailing_slash_does_not_double_up() {
-        let out = codex_config(CODEX_ORIGINAL, "http://127.0.0.1:8787/", None).unwrap();
+        let out = codex_config(CODEX_ORIGINAL, "http://127.0.0.1:8787/", ClientPlan::default()).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("http://127.0.0.1:8787/v1"));
         assert!(!text.contains("8787//v1"));
@@ -589,7 +733,7 @@ base_url = "http://192.168.31.1:3000/v1"
             Some(ClientId::ClaudeCode.stored_base_url(url).as_str())
         );
 
-        let codex = codex_config(CODEX_ORIGINAL, url, None).unwrap();
+        let codex = codex_config(CODEX_ORIGINAL, url, ClientPlan::default()).unwrap();
         let doc: toml_edit::DocumentMut =
             String::from_utf8(codex).unwrap().parse().unwrap();
         assert_eq!(
