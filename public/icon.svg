@@ -1,0 +1,44 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!--
+    Apilot 图标源文件。
+    改这个文件后用 `bunx tauri icon src-tauri/icons/icon.svg -o src-tauri/icons` 重新生成全套位图，
+    并把它复制到 `public/icon.svg`（index.html 的 favicon 引用的是那一份，两处需手工同步）。
+
+    图形语义：一条入站路径在分叉点裂成两条出站路径，三个端点各落一个节点
+    —— 即「一个请求进来，被路由到不同渠道」。
+
+    两处注意：
+    1. 渐变的 gradientUnits 必须是 userSpaceOnUse。默认的 objectBoundingBox 在
+       纯垂直/水平路径上包围盒宽或高为 0，渐变会退化，该笔画直接不渲染。
+    2. 图形整体缩放 1.22 居中：直接把描边坐标画到 1024 画布上只占 50% 宽度，
+       留白过多，看着比同排的其他应用图标小一圈。
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#242838"/>
+      <stop offset="1" stop-color="#0D0F16"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="260" y1="830" x2="770" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" fill="url(#tile)"/>
+
+  <g transform="translate(512 512) scale(1.22) translate(-512 -512)">
+    <g fill="none" stroke="url(#ink)" stroke-width="80" stroke-linecap="round">
+      <!-- 主干：底部节点 → 分叉点 -->
+      <path d="M512 730 V580"/>
+      <!-- 两条出站路径 -->
+      <path d="M512 580 C512 470 424 452 314 294"/>
+      <path d="M512 580 C512 470 600 452 710 294"/>
+    </g>
+
+    <g fill="url(#ink)">
+      <circle cx="512" cy="730" r="62"/>
+      <circle cx="314" cy="294" r="62"/>
+      <circle cx="710" cy="294" r="62"/>
+    </g>
+  </g>
+</svg>
