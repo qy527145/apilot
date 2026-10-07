@@ -70,12 +70,17 @@ export default function OverviewPage({ onNavigate }: Props) {
   });
 
   const toggle = useMutation({
-    mutationFn: async (running: boolean) =>
-      running ? api.gatewayStop() : api.gatewayStart(),
+    // 参数是开关**将要变成**的状态（`onCheckedChange` 给的是新值，不是旧值）。
+    // 之前写成 `running ? stop() : start()` 就正好反了：开着拨下去调的是 start
+    // （已在运行会原样返回），关着拨上去调的是 stop（没运行是空操作），
+    // 结果两头都没反应。
+    mutationFn: (nextRunning: boolean) =>
+      nextRunning ? api.gatewayStart() : api.gatewayStop(),
     onSuccess: (status) => {
       qc.setQueryData(qk.gateway, status);
       toast.success(status.running ? "网关已启动" : "网关已停止");
     },
+    // 失败不用在这里兜：`api.call` 已经统一 toast 了，再加一个会弹两条。
   });
 
   const chartData = useMemo(
@@ -127,7 +132,12 @@ export default function OverviewPage({ onNavigate }: Props) {
             value={formatNumber(totals.data?.requests)}
             icon={<Activity className="size-4" />}
             loading={totals.isLoading}
-            hint={gateway ? `监听 ${gateway.host}:${gateway.port}` : undefined}
+            hint={
+              // 停着的时候 `stop()` 会把端口清成 0，直接拼会显示成「监听 …:0」。
+              gateway?.running
+                ? `监听 ${gateway.host}:${gateway.port}`
+                : undefined
+            }
           />
           <StatCard
             label="今日费用"

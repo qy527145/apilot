@@ -42,7 +42,32 @@ pub async fn update_settings(
     settings: AppSettings,
 ) -> AppResult<AppSettings> {
     let next = settings.normalized();
+    let before = shell.settings();
+
+    let rebind = crate::gateway::server::needs_rebind(
+        &before,
+        &next,
+        shell.gateway.status().running,
+    );
+
     shell.update_settings(next.clone()).await?;
+
+    // 监听地址变了要真的换过去 —— 以前只是存下来，网关照旧跑在老地址上，
+    // 表现为"改了端口没反应"。
+    //
+    // **放后台**：`stop()` 是优雅停机，会等在途请求跑完，一条长回答能挂几分钟，
+    // 设置页不该为此卡住。失败会挂到网关状态上（`report_error`），界面上看得到。
+    if rebind {
+        let shell = shell.inner().clone();
+        let gateway = shell.gateway.clone();
+        let (host, port) = (before.listen_host.clone(), before.listen_port);
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = gateway.rebind(shell, &host, port).await {
+                tracing::warn!("换监听地址未生效: {e}");
+            }
+        });
+    }
+
     Ok(next)
 }
 

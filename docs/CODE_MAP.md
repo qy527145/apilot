@@ -93,7 +93,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | 文件 | 内容 |
 |---|---|
 | `pipeline.rs` | **核心编排**。`handle()` 串起整条链路；`Recorder` 收口记账；`detect_client()` 识别来源；`decode_sse_as_response()` 兜住「上游无视 stream 参数」 |
-| `server.rs` | `GatewayServer`：`start` / `stop` / `status` / `base_url`，用 oneshot + graceful shutdown |
+| `server.rs` | `GatewayServer`：`start` / `start_at` / `stop` / `status` / `base_url`，用 oneshot + graceful shutdown。**`rebind` 负责"改了监听地址要真的换过去"**：端口变了先绑新的探路（绑不上就原样退回，绝不先停再试），新地址起不来则退回老地址；`needs_rebind` 是它的纯函数判据 |
 | `router.rs` | axum 路由表、`/health`、`/v1/models`、路径兜底（按路径特征猜协议） |
 | `stream.rs` | `translate_stream()`（上游流 → 下游流）、`stream_from_response()`（缓存重放流）、**`ContentAccumulator`**（从增量重建完整内容，供缓存写入）、**`StreamTimings`**（每个事件的时间点，供时间轴；平行数组 + 名字表，两千帧几 KB）。`delta_display_name()` 那套名字**必须与前端 `StreamDelta` 的 serde 标签逐字相同**，有测试钉着 |
 | `sse.rs` | SSE 原语：`take_sse_block`（两种分隔符取最早）、`append_utf8_safe`（跨 chunk 多字节）、`parse_event` / `encode_event` |
