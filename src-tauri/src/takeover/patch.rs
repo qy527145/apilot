@@ -125,12 +125,14 @@ pub enum TomlOp {
 #[derive(Debug, Clone)]
 pub enum TomlValue {
     Str(String),
+    Bool(bool),
 }
 
 impl TomlValue {
     fn into_item(self) -> Item {
         match self {
             Self::Str(s) => toml_edit::value(s),
+            Self::Bool(b) => toml_edit::value(b),
         }
     }
 }

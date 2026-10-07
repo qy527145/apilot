@@ -273,10 +273,41 @@ fn plan_codex(base_url: &str) -> AppResult<Vec<FilePatch>> {
                 key: "wire_api".into(),
                 value: TomlValue::Str("responses".into()),
             },
+            // 让 Codex 来我们这儿取模型元数据，而不是用它内置那份 —— 内置那份把
+            // gpt-6-sol 一类的模型标成「Responses Lite」，工具会被塞进
+            // `input[].additional_tools`，而这形状对上游来说是**静默失效**的：
+            // 收下请求、返回 200，工具一个不认，模型只能把调用写成 DSML 正文。
+            // 详见 `crate::codex`。
+            TomlOp::SetInTable {
+                table: table.clone(),
+                key: "model_catalog_url".into(),
+                value: TomlValue::Str(crate::codex::catalog_url(base_url)),
+            },
+            // 留 false 的话 Codex 会先拿 websocket 连一次，失败再回落 —— 每次开
+            // 会话都白等一轮。网关只讲 HTTP。
+            TomlOp::SetInTable {
+                table: table.clone(),
+                key: "supports_websockets".into(),
+                value: TomlValue::Bool(false),
+            },
             TomlOp::SetInTable {
                 table,
                 key: "experimental_bearer_token".into(),
                 value: TomlValue::Str(floor::LOCAL_PLACEHOLDER_KEY.into()),
+            },
+            // 拉 `model_catalog_url` 这件事在 Codex 里挂在 `api_key_model_discovery`
+            // 这个开关后面，不开就永远不去取，上面的地址等于白写。
+            TomlOp::SetInTable {
+                table: "features".into(),
+                key: "api_key_model_discovery".into(),
+                value: TomlValue::Bool(true),
+            },
+            // 上一条会被 Codex 归到「开发中特性」，每开一次会话都提示一遍
+            // 「可能行为不可预期」。这个开关不开用户就得天天看这句与己无关的警告；
+            // 开了就只关掉警告本身，不影响它提示别的开发中特性。
+            TomlOp::SetTop {
+                key: "suppress_unstable_features_warning".into(),
+                value: TomlValue::Bool(true),
             },
         ],
     )?;
@@ -421,6 +452,56 @@ mod tests {
     }
 
     #[test]
+    fn codex_plan_makes_the_client_stop_using_responses_lite() {
+        // 接管的核心目的之一：让 Codex 来取我们这份目录，而目录里所有模型都关掉了
+        // Responses Lite。它内置那份把 gpt-6-sol 标成 Lite，工具就被塞进
+        // `input[].additional_tools` —— 那个形状对不少上游是**静默失效**的
+        // （收下请求、返回 200，工具一个不认），模型只能把调用写成 DSML 正文。
+        let patches = plan_codex("http://127.0.0.1:8787").unwrap();
+        let text = String::from_utf8(patches[0].content.clone().unwrap()).unwrap();
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+
+        let provider = &doc["model_providers"][floor::CODEX_PROVIDER_NAME];
+        // 目录不在 /v1 底下 —— 那是对话接口的前缀，带上会拼成 /v1/codex/models。
+        assert_eq!(
+            provider["model_catalog_url"].as_str(),
+            Some("http://127.0.0.1:8787/codex/models")
+        );
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
+        // 不打开这个开关，Codex 根本不会去取 model_catalog_url，上面那行等于白写。
+        assert_eq!(
+            doc["features"]["api_key_model_discovery"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            doc["suppress_unstable_features_warning"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_plan_keeps_the_users_own_feature_flags() {
+        // 铁律：只动「我拥有」的键。用户自己开过的 feature 不能被我们往
+        // `[features]` 里写的那一个键顺手清掉。
+        let original = b"[features]\nsome_other_flag = true\n";
+        let out = patch::patch_toml(
+            original,
+            &[TomlOp::SetInTable {
+                table: "features".into(),
+                key: "api_key_model_discovery".into(),
+                value: TomlValue::Bool(true),
+            }],
+        )
+        .unwrap();
+        let doc: toml_edit::DocumentMut = String::from_utf8(out).unwrap().parse().unwrap();
+        assert_eq!(doc["features"]["some_other_flag"].as_bool(), Some(true));
+        assert_eq!(
+            doc["features"]["api_key_model_discovery"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn codex_plan_only_touches_config_toml() {
         let patches = plan_codex("http://127.0.0.1:8787").unwrap();
         assert_eq!(patches.len(), 1, "auth.json 必须不被触碰");
@@ -433,6 +514,9 @@ mod tests {
         let text = String::from_utf8(patches[0].content.clone().unwrap()).unwrap();
         assert!(text.contains("http://127.0.0.1:8787/v1"));
         assert!(!text.contains("8787//v1"));
+        // 目录地址同理：尾斜杠不能拼出 `//codex`，那在客户端是 404。
+        assert!(text.contains("http://127.0.0.1:8787/codex/models"));
+        assert!(!text.contains("8787//codex"));
     }
 
     // --- Gemini ---

@@ -17,6 +17,7 @@
   - [routing — 模型选择、规则链与热切换](#routing--模型选择规则链与热切换1874-行)
   - [upstream — 上游渠道](#upstream--上游渠道771-行)
   - [catalog — 上游模型目录](#catalog--上游模型目录价格--能力)
+  - [codex — 发给客户端的模型目录](#codex--发给客户端的模型目录)
   - [billing — 计费](#billing--计费848-行)
   - [cache — 响应缓存](#cache--响应缓存1109-行)
   - [takeover — 客户端接管](#takeover--客户端接管1763-行)
@@ -213,6 +214,35 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 只有它有，DeepSeek 已是 v4 命名），LiteLLM 模型更多但偏一手大厂。实测两者对
 个别模型（如 DeepSeek）报价能差一倍，所以界面上必须标出来源。
 
+---
+
+### `codex/` — 发给客户端的模型目录
+
+上游目录（上面那个 `catalog/`）是**收进来**的：价格、能力。这里是**发出去**的：
+网关反过来告诉 Codex 客户端「模型长什么样」。两者只共享"模型目录"这个词。
+
+| 文件 | 内容 |
+|---|---|
+| `mod.rs` | `catalog()`（内置目录 → 关掉 Responses Lite → 交给客户端）、`CATALOG_PATH`、`catalog_url` |
+| `../assets/codex/` | vendored 的 Codex 原文（`models.json` / `prompt.md`）+ 来源与更新说明 |
+
+**为什么要有它。** Codex 用不用 Responses Lite（把工具塞进 `input[].additional_tools`，
+形状是 `namespace > custom`）**只由模型元数据里的 `use_responses_lite` 决定**，而这份
+元数据来自它自己的内置目录 —— `gpt-6-sol` 这类 GPT 系名字内置就是 `true`。
+
+要命的地方是：不少上游对这个形状**收下请求、返回 200，却完全不解析**（DeepSeek 的
+`/v1/responses` 就是）。直通转发看不出任何异常，模型那侧却一个工具都没有，只能把调用
+写成 `<｜DSML｜｜ calls>` 这样的正文 —— 客户端看到的是"模型把工具调用当普通文本吐出来"。
+
+所以网关把目录接管过来，逐条把 Lite 关掉再回给客户端。三个字段必须**一起**改：
+`use_responses_lite = false`（工具走顶层）、`tool_mode = "direct"`（否则 code mode 的
+自由格式 `exec` 会跑到顶层，而上游对顶层 `custom` 普遍只接受 `apply_patch`）、提示词换成
+通用那份（被 Lite 关住的条目，其提示词在教模型调 `functions.exec`，工具集一换就对不上）。
+细节见 `mod.rs` 的模块注释。
+
+目录是**整体替换**客户端内置那份的，所以 vendored 文件里每一条都得留着，包括不改的。
+拉取失败只会让客户端退回自己的兜底元数据（能用，只是没有 `apply_patch`），不会坏。
+
 **为什么不合成一个网络集成**：公开目录本来就同时维护价格和能力标志，分两次
 下载只是把同一个文件拉两遍。
 
@@ -280,6 +310,17 @@ quota           += tool_call_surcharge × 工具调用次数
 真实端口也是那一刻才分配）。启动、换地址、退回老地址三条路都汇到 `serve_on`，一处全覆盖。
 判据是「客户端现在指的地址 ≠ 目标地址」，不是整份文件比 —— 后者会把用户手加的模型覆盖、
 密钥也当成"不一致"，然后被 `plan_apply` 抹掉。
+
+**Codex 额外写三样东西**（都在 `plan_codex` 里，原因是别让客户端走 Responses Lite，
+见 [`codex/`](#codex--发给客户端的模型目录)）：
+
+- `model_catalog_url` → 指向网关的 `/codex/models`。和 base_url 一样由**网关地址算出**，
+  所以换地址时跟着 `repoint_taken_over` 一起更新（同一个 `plan_apply` 重跑一遍就够）。
+- `features.api_key_model_discovery = true` —— **不打开这个开关，上面那行等于白写**：
+  Codex 不会去取 `model_catalog_url`。这条实测才发现（0.160.x 里它还是开发中特性，
+  默认关）。
+- `suppress_unstable_features_warning = true` —— 上一条会让 Codex 每次开会话都提示
+  「可能行为不可预期」。这个开关**只关警告本身**，不影响它提示别的开发中特性。
 
 ---
 

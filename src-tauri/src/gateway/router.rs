@@ -19,6 +19,10 @@ pub fn build(shell: Arc<AppShell>) -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
+        // Codex 专用的模型目录。接管时写进它 provider 配置的 `model_catalog_url`，
+        // 见 `crate::codex`。**必须显式注册**：落进 fallback 就会被原样转给上游，
+        // 客户端拿到的是上游那份错误说明，而不是我们的目录。
+        .route(crate::codex::CATALOG_PATH, get(codex_catalog))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/responses", post(openai_responses))
@@ -79,6 +83,32 @@ async fn list_models(State(shell): State<Arc<AppShell>>) -> Response {
         .collect();
 
     axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
+}
+
+/// 返回 Codex 用的模型目录。
+///
+/// 原样把字节发回去，不重新序列化 —— 内容是 `crate::codex` 那份打过补丁的目录，
+/// 这里只负责搬运。
+async fn codex_catalog() -> Response {
+    match crate::codex::catalog() {
+        Ok(bytes) => (
+            [(http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            // 5xx 而不是空目录：客户端拉不到目录只会退回自己的兜底元数据（能用，
+            // 只是没有 apply_patch），而回一份空目录会把"我们这边坏了"藏起来。
+            tracing::error!("{e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": { "message": e.to_string() }
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn anthropic_messages(
@@ -288,6 +318,36 @@ mod tests {
                 chat_protocol(p).is_some(),
                 "注册的路径 {p} 必须被认成对话请求"
             );
+        }
+    }
+
+    #[test]
+    fn catalog_path_is_served_here_and_is_not_a_chat_route() {
+        // 两者都得上锁。落进 fallback 会被原样转给上游，客户端拿到的是上游的错误
+        // 说明而不是目录；被认成对话请求则更糟 —— 管线会拿它当请求体去解码。
+        assert_eq!(crate::codex::CATALOG_PATH, "/codex/models");
+        assert!(chat_protocol(crate::codex::CATALOG_PATH).is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_route_serves_a_parseable_model_catalog() {
+        // 客户端实际会拿到的那串字节。它是给客户端**解析**的，所以这里按它的读法
+        // 验一遍：JSON 可解析、有 models 数组、每条都关掉了 Lite。
+        let resp = codex_catalog().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let models = v["models"].as_array().expect("必须是 models 数组");
+        assert!(!models.is_empty());
+        for m in models {
+            assert_eq!(m["use_responses_lite"], serde_json::json!(false), "{}", m["slug"]);
         }
     }
 }

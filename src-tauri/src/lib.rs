@@ -3,6 +3,7 @@
 mod billing;
 mod cache;
 mod catalog;
+mod codex;
 mod commands;
 mod config;
 mod error;
