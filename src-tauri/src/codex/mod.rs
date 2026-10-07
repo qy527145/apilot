@@ -10,6 +10,16 @@
 //! provider 下配 `model_catalog_url`（见 [`CATALOG_PATH`]）。早先接管流程自动写过一版，
 //! 要同时注入两个 feature 开关才生效、侵入性太大，撤了。
 //!
+//! ## 目录分两半，缺一不可
+//!
+//! - **内置那半**（`assets/codex/models.json`，逐条关掉 Lite）：管 GPT 系名字。
+//! - **Apilot 自己那半**（[`entry`]，为 Apilot 会给客户端用的模型名各生成一条）：
+//!   管「接管时写入当前模型」写的那些名字。
+//!
+//! 目录是**按名字**生效的 —— 客户端用哪个名字，就查哪条。少了第二半，只要客户端用的
+//! 不是 GPT 系名字，就会落到 Codex 自己的兜底元数据上（没有 `apply_patch`），于是
+//! 「配了目录」和「换了模型名」互相抵消。
+//!
 //! ## 为什么需要它
 //!
 //! Codex 用不用「Responses Lite」**只由模型元数据里的 `use_responses_lite` 决定**：
@@ -46,6 +56,7 @@
 //! 上游决定。不认识它的上游（DeepSeek）会像忽略 `additional_tools` 一样忽略它，
 //! 认识它的中转则白捡一个能力，两种都不需要我们插手。
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
@@ -82,18 +93,91 @@ const GENERIC_PROMPT: &str = include_str!("../../assets/codex/prompt.md");
 /// 以及客户端启动时必须够得着网关 —— 取不到会静默退回它内置那份（也就是 Lite）。
 pub const CATALOG_PATH: &str = "/codex/models";
 
-/// 打过补丁的目录 JSON，首次访问时构建。
+/// 打过补丁的内置目录（`{"models": [...]}`），首次访问时构建。
 ///
-/// 用 `OnceLock` 而不是每次重算：四百多 KB 的解析没必要每个请求做一遍。
-pub fn catalog() -> AppResult<&'static [u8]> {
-    static CATALOG: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
-    match CATALOG.get_or_init(build) {
-        Ok(bytes) => Ok(bytes),
+/// 用 `OnceLock` 而不是每次重算：四百多 KB 的解析没必要每个请求做一遍。**只有内置
+/// 那半份**能这样缓存 —— Apilot 自己的模型名来自数据库，运行时会变，见 [`catalog`]。
+fn base() -> AppResult<&'static Value> {
+    static BASE: OnceLock<Result<Value, String>> = OnceLock::new();
+    match BASE.get_or_init(build_base) {
+        Ok(v) => Ok(v),
         Err(reason) => Err(AppError::Msg(format!("内置 Codex 模型目录不可用: {reason}"))),
     }
 }
 
-fn build() -> Result<Vec<u8>, String> {
+/// 交给客户端的目录：内置那份 **+ 为 Apilot 自己的模型名各补一条**。
+///
+/// `extra` 是 Apilot 会给客户端用的模型名（见 `gateway/router.rs`）。补这半份是因为
+/// 目录是**按名字**生效的：客户端用哪个名字发请求，就去目录里查哪个。少了这半份，
+/// 只要客户端用的不是 GPT 系名字（比如「接管时写入当前模型」写的那个），就会落到
+/// Codex 自己的兜底元数据上 —— 而那上面没有 `apply_patch`。
+///
+/// 两半合起来才让「目录」和「换模型名」互补而不是互相抵消：
+///
+/// | 情况 | 结果 |
+/// |---|---|
+/// | 取到目录 | 完整元数据，**带 `apply_patch`** |
+/// | 取不到（网关没起 / 目录被撤） | Codex 兜底：经典工具集，没有 `apply_patch`，至少不是 Lite |
+pub fn catalog(extra: &[String]) -> AppResult<Vec<u8>> {
+    let mut models = base()?["models"].as_array().cloned().unwrap_or_default();
+    // 去重是**强制**的：Codex 校验目录时，slug 重复会让它**整份拒收** —— 那比少一条
+    // 糟得多，因为客户端会静默退回内置目录（也就是 Lite）。
+    let mut seen: HashSet<String> = models
+        .iter()
+        .filter_map(|m| m["slug"].as_str().map(String::from))
+        .collect();
+
+    for name in extra {
+        let name = name.trim();
+        if name.is_empty() || !seen.insert(name.to_string()) {
+            continue;
+        }
+        models.push(entry(name));
+    }
+
+    serde_json::to_vec(&json!({ "models": models }))
+        .map_err(|e| AppError::Msg(format!("序列化模型目录失败: {e}")))
+}
+
+/// 给 Apilot 自己的模型名生成一条元数据。
+///
+/// 刻意贴着 **Codex 自己的兜底元数据**写（`models-manager/src/model_info.rs`）：
+/// 那些值就是同一个模型名在「没有目录」时的待遇，照抄等于不引入变化，只动手脚动在
+/// 我们真正要改的三处 —— 关 Lite、开 `apply_patch`、提示词用通用那份（那份本来就是
+/// 配经典工具集、且教模型用 `apply_patch` 的）。
+///
+/// `context_window` 也照抄（272k）。Apilot 没有「上游模型的真实窗口」这份数据，编一个
+/// 数只会更危险：报大了客户端来不及压缩、报小了白白浪费上下文。想改得先有数据源。
+fn entry(name: &str) -> Value {
+    json!({
+        "slug": name,
+        "display_name": name,
+        "description": "通过 Apilot 提供",
+        "default_reasoning_level": Value::Null,
+        "supported_reasoning_levels": [],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 99,
+        "availability_nux": Value::Null,
+        "upgrade": Value::Null,
+        "support_verbosity": false,
+        "default_verbosity": Value::Null,
+        "apply_patch_tool_type": "freeform",
+        "truncation_policy": { "mode": "bytes", "limit": 10_000 },
+        "experimental_supported_tools": [],
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "use_responses_lite": false,
+        "tool_mode": "direct",
+        "supports_search_tool": false,
+        "prefer_websockets": false,
+        "model_messages": { "instructions_template": GENERIC_PROMPT },
+        "base_instructions": GENERIC_PROMPT,
+    })
+}
+
+fn build_base() -> Result<Value, String> {
     let mut catalog: Value =
         serde_json::from_str(MODELS_JSON).map_err(|e| format!("内置目录不是合法 JSON: {e}"))?;
     let models = catalog
@@ -132,16 +216,24 @@ fn build() -> Result<Vec<u8>, String> {
         model["base_instructions"] = json!(prompt);
     }
 
-    serde_json::to_vec(&catalog).map_err(|e| format!("序列化内置目录失败: {e}"))
+    Ok(catalog)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Apilot 自己那半份用的名字。**故意让所有不变量测试都带上它** —— 动态那半份和
+    /// 内置那半份要守同一套规矩，分开测迟早有一边漏掉。
+    const APILOT_MODEL: &str = "deepseek-flash";
+
+    fn names() -> Vec<String> {
+        vec![APILOT_MODEL.to_string()]
+    }
+
     fn models() -> Vec<Value> {
-        let bytes = catalog().expect("内置目录必须可用");
-        let v: Value = serde_json::from_slice(bytes).unwrap();
+        let bytes = catalog(&names()).expect("目录必须可用");
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
         v["models"].as_array().unwrap().clone()
     }
 
@@ -150,6 +242,74 @@ mod tests {
             .into_iter()
             .find(|m| m["slug"] == slug)
             .unwrap_or_else(|| panic!("目录里应该有 {slug}"))
+    }
+
+    #[test]
+    fn apilot_model_names_are_in_the_catalog() {
+        // 这是这一半存在的理由：客户端用 `deepseek-flash` 这类名字时，目录里必须有
+        // 对应条目，否则它落到 Codex 兜底元数据上 —— 那里没有 apply_patch。
+        let entry = by_slug(APILOT_MODEL);
+        assert_eq!(entry["apply_patch_tool_type"], json!("freeform"));
+        assert_eq!(entry["use_responses_lite"], json!(false));
+        assert_eq!(entry["tool_mode"], json!("direct"));
+    }
+
+    #[test]
+    fn apilot_entries_carry_every_field_codex_requires() {
+        // Codex 反序列化时这些字段没有默认值 —— 缺一个会让它**整份拒收**目录，
+        // 客户端于是静默退回内置那份（也就是 Lite）。比少一条糟得多。
+        let entry = by_slug(APILOT_MODEL);
+        for key in [
+            "slug",
+            "display_name",
+            "description",
+            "supported_reasoning_levels",
+            "shell_type",
+            "visibility",
+            "supported_in_api",
+            "priority",
+            "availability_nux",
+            "upgrade",
+            "support_verbosity",
+            "default_verbosity",
+            "apply_patch_tool_type",
+            "truncation_policy",
+            "experimental_supported_tools",
+        ] {
+            assert!(
+                entry.get(key).is_some(),
+                "{key} 是 Codex 的必填字段，缺了整份目录会被拒收"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_codex_already_covers_is_not_duplicated() {
+        // slug 重复会让 Codex 整份拒收目录。客户端完全可能把某个模型映射成 gpt-6-sol
+        // 这类名字，所以这条必须挡住。
+        let list = catalog(&["gpt-6-sol".to_string(), "gpt-6-sol".to_string()]).unwrap();
+        let v: Value = serde_json::from_slice(&list).unwrap();
+        let mut slugs: Vec<&str> = v["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap())
+            .collect();
+        let total = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), total, "目录里有重复 slug");
+    }
+
+    #[test]
+    fn blank_names_are_ignored() {
+        // 模型策略没配时 `effective().model` 可能是空的/空白，别往目录里塞空 slug ——
+        // 空 slug 同样会让 Codex 整份拒收。
+        let list = catalog(&["".to_string(), "   ".to_string()]).unwrap();
+        let v: Value = serde_json::from_slice(&list).unwrap();
+        for m in v["models"].as_array().unwrap() {
+            assert!(!m["slug"].as_str().unwrap().trim().is_empty());
+        }
     }
 
     #[test]

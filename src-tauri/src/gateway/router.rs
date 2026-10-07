@@ -88,9 +88,16 @@ async fn list_models(State(shell): State<Arc<AppShell>>) -> Response {
 /// 返回 Codex 用的模型目录。
 ///
 /// 原样把字节发回去，不重新序列化 —— 内容是 `crate::codex` 那份打过补丁的目录，
-/// 这里只负责搬运。
-async fn codex_catalog() -> Response {
-    match crate::codex::catalog() {
+/// 这里只负责把「Apilot 会给客户端用的模型名」收集好交给它。
+async fn codex_catalog(State(shell): State<Arc<AppShell>>) -> Response {
+    let names = apilot_model_names(&shell).await;
+    catalog_response(&names)
+}
+
+/// 把目录拼成响应。与取名字那步分开，是为了让测试能直接喂一组名字 ——
+/// 走完整处理器要现搭一个 `AppShell`（数据库、网关、定价……），代价远大于收益。
+fn catalog_response(names: &[String]) -> Response {
+    match crate::codex::catalog(names) {
         Ok(bytes) => (
             [(http::header::CONTENT_TYPE, "application/json")],
             bytes,
@@ -109,6 +116,35 @@ async fn codex_catalog() -> Response {
                 .into_response()
         }
     }
+}
+
+/// Apilot 会给客户端用的模型名 —— 目录里得给它们各留一条。
+///
+/// 判据和 `/v1/models` 保持一致（渠道声明的入站模型名 + 单价表里配过的），再补上
+/// 模型策略给 Codex 指定的那个：**「接管时写入当前模型」写的就是它**，而它未必在渠道
+/// 的映射表里。少了这一步，目录和那个开关会互相抵消（客户端用的名字查不到 → 落到
+/// Codex 兜底元数据 → 没有 `apply_patch`）。
+async fn apilot_model_names(shell: &Arc<AppShell>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+
+    let codex = crate::takeover::clients::ClientId::Codex;
+    if let Some(model) = shell.settings().model_policy.effective(codex.as_str()).model {
+        names.push(model.to_string());
+    }
+
+    match crate::storage::providers::list_enabled(&shell.db).await {
+        Ok(providers) => {
+            for p in providers {
+                names.extend(p.model_mapping.keys().cloned());
+            }
+        }
+        Err(e) => tracing::warn!("读取渠道列表失败（模型目录会少几条）: {e}"),
+    }
+    names.extend(shell.pricing.load().models());
+
+    names.sort();
+    names.dedup();
+    names
 }
 
 async fn anthropic_messages(
@@ -333,7 +369,7 @@ mod tests {
     async fn catalog_route_serves_a_parseable_model_catalog() {
         // 客户端实际会拿到的那串字节。它是给客户端**解析**的，所以这里按它的读法
         // 验一遍：JSON 可解析、有 models 数组、每条都关掉了 Lite。
-        let resp = codex_catalog().await;
+        let resp = catalog_response(&["deepseek-flash".to_string()]);
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
@@ -349,5 +385,7 @@ mod tests {
         for m in models {
             assert_eq!(m["use_responses_lite"], serde_json::json!(false), "{}", m["slug"]);
         }
+        // 传进去的名字也要在里面 —— 少了它，客户端用这个名字时就拿不到 apply_patch。
+        assert!(models.iter().any(|m| m["slug"] == "deepseek-flash"));
     }
 }

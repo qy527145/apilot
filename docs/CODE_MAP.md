@@ -228,14 +228,27 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 |---|---|
 | 文件 | 内容 |
 |---|---|
-| `mod.rs` | `catalog()`（内置目录 → 关掉 Responses Lite → 交给客户端）、`CATALOG_PATH` |
+| `mod.rs` | `catalog(names)`（内置目录 + Apilot 自己的模型名，都关掉 Responses Lite）、`entry`（为 Apilot 的模型名生成的条目）、`CATALOG_PATH` |
 | `../assets/codex/` | vendored 的 Codex 原文（`models.json` / `prompt.md`）+ 来源与更新说明 |
+
+**目录分两半，缺一不可**（`gateway/router.rs::apilot_model_names` 负责收集第二半要用到的名字）：
+
+- **内置那半**（vendored，逐条关掉 Lite）：管 GPT 系名字。
+- **Apilot 自己那半**（`entry`，为 Apilot 会给客户端用的模型名各生成一条）：管
+  「接管时写入当前模型」写的那些名字。
+
+目录是**按名字**生效的 —— 客户端用哪个名字，就查哪条。少了第二半，只要客户端用的不是
+GPT 系名字，就会落到 Codex 自己的兜底元数据上（那里没有 `apply_patch`），于是
+**「配了目录」和「换了模型名」互相抵消** —— 配了半天一点用没有。
 
 **接管不会自动用它。** 默认那条路是「给客户端换一个它不认识的模型名」（见上面 takeover
 一节）：一行配置、不联网、不依赖客户端开关，代价是没有 `apply_patch`。这里这份是给
-**想要完整元数据的人手动配**的 —— 自己写 `model_catalog_url` 指向 `CATALOG_PATH`，
-外加 `[features] api_key_model_discovery = true`（不打开这个开关 Codex 根本不会去取）。
-早先接管流程自动写过一版，那两个开关让侵入性变得太大，撤了。
+**想要完整元数据、特别是想要 `apply_patch` 的人手动配**的 —— 自己写 `model_catalog_url`
+指向 `CATALOG_PATH`，外加 `[features] api_key_model_discovery = true`（不打开这个开关
+Codex 根本不会去取）。早先接管流程自动写过一版，那两个开关让侵入性变得太大，撤了。
+
+> 这两条路现在**互补**：目录取到 → 完整元数据（含 `apply_patch`）；取不到（网关没起 /
+> 目录被撤）→ 退回 Codex 兜底，经典工具集、没有 `apply_patch`，但至少不是 Lite。
 
 **为什么要有它。** Codex 用不用 Responses Lite（把工具塞进 `input[].additional_tools`，
 形状是 `namespace > custom`）**只由模型元数据里的 `use_responses_lite` 决定**，而这份
