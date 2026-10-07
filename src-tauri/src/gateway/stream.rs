@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
+use serde::Serialize;
 
 use crate::protocol::codec::{StreamDecoder, StreamEncoder};
 use crate::protocol::dto::{FinishReason, UnifiedDelta, UnifiedResponse, UnifiedUsage};
@@ -24,6 +25,90 @@ use super::sse::{append_utf8_safe, encode_event, parse_event, take_sse_block};
 /// 截断而不是丢弃，是因为"原始帧"本来就只有排查时才看，半份也远比没有有用 ——
 /// 前提是界面明确标出它被截断了。
 const MAX_RAW_STREAM_BYTES: usize = 2 * 1024 * 1024;
+
+/// 时间轴里最多记多少个事件。超出后不再记，只把 `truncated` 立起来。
+///
+/// 两千帧足够看出"哪一段在等"，而这份记录是**每个请求都存一份**的：
+/// 不封顶的话，一个长回答就能让一条日志重上几百 KB。
+const MAX_TIMINGS: usize = 2000;
+
+/// 流式响应里每个事件的时间点，供「时间轴」看每个事件花了多久。
+///
+/// 存成**平行数组 + 名字表**而不是 `[{at_ms, name}]`：事件名高度重复
+/// （一个长回答里 `content_block_delta` 能占九成），逐个存一遍字符串会让
+/// 这条记录膨胀好几倍。名字表加上去之后，两千帧是几 KB —— 跟同一行里
+/// 那个原始帧 blob 比可以忽略。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct StreamTimings {
+    /// 每个事件相对流开始的毫秒数，按发生顺序。
+    pub at_ms: Vec<i64>,
+    /// 去重后的事件名。
+    pub names: Vec<String>,
+    /// 与 `at_ms` 等长；每项是 `names` 的下标。
+    pub name_idx: Vec<u16>,
+    /// 事件数超过上限，后面的没记。
+    pub truncated: bool,
+}
+
+impl StreamTimings {
+    pub fn push(&mut self, at_ms: i64, name: &str) {
+        if self.at_ms.len() >= MAX_TIMINGS {
+            self.truncated = true;
+            return;
+        }
+
+        // 线性找即可：不同的事件名现实中不超过几十个。
+        let idx = match self.names.iter().position(|n| n == name) {
+            Some(i) => i,
+            None => {
+                self.names.push(name.to_string());
+                self.names.len() - 1
+            }
+        };
+
+        self.name_idx.push(idx as u16);
+        self.at_ms.push(at_ms);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.at_ms.is_empty()
+    }
+}
+
+/// 一个事件在时间轴里的名字：优先 SSE 的 `event:` 行，没有就回落到增量类型。
+///
+/// 与前端实时视图的取法保持一致（那边也是先找 `event:` 再回落到
+/// `deltas[0].kind`）—— 两边不一致的话，同一个事件在实时视图和明细里
+/// 会显示成两个名字。
+fn timeline_name(raw: &str, deltas: &[UnifiedDelta]) -> String {
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            return rest.trim().to_string();
+        }
+    }
+    match deltas.first() {
+        Some(d) => delta_display_name(d).to_string(),
+        None => "—".to_string(),
+    }
+}
+
+/// `UnifiedDelta` 在界面上的名字。
+///
+/// **必须与 `StreamDelta` 的 serde 标签逐字相同** —— 前端在实时视图里就是按
+/// 那个标签取名字的。有测试钉着这一点（`delta_names_match_the_wire_tags`）。
+fn delta_display_name(d: &UnifiedDelta) -> &'static str {
+    match d {
+        UnifiedDelta::MessageStart { .. } => "message_start",
+        UnifiedDelta::BlockStart { .. } => "block_start",
+        UnifiedDelta::TextDelta { .. } => "text",
+        UnifiedDelta::ThinkingDelta { .. } => "thinking",
+        UnifiedDelta::ToolInputDelta { .. } => "tool_input",
+        UnifiedDelta::BlockStop { .. } => "block_stop",
+        UnifiedDelta::Usage(_) => "usage",
+        UnifiedDelta::Finish(_) => "finish",
+        UnifiedDelta::Error { .. } => "error",
+    }
+}
 
 /// 流结束后的统计结果。
 #[derive(Debug, Clone, Default)]
@@ -46,6 +131,8 @@ pub struct StreamOutcome {
     pub total: Option<Duration>,
     /// 处理过的 SSE 事件数。
     pub events: u64,
+    /// 每个事件的时间点，供时间轴用。
+    pub timings: StreamTimings,
     pub finish_reason: Option<FinishReason>,
     pub error: Option<String>,
 }
@@ -294,6 +381,15 @@ where
                 if let Some(o) = observer.as_mut() {
                     o.on_event(&block, &deltas);
                 }
+
+                // 时间轴用的时间点。记在这里而不是记在观察者里：`StreamOutcome`
+                // 是要落库的，观察者只管实时推送，两边各记各的会跑出两份不一致的
+                // 时间。放在观察者之后是为了让"推给前端"这件事先发生 ——
+                // 名字推导要遍历原文，不能让排查用的东西拖慢实时视图。
+                outcome.timings.push(
+                    start.elapsed().as_millis() as i64,
+                    &timeline_name(&block, &deltas),
+                );
 
                 for d in &deltas {
                     if let UnifiedDelta::Finish(r) = d {
@@ -1028,5 +1124,125 @@ mod tests {
         let o = rx.await.unwrap();
         assert_eq!(o.content.len(), 1);
         assert_eq!(o.content[0].as_text(), Some("最终"));
+    }
+
+    #[tokio::test]
+    async fn a_streamed_response_records_a_timing_per_event() {
+        // 时间轴完全靠这份记录画出来，少一个事件就少一根条。
+        let chunks = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"b\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_observed(
+            upstream(chunks),
+            Box::new(AnthropicStreamDecoder::new()),
+            None,
+            StreamTimeouts::default(),
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            });
+        run(body).await;
+
+        let o = rx.await.unwrap();
+        let t = &o.timings;
+        assert_eq!(t.at_ms.len() as u64, o.events, "时间点数必须与事件数一致");
+        assert_eq!(t.at_ms.len(), 4);
+        assert!(!t.truncated);
+
+        let names: Vec<&str> = t
+            .name_idx
+            .iter()
+            .map(|i| t.names[*i as usize].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_delta",
+                "content_block_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            t.names.len(),
+            3,
+            "名字表要去重：重复的事件名只该占一个条目"
+        );
+
+        // 单调不减，否则"两个事件之间花了多久"会算出负数。
+        assert!(t.at_ms.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn timings_dedupe_names_and_stop_at_the_cap() {
+        let mut t = StreamTimings::default();
+        for i in 0..10i64 {
+            t.push(i, if i % 3 == 0 { "a" } else { "b" });
+        }
+        assert_eq!(t.at_ms.len(), 10);
+        assert_eq!(t.names, ["a", "b"]);
+        assert!(!t.truncated);
+
+        let mut t = StreamTimings::default();
+        for i in 0..(MAX_TIMINGS as i64 + 5) {
+            t.push(i, "x");
+        }
+        assert_eq!(t.at_ms.len(), MAX_TIMINGS, "封顶之后不再增长");
+        assert!(t.truncated, "封顶了必须让界面知道后面还有");
+        assert_eq!(t.names.len(), 1, "名字表不该跟着帧数一起涨");
+    }
+
+    #[test]
+    fn delta_names_match_the_wire_tags() {
+        // 时间轴里的名字有两种来源：SSE 的 `event:` 行（各协议自己的），
+        // 以及没有那一行时回落到增量类型。回落的那套**必须**与前端按 `kind`
+        // 分支用的标签逐字相同，否则同一个事件在实时视图和明细里会显示成
+        // 两个名字 —— 那种不一致没人会在测试里发现，只会在界面上困惑。
+        use crate::protocol::dto::{ContentBlock, UsageDelta};
+        use crate::traffic::stream_events::StreamDelta;
+
+        let samples = vec![
+            UnifiedDelta::MessageStart {
+                id: "m".into(),
+                model: "x".into(),
+            },
+            UnifiedDelta::BlockStart {
+                index: 0,
+                block: ContentBlock::text(""),
+            },
+            UnifiedDelta::text(0, "hi"),
+            UnifiedDelta::ThinkingDelta {
+                index: 0,
+                text: "t".into(),
+            },
+            UnifiedDelta::ToolInputDelta {
+                index: 0,
+                partial_json: "{}".into(),
+            },
+            UnifiedDelta::BlockStop { index: 0 },
+            UnifiedDelta::Usage(UsageDelta {
+                output_tokens: Some(1),
+                ..Default::default()
+            }),
+            UnifiedDelta::Finish(FinishReason::ToolUse),
+            UnifiedDelta::Error {
+                code: "c".into(),
+                message: "m".into(),
+            },
+        ];
+
+        for d in &samples {
+            let wire = serde_json::to_value(StreamDelta::from(d)).unwrap();
+            assert_eq!(
+                wire["kind"].as_str().unwrap(),
+                delta_display_name(d),
+                "时间轴的名字与前端的 kind 标签对不上：{d:?}"
+            );
+        }
     }
 }

@@ -220,6 +220,7 @@ mod tests {
             upstream_stream_raw: None,
             client_stream_raw: None,
             stream_raw_truncated: false,
+            stream_timings: None,
         }
     }
 

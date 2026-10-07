@@ -429,6 +429,11 @@ pub struct RequestDetail {
     pub client_stream_raw: Option<String>,
     /// 原始 SSE 帧是否因为超过上限被截断。
     pub stream_raw_truncated: bool,
+    /// 每个事件的时间点（`StreamTimings` 的 JSON 文本），供时间轴用。
+    ///
+    /// 老日志没有这一项（改动前没记），界面上据此不显示时间轴，而不是画一根
+    /// 全零的假轴。
+    pub stream_timings: Option<String>,
 }
 
 /// 出站方向的追踪：Apilot 实际发给上游的请求，与上游返回的原始响应。
@@ -468,6 +473,8 @@ pub struct CaptureRecord {
     pub upstream_stream_raw: Option<Vec<u8>>,
     pub client_stream_raw: Option<Vec<u8>>,
     pub stream_raw_truncated: bool,
+    /// 每个事件的时间点（`StreamTimings` 的 JSON 文本），供时间轴用。
+    pub stream_timings: Option<String>,
 }
 
 pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()> {
@@ -477,8 +484,9 @@ pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()>
              upstream_url, upstream_headers, upstream_body, upstream_status,
              upstream_response_headers, upstream_response_body,
              response_headers, response_body, stream_text, stream_events,
-             response_content, upstream_stream_raw, client_stream_raw, stream_raw_truncated)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+             response_content, upstream_stream_raw, client_stream_raw, stream_raw_truncated,
+             stream_timings)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
     )
     .bind(&c.request_id)
     .bind(c.ts)
@@ -500,6 +508,7 @@ pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()>
     .bind(&c.upstream_stream_raw)
     .bind(&c.client_stream_raw)
     .bind(c.stream_raw_truncated as i64)
+    .bind(&c.stream_timings)
     .execute(pool)
     .await?;
     Ok(())
@@ -516,7 +525,8 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
                 upstream_url, upstream_headers, upstream_body, upstream_status,
                 upstream_response_headers, upstream_response_body,
                 response_headers, response_body, stream_text, stream_events,
-                response_content, upstream_stream_raw, client_stream_raw, stream_raw_truncated
+                response_content, upstream_stream_raw, client_stream_raw, stream_raw_truncated,
+                stream_timings
          FROM captures WHERE request_id = ?1",
     )
     .bind(request_id)
@@ -543,6 +553,7 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         upstream_stream_raw,
         client_stream_raw,
         stream_raw_truncated,
+        stream_timings,
     ) = match &cap {
         Some(r) => (
             r.get::<Option<String>, _>("method").unwrap_or_default(),
@@ -563,6 +574,7 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
             r.get::<Option<Vec<u8>>, _>("upstream_stream_raw"),
             r.get::<Option<Vec<u8>>, _>("client_stream_raw"),
             r.get::<Option<i64>, _>("stream_raw_truncated").unwrap_or(0) != 0,
+            r.get::<Option<String>, _>("stream_timings"),
         ),
         None => (
             String::new(),
@@ -583,6 +595,7 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
             None,
             None,
             false,
+            None,
         ),
     };
 
@@ -636,6 +649,7 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         client_stream_raw: client_stream_raw
             .map(|b| String::from_utf8_lossy(&b).to_string()),
         stream_raw_truncated,
+        stream_timings,
     }))
 }
 
@@ -997,6 +1011,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_timings_roundtrip() {
+        // 时间轴完全靠这一列画出来。存成 JSON 文本（与 response_content 同一套做法），
+        // 前端自己去解。
+        let p = pool().await;
+        insert(&p, &rec("r1", "claude-code", "m")).await.unwrap();
+
+        let timings = serde_json::json!({
+            "at_ms": [0, 12, 1240],
+            "names": ["message_start", "content_block_delta"],
+            "name_idx": [0, 1, 1],
+            "truncated": false,
+        });
+
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r1".into(),
+                ts: now_ms(),
+                stream_timings: Some(timings.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(d.stream_timings.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["at_ms"][2], 1240);
+        assert_eq!(parsed["names"][1], "content_block_delta");
+        assert_eq!(parsed["name_idx"][2], 1);
+        assert_eq!(parsed["truncated"], false);
+    }
+
+    #[tokio::test]
     async fn stream_raw_fields_default_to_none_and_false() {
         // 非流式捕获不该被这些列影响；截断标志默认必须是 false，
         // 否则界面会对所有请求都显示"已截断"。
@@ -1018,6 +1067,7 @@ mod tests {
         assert_eq!(d.upstream_stream_raw, None);
         assert_eq!(d.client_stream_raw, None);
         assert!(!d.stream_raw_truncated);
+        assert_eq!(d.stream_timings, None, "没有就是不显示时间轴，不是画一根全零的假轴");
     }
 
     #[tokio::test]

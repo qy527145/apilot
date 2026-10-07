@@ -1060,6 +1060,12 @@ fn finalize_stream(
             cap.client_stream_raw = outcome.raw_client.clone();
             cap.stream_raw_truncated = outcome.raw_truncated;
 
+            // 每个事件的时间点，供时间轴。空流不写 —— 界面上要区分
+            // "没有时间轴数据"与"有一份全零的假轴"。
+            if !outcome.timings.is_empty() {
+                cap.stream_timings = serde_json::to_string(&outcome.timings).ok();
+            }
+
             if let Err(e) = crate::storage::logs::save_capture(&shell.db, &cap).await {
                 tracing::warn!("写流式捕获失败: {e}");
             }

@@ -262,6 +262,17 @@ UPDATE provider_models SET
     r#"
 ALTER TABLE providers ADD COLUMN proxy TEXT;
 "#,
+    // --- v6: 流式响应每个事件的时间点 ---
+    //
+    // 动机：`stream_events` 只有一个总数，`ttfb`/`latency` 只有首字节与总耗时。
+    // 于是"这个请求为什么慢"在事后完全查不出来 —— 是上游很久才吐第一个字，
+    // 还是中间某一段卡了两秒？实时视图能看见，但流一结束就没了。
+    //
+    // 存 JSON：平行数组 + 名字表（见 `gateway::stream::StreamTimings`），
+    // 两千帧几 KB。老行留 NULL —— 那时本来就没记，界面据此不显示时间轴。
+    r#"
+ALTER TABLE captures ADD COLUMN stream_timings TEXT;
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -273,7 +284,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 
