@@ -1,9 +1,11 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { RotateCcw, Save } from "lucide-react";
 import { toast } from "sonner";
 
 import { CustomRuleEditor } from "@/components/models/CustomRuleEditor";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import {
@@ -22,6 +24,7 @@ import {
   type ModelPolicy,
   type ModelPolicyMode,
 } from "@/lib/api";
+import { useUnsavedChanges } from "@/lib/unsaved";
 
 const MODE_LABEL: Record<ModelPolicyMode, string> = {
   passthrough: "用客户端请求的模型",
@@ -65,12 +68,31 @@ export function ModelPolicyCard({ models }: { models: string[] }) {
     retry: 1,
   });
 
+  const server = data?.model_policy;
+  const [draft, setDraft] = useState<ModelPolicy | null>(null);
+
+  const dirty = !!server && !!draft && !samePolicy(draft, server);
+
+  // 用 ref 让下面那个 effect 读到最新的 dirty，而不必把它放进依赖数组 ——
+  // 放进去的话，每次编辑都会重跑一遍「从服务端同步草稿」，等于白做。
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+
+  // 只在**没有未保存改动**时才用服务端的值覆盖草稿。
+  // 无条件覆盖会把用户正在编辑的内容冲掉：设置查询会在保存后、别的页面
+  // 改动设置后重新取数，而这时候草稿正是用户还没提交的那一份。
+  useEffect(() => {
+    if (server && !dirtyRef.current) setDraft(server);
+  }, [server]);
+
+  useUnsavedChanges(dirty);
+
   const save = useMutation({
-    mutationFn: api.setModelPolicy,
+    mutationFn: (policy: ModelPolicy) => api.setModelPolicy(policy),
     onSuccess: (saved) => {
       // 把服务端**规范化之后**的结果直接写回缓存，而不是原地重取：
-      // 它才是真源（空白、非法正则行都是那边清掉的），而且下一次改动读到的
-      // 立刻就是最新值，不会拿着旧 policy 把刚才那次改动盖回去。
+      // 它才是真源（空白、非法正则行都是那边清掉的）。
+      setDraft(saved);
       qc.setQueryData(qk.settings, (old) =>
         old ? { ...old, model_policy: saved } : old,
       );
@@ -78,7 +100,7 @@ export function ModelPolicyCard({ models }: { models: string[] }) {
     },
   });
 
-  const policy = data?.model_policy;
+  const policy = draft;
 
   // hook 必须在下面那个提前 return **之前**调用 —— 顺序变了 React 会把整棵
   // 组件树卸载，表现为白/黑屏。
@@ -106,7 +128,8 @@ export function ModelPolicyCard({ models }: { models: string[] }) {
 
   if (!policy) return null;
 
-  const patch = (next: Partial<ModelPolicy>) => save.mutate({ ...policy, ...next });
+  const patch = (next: Partial<ModelPolicy>) =>
+    setDraft((d) => (d ? { ...d, ...next } : d));
 
   const patchClient = (id: string, rule: ClientRule) =>
     patch({ per_client: { ...policy.per_client, [id]: rule } });
@@ -119,6 +142,30 @@ export function ModelPolicyCard({ models }: { models: string[] }) {
           <Badge variant={policy.mode === "passthrough" ? "secondary" : "default"}>
             {MODE_LABEL[policy.mode]}
           </Badge>
+          {dirty && (
+            <span className="text-amber-600 text-xs dark:text-amber-400">
+              有未保存的更改
+            </span>
+          )}
+          <div className="ml-auto flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!dirty || save.isPending}
+              onClick={() => setDraft(server ?? null)}
+            >
+              <RotateCcw className="size-4" />
+              撤销
+            </Button>
+            <Button
+              size="sm"
+              disabled={!dirty || save.isPending}
+              onClick={() => draft && save.mutate(draft)}
+            >
+              <Save className="size-4" />
+              {save.isPending ? "保存中…" : "保存"}
+            </Button>
+          </div>
         </div>
         <p className="text-muted-foreground text-xs">
           决定发往上游的请求体里 <code>model</code> 写什么。全局设一条，
@@ -221,6 +268,31 @@ export function ModelPolicyCard({ models }: { models: string[] }) {
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * 按键名递归排序后序列化。
+ *
+ * 用来判断草稿与已保存值是否一致。不能直接 `JSON.stringify`：`per_client`
+ * 在 Rust 侧是 map，往返一次键序未必与草稿相同，那会让「没改过」被判成
+ * 「改过」，保存按钮一直亮着、切页时也一直弹拦截。
+ *
+ * 也不用逐字段比较 —— 那个写法会随字段增减而漏，而且漏了不会报错。
+ */
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(
+      ([a], [b]) => (a < b ? -1 : a > b ? 1 : 0),
+    );
+    return `{${entries
+      .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+const samePolicy = (a: ModelPolicy, b: ModelPolicy) =>
+  stableStringify(a) === stableStringify(b);
 
 function ClientRow({
   name,
