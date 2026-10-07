@@ -79,7 +79,7 @@ pub struct RequestLog {
     pub saved_quota: i64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LogFilter {
     pub client: Option<String>,
     pub model: Option<String>,
@@ -88,6 +88,14 @@ pub struct LogFilter {
     pub from: Option<i64>,
     pub to: Option<i64>,
     pub only_cache_hit: Option<bool>,
+    /// 入站协议（`protocol_in`）。认不出的值被忽略，等同于不筛。
+    pub protocol: Option<String>,
+    /// `"ok"`（< 400）或 `"error"`（≥ 400）。认不出的值被忽略。
+    pub status: Option<String>,
+    /// 只看流式 / 只看非流式。
+    pub is_stream: Option<bool>,
+    /// 模型名模糊匹配。`model` 是精确匹配，这个是给"记不全名字"用的。
+    pub model_like: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -98,11 +106,55 @@ fn default_limit() -> i64 {
     50
 }
 
+/// 手写而不是 derive：`#[serde(default = "default_limit")]` 只管反序列化，
+/// derive 出来的 `Default` 会给 `limit: 0`，再被 `normalized()` 夹成 1 ——
+/// 于是"不传筛选条件"悄悄变成"只返回一条"。
+impl Default for LogFilter {
+    fn default() -> Self {
+        Self {
+            client: None,
+            model: None,
+            provider_tag: None,
+            from: None,
+            to: None,
+            only_cache_hit: None,
+            protocol: None,
+            status: None,
+            is_stream: None,
+            model_like: None,
+            limit: default_limit(),
+            offset: 0,
+        }
+    }
+}
+
+pub const STATUS_OK: &str = "ok";
+pub const STATUS_ERROR: &str = "error";
+
 impl LogFilter {
     /// 夹住分页参数，避免一条查询把整个表拉出来。
+    ///
+    /// 同时把认不出的枚举值清掉：筛选条件来自 URL / 前端状态，一个过期或拼错的
+    /// 字符串应该等于"不筛"，而不是让整个查询报错、页面变成一片错误提示。
     pub fn normalized(mut self) -> Self {
         self.limit = self.limit.clamp(1, 1000);
         self.offset = self.offset.max(0);
+
+        self.protocol = self
+            .protocol
+            .map(|p| p.trim().to_string())
+            .filter(|p| crate::protocol::dto::Protocol::parse(p).is_some());
+
+        self.status = self
+            .status
+            .map(|s| s.trim().to_string())
+            .filter(|s| s == STATUS_OK || s == STATUS_ERROR);
+
+        self.model_like = self
+            .model_like
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         self
     }
 }
@@ -213,6 +265,54 @@ pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<(Vec<Requ
     Ok((rows.iter().map(row_to_log).collect(), total))
 }
 
+/// 筛选下拉的数据源：最近这些请求里实际出现过的客户端 / 模型 / 协议。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LogFacets {
+    pub clients: Vec<String>,
+    pub models: Vec<String>,
+    pub protocols: Vec<String>,
+}
+
+/// 只扫最近 `scan` 条，不对全表做 DISTINCT。
+///
+/// 本地库跑上几个月，`request_logs` 是几十万行级别，而筛选下拉要回答的
+/// 只是"最近都有什么"——全表去重既慢又没意义（三个月前用过一次的模型
+/// 出现在下拉里只会干扰选择）。
+pub async fn facets(pool: &SqlitePool, scan: i64) -> AppResult<LogFacets> {
+    let scan = scan.clamp(1, 10_000);
+    let rows = sqlx::query(
+        "SELECT client, model, protocol_in FROM request_logs ORDER BY ts DESC LIMIT ?1",
+    )
+    .bind(scan)
+    .fetch_all(pool)
+    .await?;
+
+    let mut clients = std::collections::BTreeSet::new();
+    let mut models = std::collections::BTreeSet::new();
+    let mut protocols = std::collections::BTreeSet::new();
+
+    for r in &rows {
+        let c: String = r.get("client");
+        let m: String = r.get("model");
+        let p: String = r.get("protocol_in");
+        if !c.is_empty() {
+            clients.insert(c);
+        }
+        if !m.is_empty() {
+            models.insert(m);
+        }
+        if !p.is_empty() {
+            protocols.insert(p);
+        }
+    }
+
+    Ok(LogFacets {
+        clients: clients.into_iter().collect(),
+        models: models.into_iter().collect(),
+        protocols: protocols.into_iter().collect(),
+    })
+}
+
 fn push_where(qb: &mut QueryBuilder<'_, sqlx::Sqlite>, f: &LogFilter) {
     if let Some(c) = &f.client {
         qb.push(" AND client = ").push_bind(c.clone());
@@ -231,6 +331,28 @@ fn push_where(qb: &mut QueryBuilder<'_, sqlx::Sqlite>, f: &LogFilter) {
     }
     if f.only_cache_hit == Some(true) {
         qb.push(" AND cache_hit = 1");
+    }
+    if let Some(p) = &f.protocol {
+        qb.push(" AND protocol_in = ").push_bind(p.clone());
+    }
+    match f.status.as_deref() {
+        Some(STATUS_OK) => {
+            qb.push(" AND status_code < 400");
+        }
+        Some(STATUS_ERROR) => {
+            qb.push(" AND status_code >= 400");
+        }
+        _ => {}
+    }
+    if let Some(s) = f.is_stream {
+        qb.push(" AND is_stream = ").push_bind(s as i64);
+    }
+    if let Some(m) = &f.model_like {
+        // 转义 LIKE 的通配符：模型名里出现 % 或 _ 时不该被当成通配符。
+        let escaped = m.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        qb.push(" AND model LIKE ")
+            .push_bind(format!("%{escaped}%"))
+            .push(" ESCAPE '\\'");
     }
 }
 
@@ -1083,5 +1205,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 1, "清空日志不应影响计费聚合");
+    }
+
+    // -----------------------------------------------------------------------
+    // 筛选
+    // -----------------------------------------------------------------------
+
+    /// 造一条可控的日志：状态码、协议、是否流式都从外面给。
+    fn shaped(id: &str, model: &str, status: i32, protocol: &str, stream: bool) -> RequestLogRecord {
+        RequestLogRecord {
+            status_code: status,
+            protocol_in: protocol.into(),
+            is_stream: stream,
+            ..rec(id, "claude-code", model)
+        }
+    }
+
+    async fn query_ids(p: &SqlitePool, f: LogFilter) -> Vec<String> {
+        let (items, _) = query(p, &f).await.unwrap();
+        items.into_iter().map(|r| r.request_id).collect()
+    }
+
+    #[tokio::test]
+    async fn protocol_filter_selects_only_that_protocol() {
+        let p = pool().await;
+        insert(&p, &shaped("a", "m", 200, "anthropic", false)).await.unwrap();
+        insert(&p, &shaped("b", "m", 200, "openai_chat", false)).await.unwrap();
+
+        let ids = query_ids(&p, LogFilter {
+            protocol: Some("anthropic".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_protocol_name_filters_nothing_instead_of_erroring() {
+        // 筛选条件来自前端状态，可能是过期的。它该被忽略，而不是让页面报错。
+        let p = pool().await;
+        insert(&p, &shaped("a", "m", 200, "anthropic", false)).await.unwrap();
+
+        let ids = query_ids(&p, LogFilter {
+            protocol: Some("gemini".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(ids, vec!["a"], "认不出的协议名等同于不筛");
+    }
+
+    #[tokio::test]
+    async fn status_filter_splits_success_from_failure() {
+        let p = pool().await;
+        insert(&p, &shaped("ok", "m", 200, "anthropic", false)).await.unwrap();
+        insert(&p, &shaped("bad", "m", 502, "anthropic", false)).await.unwrap();
+
+        let ok = query_ids(&p, LogFilter {
+            status: Some(STATUS_OK.into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(ok, vec!["ok"]);
+
+        let bad = query_ids(&p, LogFilter {
+            status: Some(STATUS_ERROR.into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(bad, vec!["bad"]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_status_value_filters_nothing() {
+        let p = pool().await;
+        insert(&p, &shaped("a", "m", 500, "anthropic", false)).await.unwrap();
+
+        let ids = query_ids(&p, LogFilter {
+            status: Some("失败的".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn is_stream_filter_separates_the_two_kinds() {
+        let p = pool().await;
+        insert(&p, &shaped("s", "m", 200, "anthropic", true)).await.unwrap();
+        insert(&p, &shaped("n", "m", 200, "anthropic", false)).await.unwrap();
+
+        let streaming = query_ids(&p, LogFilter {
+            is_stream: Some(true),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(streaming, vec!["s"], "只看流式时非流式必须被排除");
+
+        let plain = query_ids(&p, LogFilter {
+            is_stream: Some(false),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(plain, vec!["n"]);
+    }
+
+    #[tokio::test]
+    async fn model_like_matches_a_fragment() {
+        let p = pool().await;
+        insert(&p, &rec("a", "c", "claude-sonnet-5")).await.unwrap();
+        insert(&p, &rec("b", "c", "gpt-5")).await.unwrap();
+
+        let ids = query_ids(&p, LogFilter {
+            model_like: Some("sonnet".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn model_like_does_not_treat_user_input_as_a_wildcard() {
+        // 用户输入的 % 应当当作普通字符：把 "gpt-5" 输成 "gpt%" 不该匹配到所有 gpt 模型。
+        let p = pool().await;
+        insert(&p, &rec("a", "c", "gpt-5")).await.unwrap();
+        insert(&p, &rec("b", "c", "gpt%5")).await.unwrap();
+
+        let ids = query_ids(&p, LogFilter {
+            model_like: Some("gpt%5".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(ids, vec!["b"], "% 必须被转义成字面量");
+    }
+
+    #[tokio::test]
+    async fn filters_combine_with_and() {
+        let p = pool().await;
+        insert(&p, &shaped("hit", "m", 200, "anthropic", true)).await.unwrap();
+        insert(&p, &shaped("no-stream", "m", 200, "anthropic", false)).await.unwrap();
+        insert(&p, &shaped("other-proto", "m", 200, "openai_chat", true)).await.unwrap();
+
+        let ids = query_ids(&p, LogFilter {
+            protocol: Some("anthropic".into()),
+            is_stream: Some(true),
+            status: Some(STATUS_OK.into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(ids, vec!["hit"], "多个条件必须同时生效");
+    }
+
+    #[tokio::test]
+    async fn an_empty_filter_returns_everything() {
+        let p = pool().await;
+        insert(&p, &rec("a", "c", "m1")).await.unwrap();
+        insert(&p, &rec("b", "c", "m2")).await.unwrap();
+
+        let (items, total) = query(&p, &LogFilter::default()).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(total, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // 筛选下拉的数据源
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn facets_lists_distinct_sorted_values() {
+        let p = pool().await;
+        insert(&p, &shaped("a", "m1", 200, "anthropic", false)).await.unwrap();
+        insert(&p, &shaped("b", "m2", 200, "anthropic", false)).await.unwrap();
+        insert(&p, &shaped("c", "m1", 200, "openai_chat", false)).await.unwrap();
+
+        let f = facets(&p, 100).await.unwrap();
+        assert_eq!(f.models, vec!["m1", "m2"], "必须去重且有序");
+        assert_eq!(f.protocols, vec!["anthropic", "openai_chat"]);
+        assert_eq!(f.clients, vec!["claude-code"]);
+    }
+
+    #[tokio::test]
+    async fn facets_on_an_empty_table_is_empty_not_an_error() {
+        let p = pool().await;
+        let f = facets(&p, 100).await.unwrap();
+        assert!(f.models.is_empty());
+        assert!(f.clients.is_empty());
     }
 }

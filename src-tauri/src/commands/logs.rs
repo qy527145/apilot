@@ -24,6 +24,14 @@ pub async fn query_logs(
     Ok(Page { items, total })
 }
 
+/// 筛选下拉的候选值。前端进监控页时取一次。
+#[tauri::command]
+pub async fn list_log_facets(
+    shell: State<'_, Arc<AppShell>>,
+) -> AppResult<crate::storage::logs::LogFacets> {
+    crate::storage::logs::facets(&shell.db, 2000).await
+}
+
 /// 详情命令的返回：日志 + 捕获原文 + 语义化视图。
 ///
 /// `flatten` 让前端看到的就是一个扁平的 `RequestDetail` 再加一个 `views` 字段

@@ -37,6 +37,19 @@ impl Protocol {
         }
     }
 
+    /// [`Protocol::as_str`] 的逆运算。
+    ///
+    /// `as_str` 的产物会落到 `request_logs.protocol_in/out`，按它筛日志时就需要
+    /// 反向解析。两者必须成对维护 —— 落库的名字改了而这里没改，筛选会静默失效。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "anthropic" => Some(Self::AnthropicMessages),
+            "openai_chat" => Some(Self::OpenAiChat),
+            "openai_responses" => Some(Self::OpenAiResponses),
+            _ => None,
+        }
+    }
+
     /// 依据请求路径推断协议。识别不出时返回 `None`，由调用方决定回落策略。
     pub fn from_path(path: &str) -> Option<Self> {
         let p = path.trim_end_matches('/');
@@ -525,5 +538,20 @@ mod tests {
                 p
             );
         }
+    }
+
+    #[test]
+    fn parse_is_the_inverse_of_as_str() {
+        // 监控页按 `protocol_in` 筛日志时靠这条解析。落库用的名字改了而这里没改，
+        // 筛选会静默失效 —— 下拉里选什么都没反应，也不报错。
+        for p in [
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+        ] {
+            assert_eq!(Protocol::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(Protocol::parse("gemini"), None);
+        assert_eq!(Protocol::parse(""), None);
     }
 }

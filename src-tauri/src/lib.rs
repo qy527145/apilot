@@ -112,6 +112,7 @@ pub fn run() {
             commands::takeover::takeover_readiness,
             // --- 日志 ---
             commands::logs::query_logs,
+            commands::logs::list_log_facets,
             commands::logs::get_request_detail,
             commands::logs::clear_logs,
         ])

@@ -378,6 +378,8 @@ export interface CacheScope {
 
 /* ------------------------------ 日志 ------------------------------ */
 
+export type LogStatus = "ok" | "error";
+
 export interface LogFilter {
   client?: string | null;
   model?: string | null;
@@ -385,8 +387,21 @@ export interface LogFilter {
   from?: number | null;
   to?: number | null;
   only_cache_hit?: boolean | null;
+  /** 入站协议。认不出的值后端会忽略（等同于不筛）。 */
+  protocol?: Protocol | null;
+  status?: LogStatus | null;
+  is_stream?: boolean | null;
+  /** 模型名模糊匹配（`model` 是精确匹配）。 */
+  model_like?: string | null;
   limit: number;
   offset: number;
+}
+
+/** 筛选下拉的候选值，来自最近这些请求里实际出现过的内容。 */
+export interface LogFacets {
+  clients: string[];
+  models: string[];
+  protocols: string[];
 }
 
 export interface RequestLog {
@@ -524,6 +539,36 @@ export interface UnifiedUsage {
   total_tokens: number;
   source: "upstream" | "local_estimate";
 }
+
+/**
+ * 流式增量在**实时流**里的推流形态。与后端 `traffic::stream_events::StreamDelta`
+ * 一一对应。
+ *
+ * 为什么要单独一个类型，而不是直接复用 IR 的 `UnifiedDelta`：后者用内部标签
+ * `type`，而 `Finish(FinishReason)` 里包着的枚举**也**用 `type` 当标签，两者会拼出
+ * `{"type":"finish","type":"tool_use"}` 这种重复键。`JSON.parse` 只留最后一个，
+ * 前端就再也认不出这是 finish。所以推流侧换用 `kind`。
+ *
+ * 只有监控页的实时流用得到它 —— 请求明细那边看的是重建好的 `UnifiedResponse`。
+ */
+export type StreamDelta =
+  | { kind: "message_start"; id: string; model: string }
+  | { kind: "block_start"; index: number; block: ContentBlock }
+  | { kind: "text"; index: number; text: string }
+  | { kind: "thinking"; index: number; text: string }
+  | { kind: "tool_input"; index: number; partial_json: string }
+  | { kind: "block_stop"; index: number }
+  | {
+      kind: "usage";
+      input_tokens?: number | null;
+      output_tokens?: number | null;
+      cache_read_tokens?: number | null;
+      cache_creation_tokens?: number | null;
+      reasoning_tokens?: number | null;
+      total_tokens?: number | null;
+    }
+  | { kind: "finish"; reason: FinishReason }
+  | { kind: "error"; code: string; message: string };
 
 export interface DecodedRequest {
   protocol: string;
@@ -752,6 +797,8 @@ export const api = {
 
   /* ---- logs ---- */
   queryLogs: (filter: LogFilter) => call<Page<RequestLog>>("query_logs", { filter }),
+  /** 筛选下拉的候选值。进监控页时取一次即可。 */
+  listLogFacets: () => call<LogFacets>("list_log_facets"),
   getRequestDetail: (requestId: string) =>
     call<RequestDetail>("get_request_detail", { requestId }),
   /** 清空请求明细与原文捕获。计费聚合不受影响。 */

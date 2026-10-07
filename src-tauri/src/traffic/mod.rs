@@ -4,6 +4,7 @@
 //! 统计互补：DB 回答"过去一小时花了多少"，这里回答"现在正在跑什么"。
 
 pub mod events;
+pub mod stream_events;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -53,12 +54,21 @@ impl Default for TrafficStats {
 }
 
 /// 事件名。前端 `listen` 用这些字符串订阅。
+///
+/// **改这里就必须同步改前端 `src/lib/events.ts` 的 `ApilotEventMap`** ——
+/// 两边都是字面量，对不上不会报错，只会静默收不到。
 pub mod event_names {
     pub const GATEWAY: &str = "apilot://gateway";
     pub const TRAFFIC: &str = "apilot://traffic";
     pub const REQUEST: &str = "apilot://request";
     pub const SELECTOR_CHANGED: &str = "apilot://selector-changed";
     pub const CACHE: &str = "apilot://cache";
+    /// 请求开始（监控页「进行中」列表的进入点）。
+    pub const REQUEST_START: &str = "apilot://request-start";
+    /// 请求结束（离开点）。与 `REQUEST` 分开，见 `stream_events::RequestFinished`。
+    pub const REQUEST_END: &str = "apilot://request-end";
+    /// 流式请求的实时事件批次。
+    pub const STREAM: &str = "apilot://stream";
 }
 
 impl TrafficStats {

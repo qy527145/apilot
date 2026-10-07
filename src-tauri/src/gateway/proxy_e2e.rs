@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::HeaderMap;
 
-use crate::gateway::stream::{translate_stream, StreamOutcome, StreamTimeouts};
+use crate::gateway::stream::{translate_stream_observed, StreamOutcome, StreamTimeouts};
 use crate::protocol::anthropic::{AnthropicStreamDecoder, AnthropicStreamEncoder};
 use crate::protocol::oai_chat::{ChatStreamDecoder, ChatStreamEncoder};
 use crate::protocol::dto::Protocol;
@@ -184,15 +184,15 @@ async fn run_pipeline(
         None
     };
 
-    let body = translate_stream(
+    let body = translate_stream_observed(
         stream,
         decoder,
         encoder,
         StreamTimeouts::default(),
+        None,
         move |o| {
             let _ = tx.send(o);
-        },
-    );
+        });
 
     let bytes = drain(body).await;
     let outcome = rx.await.expect("on_finish 应当被调用");
@@ -311,15 +311,15 @@ async fn chat_upstream_to_anthropic_client_end_to_end() {
     };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let body = translate_stream(
+    let body = translate_stream_observed(
         stream,
         Box::new(ChatStreamDecoder::new()),
         Some(Box::new(AnthropicStreamEncoder::new())),
         StreamTimeouts::default(),
+        None,
         move |o| {
             let _ = tx.send(o);
-        },
-    );
+        });
 
     let bytes = drain(body).await;
     let down = String::from_utf8_lossy(&bytes).to_string();

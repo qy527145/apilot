@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { GatewayStatus, RequestLog } from "@/lib/api";
+import type { GatewayStatus, RequestLog, StreamDelta } from "@/lib/api";
 
 /* ================================================================== */
 /* 事件负载类型契约                                                    */
@@ -19,11 +19,53 @@ export interface SelectorChanged {
   reason: string;
 }
 
+/** 请求开始。监控页据此把一条记录放进「进行中」。 */
+export interface RequestStarted {
+  request_id: string;
+  ts: number;
+  client: string;
+  model: string;
+  path: string;
+  protocol_in: string;
+  provider_tag: string;
+  is_stream: boolean;
+}
+
+/** 请求结束。与 `apilot://request` 分开：那个会丢负载，当不了结束信号。 */
+export interface RequestFinished {
+  request_id: string;
+  status_code: number;
+  error?: string | null;
+}
+
+/** 流式请求里的一帧。 */
+export interface StreamFrame {
+  seq: number;
+  at_ms: number;
+  /** 上游原始 SSE 块原文（可能已截断）。 */
+  raw: string;
+  raw_truncated: boolean;
+  /** 该帧解码出的 IR 增量，解析失败时为空。 */
+  deltas: StreamDelta[];
+}
+
+/** 一批流事件。`done` 为真表示这条流结束了。 */
+export interface StreamBatch {
+  request_id: string;
+  frames: StreamFrame[];
+  done: boolean;
+  truncated: boolean;
+  error?: string | null;
+}
+
 export interface ApilotEventMap {
   "apilot://gateway": GatewayStatus;
   "apilot://traffic": TrafficSnapshot;
   "apilot://selector-changed": SelectorChanged;
   "apilot://request": RequestLog;
+  "apilot://request-start": RequestStarted;
+  "apilot://request-end": RequestFinished;
+  "apilot://stream": StreamBatch;
 }
 
 export type ApilotEventName = keyof ApilotEventMap;

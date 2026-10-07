@@ -89,4 +89,26 @@ impl EventBus {
     pub fn cache<T: serde::Serialize + Clone>(&self, payload: &T) {
         let _ = self.app.emit(event_names::CACHE, payload);
     }
+
+    /// 推送「请求开始」。低频（每请求一次），不节流 ——
+    /// 这是监控页「进行中」列表的进入点，漏一条就会留下一个永远不消失的幽灵。
+    pub fn request_started<T: serde::Serialize + Clone>(&self, payload: &T) {
+        let _ = self.app.emit(event_names::REQUEST_START, payload);
+    }
+
+    /// 推送「请求结束」。同样不节流。
+    ///
+    /// 不能复用 [`EventBus::request`]：那个带 250ms 节流且会合并负载，
+    /// 用它当结束信号会让一部分请求永远停在「进行中」。
+    pub fn request_finished<T: serde::Serialize + Clone>(&self, payload: &T) {
+        let _ = self.app.emit(event_names::REQUEST_END, payload);
+    }
+}
+
+impl crate::traffic::stream_events::StreamEventSink for EventBus {
+    /// 流事件已经由 `StreamBatcher` 攒过批了，这里直接发，**不要再节流** ——
+    /// 节流会丢帧，而流事件丢一帧就是内容缺一块。
+    fn emit(&self, event: &crate::traffic::stream_events::StreamEvent) {
+        let _ = self.app.emit(event_names::STREAM, event);
+    }
 }

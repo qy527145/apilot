@@ -248,7 +248,7 @@ quota           += tool_call_surcharge × 工具调用次数
 | `providers.rs` | 渠道 CRUD、模型映射、**`candidate_channels`**（按每模型优先级排序，路由的候选来源）/ `candidates_for_model`（含停用渠道，模型页展示用）、**`set_model_candidates`**（跨渠道写，与 `set_models` 是同一张表的两个方向）、`has_declared_models`（接管前置条件） |
 | `routing.rs` | 路由规则 / selector / 兜底配置的读写；`ensure_default_selector` |
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
-| `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站）；`query`（动态过滤）、`get_detail`、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧 |
+| `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站 / **发给客户端的响应头**）；`query`（动态过滤：时间、客户端、模型、协议、状态、是否流式）、`get_detail`、`facets`（筛选下拉的候选值）、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧 |
 | `model_policies.rs` | 每模型的渠道选择策略读写。**没有行 = 交给 selector 与路由规则** |
 | `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` |
 
@@ -271,6 +271,7 @@ quota           += tool_call_surcharge × 工具调用次数
 |---|---|
 | `mod.rs` | `TrafficStats`（并发守护 `ActiveRequest`、累计计数、TTFB 环形窗口）、`TrafficEvent` |
 | `events.rs` | `EventBus`（按类型推送 + 节流）、`Throttle`、`event_names` |
+| `stream_events.rs` | **流式实时事件**：`StreamBatcher`（攒批 + 封顶 + 单帧截断，纯逻辑）、`StreamEmitter`（观察者实现，`Drop` 兜底断连）、`StreamDelta`（推流用的增量形态） |
 
 **事件名**（前端 `listen` 用的字面量，改了就静默破坏订阅）：
 
@@ -280,10 +281,26 @@ apilot://traffic           → TrafficEvent { rps, active, ttfb_p50_ms, total_re
 apilot://selector-changed  → SelectionEvent { selector, provider_tag, reason }
 apilot://request           → RequestLog
 apilot://cache             → CacheStats
+apilot://request-start     → RequestStarted   （监控页「进行中」的进入点）
+apilot://request-end       → RequestFinished  （离开点；不节流，见下）
+apilot://stream            → StreamEvent      （流式请求的实时事件批次）
 ```
 
 并发计数用 **RAII 守卫**而非手工 inc/dec：请求从多个分支提前返回（协议错误、上游失败、
 客户端断连），手工递减必然漏掉某条路径，导致并发数只增不减。
+
+**`request-end` 为什么不复用 `apilot://request`**：后者走 `EventBus::request`，
+带 250ms 节流且会合并负载 —— 当「结束」信号用会让一部分请求永远停在「进行中」。
+`request-start` / `request-end` 都是小而必达、不节流的。
+
+**流式请求的结束由 `StreamEmitter` 负责，不走 `Recorder::finish`**：流真正跑完
+才算结束，而 `Recorder` 早就返回了。客户端断连时转发生成器在 `yield` 点被丢弃，
+`on_finish` 根本不会执行 —— `StreamEmitter` 的 `Drop` 是唯一的兜底。
+
+**推流增量用 `StreamDelta` 而不是直接序列化 `UnifiedDelta`**：后者用内部标签
+`type`，而 `Finish(FinishReason)` 里包的枚举**也**用 `type` 当标签，会拼出
+`{"type":"finish","type":"tool_use"}` 这种重复键，前端 `JSON.parse` 只留最后一个。
+推流侧因此换用 `kind`。
 
 ---
 
@@ -299,7 +316,7 @@ apilot://cache             → CacheStats
 | `cache.rs` | 4 | `cache_stats`、`clear_cache`、策略读写 |
 | `takeover.rs` | 6 | `detect_clients`、`takeover_status`、`takeover_readiness`（接管前置条件）、`preview_takeover`、`apply_takeover`、`restore_client` |
 | `models.rs` | 8 | 模型视角：`list_model_catalog` / `list_model_options`、`get_model_policy`（模型替换，与 `app.rs` 的 `set_model_policy` 一对）、`upsert_model_policy` / `reset_model_policy` / `switch_model_channel`（每模型选渠道）、`set_model_candidates`、`probe_model_candidates` |
-| `logs.rs` | 3 | `query_logs`、`get_request_detail`、`clear_logs`（只清明细与捕获，不动 `usage_hourly`） |
+| `logs.rs` | 3 | `query_logs`、`list_log_facets`（筛选下拉的候选值），`get_request_detail`、`clear_logs`（只清明细与捕获，不动 `usage_hourly`） |
 
 **命令注册**：全部在 `lib.rs` 的 `generate_handler!` 里，用**完整路径**。
 `#[tauri::command]` 生成的 `__cmd__*` 宏项不参与 re-export，不能用 `pub use` 转发。
@@ -359,7 +376,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明）、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
-| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应」两段，内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细） |
+| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应」两段，内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间线 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
 只会在运行时静默失败。

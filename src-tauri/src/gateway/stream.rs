@@ -189,15 +189,35 @@ impl Default for StreamTimeouts {
     }
 }
 
+/// 流式过程中的实时观察者。
+///
+/// 与 `on_finish` 分开：finish 只在收尾跑一次，可以做重活（计费、写库、落捕获）；
+/// 观察者在每个 SSE 事件上被调用，必须廉价、同步、绝不阻塞下游 —— 它跑在
+/// 转发循环里，慢一点就是客户端多等一点。
+///
+/// 存在的理由：流式请求在整条流结束前不落库，不在这里插一脚，前端就只能
+/// 对着空列表猜请求是不是还活着。
+pub trait StreamObserver: Send + 'static {
+    /// 一个上游 SSE 块被解码后。`raw` 是该块的原文（直通时就是客户端收到的那份）。
+    ///
+    /// 解析失败时 `deltas` 为空，但**照样要回调** —— 坏帧正是排查时最想看的东西。
+    fn on_event(&mut self, raw: &str, deltas: &[UnifiedDelta]);
+
+    /// 流结束（正常、出错或客户端断连）时调用一次。
+    fn on_finish(&mut self, error: Option<&str>);
+}
+
 /// 把一个上游字节流变成客户端可读的响应体。
 ///
 /// `encoder` 为 `None` 时走直通：原样转发上游字节。
+/// `observer` 为 `None` 时不推实时事件流（测试与不需要该能力的调用方走这条）。
 /// `on_finish` 在流结束时调用一次，用于记账、写缓存与发事件。
-pub fn translate_stream<F>(
+pub fn translate_stream_observed<F>(
     upstream: BoxStream<'static, reqwest::Result<Bytes>>,
     mut decoder: Box<dyn StreamDecoder>,
     mut encoder: Option<Box<dyn StreamEncoder>>,
     timeouts: StreamTimeouts,
+    mut observer: Option<Box<dyn StreamObserver>>,
     on_finish: F,
 ) -> Body
 where
@@ -264,11 +284,16 @@ where
                     Ok(d) => d,
                     Err(e) => {
                         // 单个事件解析失败不该中断整条流 —— 记下来继续，
-                        // 否则客户端的回答会被从中间截断。
+                        // 否则客户端的回答会被从中间截断。观察者照样收到这个块，
+                        // 只是增量是空的：坏帧恰恰是排查时最该看见的。
                         tracing::warn!("流事件解析失败，已跳过: {e}");
-                        continue;
+                        Vec::new()
                     }
                 };
+
+                if let Some(o) = observer.as_mut() {
+                    o.on_event(&block, &deltas);
+                }
 
                 for d in &deltas {
                     if let UnifiedDelta::Finish(r) = d {
@@ -325,6 +350,9 @@ where
         outcome.raw_truncated = raw_upstream.truncated || raw_client.truncated;
         outcome.total = Some(start.elapsed());
 
+        if let Some(o) = observer.as_mut() {
+            o.on_finish(outcome.error.as_deref());
+        }
         if let Some(f) = on_finish.take() {
             f(outcome);
         }
@@ -460,15 +488,15 @@ mod tests {
         ];
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(chunks.clone()),
             Box::new(AnthropicStreamDecoder::new()),
             None, // 直通
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
 
         let bytes = run(body).await;
         let text = String::from_utf8_lossy(&bytes);
@@ -490,15 +518,15 @@ mod tests {
         ];
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(chunks),
             Box::new(AnthropicStreamDecoder::new()),
             None, // 直通
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         let bytes = run(body).await;
 
         let outcome = rx.await.unwrap();
@@ -521,15 +549,15 @@ mod tests {
         ];
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(chunks),
             Box::new(AnthropicStreamDecoder::new()),
             Some(Box::new(ChatStreamEncoder::new())),
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         let bytes = run(body).await;
 
         let outcome = rx.await.unwrap();
@@ -572,15 +600,15 @@ mod tests {
         ];
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(chunks),
             Box::new(AnthropicStreamDecoder::new()),
             Some(Box::new(ChatStreamEncoder::new())),
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
 
         let bytes = run(body).await;
         let text = String::from_utf8_lossy(&bytes);
@@ -601,15 +629,15 @@ mod tests {
         let second = "文\"}}\n\n";
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(vec![first, second]),
             Box::new(AnthropicStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
 
         let bytes = run(body).await;
         assert_eq!(
@@ -632,15 +660,15 @@ mod tests {
         ];
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(chunks),
             Box::new(AnthropicStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         run(body).await;
 
         let o = rx.await.unwrap();
@@ -658,15 +686,15 @@ mod tests {
         ];
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(chunks),
             Box::new(AnthropicStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         let bytes = run(body).await;
 
         assert!(
@@ -684,7 +712,7 @@ mod tests {
             Box::pin(futures::stream::pending());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             stalled,
             Box::new(AnthropicStreamDecoder::new()),
             None,
@@ -692,10 +720,10 @@ mod tests {
                 first_byte: Duration::from_millis(30),
                 idle: Duration::from_millis(30),
             },
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         run(body).await;
 
         let o = rx.await.unwrap();
@@ -708,15 +736,15 @@ mod tests {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = counter.clone();
 
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(vec!["data: [DONE]\n\n"]),
             Box::new(AnthropicStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             move |_| {
                 c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            },
-        );
+            });
         run(body).await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -792,15 +820,15 @@ mod tests {
     #[tokio::test]
     async fn empty_upstream_produces_no_output_but_still_finishes() {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(vec![]),
             Box::new(AnthropicStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         let bytes = run(body).await;
         assert!(bytes.is_empty());
         let o = rx.await.unwrap();
@@ -816,15 +844,15 @@ mod tests {
         ];
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(chunks),
             Box::new(ChatStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         run(body).await;
 
         let o = rx.await.unwrap();
@@ -835,15 +863,15 @@ mod tests {
     #[tokio::test]
     async fn sse_done_marker_alone_is_handled() {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(vec!["data: [DONE]\n\n"]),
             Box::new(AnthropicStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         let bytes = run(body).await;
         assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
         let _ = rx.await;
@@ -986,15 +1014,15 @@ mod tests {
         ];
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream(
+        let body = translate_stream_observed(
             upstream(chunks),
             Box::new(AnthropicStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             move |o| {
                 let _ = tx.send(o);
-            },
-        );
+            });
         run(body).await;
 
         let o = rx.await.unwrap();
