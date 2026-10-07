@@ -61,3 +61,12 @@ pub async fn set_model_policy(
     shell.update_settings(settings).await?;
     Ok(saved)
 }
+
+/// 校验一段模型脚本，`Some(错因)` 表示用不了。
+///
+/// 界面上是**保存前**的即时校验：规则里的脚本写错了只会静默不生效，
+/// 那种错用户很难自己发现。
+#[tauri::command]
+pub fn validate_model_script(source: String) -> Option<String> {
+    crate::routing::model_script::validate(&source).err()
+}

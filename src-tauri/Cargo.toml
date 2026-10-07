@@ -103,6 +103,17 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# --- 用户脚本（模型自定义规则）---
+# QuickJS 由 rquickjs-sys 用 cc 从自带的 C 源码现编，所以每个新 shell 都必须先
+# `source scripts/msvc-env.sh`，否则链接阶段会输给 Git Bash 自带的 /usr/bin/link。
+#
+# 只开 `std`，其余特性都是主动关掉的：
+#   `parallel`    会把 Runtime/Context 变成 Send+Sync，但不改变「必须同线程用」的事实，
+#                 还额外拉进 tokio 与一把全局锁 —— 我们要的只是能塞进 thread_local。
+#   `rust-alloc`  会让 set_memory_limit 静默失效，脚本的内存上限就没了。
+#   `loader` / `macro` / `futures`  这里一个都用不上。
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 

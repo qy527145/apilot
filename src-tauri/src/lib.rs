@@ -58,6 +58,7 @@ pub fn run() {
             commands::app::get_settings,
             commands::app::update_settings,
             commands::app::set_model_policy,
+            commands::app::validate_model_script,
             // --- 网关 ---
             commands::gateway::gateway_start,
             commands::gateway::gateway_stop,

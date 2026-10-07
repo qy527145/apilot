@@ -222,9 +222,14 @@ pub async fn handle(
     //
     // `request_model` 在 Recorder 初始化时已经填成了原始值，这里只动 `req.model`，
     // 让它带着生效模型往下走。
-    let policy = shell.settings().model_policy.clone();
-    let has_channels = if model_policy::needs_channel_check(&policy) {
-        // 只有 Fallback 模式需要这个判据，其余模式不白查一次库。
+    // 这里**不再 clone 整份 policy**：`settings()` 给的是 Arc，`ArcSwap` 没有守卫，
+    // 跨下面那次 await 持有它是安全的；而 policy 现在装着映射表与脚本文本，
+    // 每请求深拷贝一次纯属浪费。
+    let settings = shell.settings();
+    let policy = &settings.model_policy;
+
+    let has_channels = if model_policy::needs_channel_check(policy, &client) {
+        // 只有兜底模式需要这个判据，其余模式不白查一次库。
         crate::storage::providers::channels_for_model(&shell.db, &req.model)
             .await
             .map(|v| !v.is_empty())
@@ -232,7 +237,18 @@ pub async fn handle(
     } else {
         true
     };
-    req.model = model_policy::effective_model(&policy, &client, &req.model.clone(), has_channels);
+
+    // 先算到临时变量再赋值：`RequestCtx` 借着 `req.model`，让它在该借用的
+    // 生命周期里干净结束，别把"借用中又改写"这件事交给 NLL 去赌。
+    let effective = {
+        let ctx = model_policy::RequestCtx {
+            client: &client,
+            model: &req.model,
+            protocol: protocol.as_str(),
+        };
+        model_policy::effective_model(policy, &ctx, &ShellModelEnv { has_channels })
+    };
+    req.model = effective;
 
     // ---- 2. 路由决策 ----
     let est_tokens = estimate_request_tokens(&req);
@@ -365,13 +381,18 @@ pub async fn handle(
 
 /// 组装候选渠道：主渠道 + 其余（用于故障转移）。
 ///
-/// 主渠道由谁决定，取决于这个模型有没有在模型页配过策略：
+/// 主渠道由谁决定，取决于这个模型有没有配过渠道策略
+/// （`model_policies` 表，界面上在**路由页**的「模型的渠道选择」里改）：
 ///
-/// - **配过** → 按 `model_policies` 的策略排序，第一个当主渠道。
-///   这就是"像切换代理一样切换模型/渠道"的落点。
+/// - **配过** → 按策略在声明了这个模型的所有渠道里排序，第一个当主渠道。
+///   这就是"像切换代理一样切换渠道"的落点。
 /// - **没配过** → 沿用 `selector` 选出来的那个（现有行为，一键不动）。
 ///
 /// 这条界线是整个方案不破坏既有配置的基础，改动时别把它弄丢了。
+///
+/// 注意它是**模型策略 > selector**：模型配了策略，规则链选出来的 selector
+/// 就只剩"兜底"的意义了。这是刻意的 —— 别顺手把优先级反过来，
+/// 那会改变线上实际发请求的行为。
 async fn build_candidates(
     shell: &Arc<AppShell>,
     primary: &Arc<dyn Outbound>,
@@ -433,6 +454,25 @@ async fn build_candidates(
 
     prefer_native_protocol(&mut out, primary, protocol_in);
     out
+}
+
+/// 管线侧的 [`model_policy::ModelEnv`]。
+///
+/// 渠道检查用预先查好的结果（要不要查由 `needs_channel_check` 决定），
+/// 脚本则交给 `model_script` 的全局引擎 —— memo 缓存也在那边，这里看不见。
+/// 这是**唯一**把那个 trait 接到真实引擎上的地方，测试里换掉它就完全不碰 JS。
+struct ShellModelEnv {
+    has_channels: bool,
+}
+
+impl model_policy::ModelEnv for ShellModelEnv {
+    fn has_channels(&self, _: &str) -> bool {
+        self.has_channels
+    }
+
+    fn run_script(&self, source: &str, input: &model_policy::ScriptInput<'_>) -> Option<String> {
+        crate::routing::model_script::run(source, input)
+    }
 }
 
 /// 把候选渠道按「能原生说客户端协议」重排：能直通的不转换。
