@@ -1,5 +1,15 @@
 //! 发给 Codex 客户端的模型目录。
 //!
+//! ## 先说清楚：接管**不会**自动用它
+//!
+//! 默认方案是**给客户端换一个它不认识的模型名**（`takeover/clients.rs::codex_config`）——
+//! 一行配置、不用联网、不依赖任何客户端开关，效果是元数据退回 Codex 自己的兜底那份，
+//! 也就不是 Lite。代价是兜底元数据不带 `apply_patch`。
+//!
+//! 这个模块是给「想要完整元数据、包括 `apply_patch`」的人**手动**用的：自己在该
+//! provider 下配 `model_catalog_url`（见 [`CATALOG_PATH`]）。早先接管流程自动写过一版，
+//! 要同时注入两个 feature 开关才生效、侵入性太大，撤了。
+//!
 //! ## 为什么需要它
 //!
 //! Codex 用不用「Responses Lite」**只由模型元数据里的 `use_responses_lite` 决定**：
@@ -12,7 +22,7 @@
 //! 只能把调用写成 `<｜DSML｜｜ calls>` 这样的正文吐出来 —— 工具调用退化成纯文本，
 //! 客户端看起来就是「模型不肯用工具」。
 //!
-//! 所以网关把这份目录接管过来：内置目录逐条搬来、把 Lite 关掉，再回给客户端
+//! 这个模块把目录接管过来：内置目录逐条搬来、把 Lite 关掉，再回给客户端
 //! （见 [`catalog`]）。客户端因此换成经典顶层 `tools`，连 DeepSeek 都能正常收下。
 //!
 //! ## 三个字段必须一起改
@@ -52,16 +62,25 @@ const GENERIC_PROMPT: &str = include_str!("../../assets/codex/prompt.md");
 ///
 /// 刻意不复用 `/v1/models`：那个是 OpenAI 家列模型的公共接口，客户端会按自己的
 /// 理解解析；这里是 Codex 专用的元数据，混在一起迟早有一头被改坏。
-pub const CATALOG_PATH: &str = "/codex/models";
-
-/// 交给客户端的 `model_catalog_url`。
 ///
-/// 和 `ClientId::stored_base_url` 一样，是「网关地址 → 写进客户端配置的地址」这条
-/// 唯一路径的一部分：网关换地址时 `repoint_taken_over` 会重新生成，所以这里不接受
-/// 任何别处来的地址。
-pub fn catalog_url(base_url: &str) -> String {
-    format!("{}{CATALOG_PATH}", base_url.trim_end_matches('/'))
-}
+/// **接管流程不会把这个地址写进客户端配置。** 早先写过一版：自动写入
+/// `model_catalog_url`，外加 `features.api_key_model_discovery` 和
+/// `suppress_unstable_features_warning` 两个开关才让它生效 —— 一次接管多三行、
+/// 其中一个还是 Codex 的「开发中特性」，侵入性太大，改成了让用户自己选：
+/// 默认走「换一个 Codex 不认识的模型名」（见 `takeover/clients.rs::codex_config`），
+/// 想要 `apply_patch` 的人再手动配这里。
+///
+/// ```toml
+/// [model_providers.apilot]
+/// model_catalog_url = "http://127.0.0.1:8787/codex/models"
+///
+/// [features]
+/// api_key_model_discovery = true
+/// ```
+///
+/// 手动配上它换来的是「模型元数据完整」（含 `apply_patch`），代价是那两个开关，
+/// 以及客户端启动时必须够得着网关 —— 取不到会静默退回它内置那份（也就是 Lite）。
+pub const CATALOG_PATH: &str = "/codex/models";
 
 /// 打过补丁的目录 JSON，首次访问时构建。
 ///
@@ -186,12 +205,5 @@ mod tests {
         for expected in ["gpt-6-sol", "gpt-5.5", "codex-auto-review"] {
             assert!(slugs.iter().any(|s| s == expected), "少了 {expected}");
         }
-    }
-
-    #[test]
-    fn catalog_url_follows_the_gateway_address() {
-        assert_eq!(catalog_url("http://127.0.0.1:8787"), "http://127.0.0.1:8787/codex/models");
-        // 尾斜杠不能拼出 `//codex`，那在有些客户端是 404。
-        assert_eq!(catalog_url("http://127.0.0.1:8787/"), "http://127.0.0.1:8787/codex/models");
     }
 }

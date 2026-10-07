@@ -242,6 +242,13 @@ export interface AppSettings {
   cache_max_entries: number;
   /** 模型替换。默认 `mode: "passthrough"`（不改写）。 */
   model_policy: ModelPolicy;
+  /**
+   * 接管客户端时，把「当前配置的模型」也写进客户端配置。
+   *
+   * 默认关。主要给 Codex 用：GPT 系模型名在它内置目录里会走 Responses Lite，
+   * 工具被塞进 `input[].additional_tools`，而有些上游对这形状是静默失效的。
+   */
+  inject_client_model: boolean;
   /** 全局出站代理。默认 `mode: "system"`（跟随环境变量）。 */
   proxy: ProxySettings;
 }

@@ -11,6 +11,8 @@ import type { ViewKey } from "@/components/layout/nav";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
   DialogContent,
@@ -27,8 +29,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { qk } from "@/hooks/queries";
-import { api, type ClientDetect } from "@/lib/api";
+import { qk, useSettings } from "@/hooks/queries";
+import { api, type AppSettings, type ClientDetect } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 export default function ClientsPage({
@@ -55,6 +57,22 @@ export default function ClientsPage({
     retry: 1,
   });
   const blocked = readiness ? !readiness.ready : false;
+
+  // 这个开关存在全局设置里（`AppSettings.inject_client_model`），但它的效果只在
+  // 「接管」这一步发生，所以放在这一页而不是设置页。
+  const { data: settings } = useSettings();
+  const saveInject = useMutation({
+    mutationFn: (inject: boolean) =>
+      api.updateSettings({ ...(settings as AppSettings), inject_client_model: inject }),
+    onSuccess: (s) => {
+      qc.setQueryData(qk.settings, s);
+      toast.success(
+        s.inject_client_model
+          ? "已开启：下次接管会把当前模型写进客户端配置"
+          : "已关闭：接管不再改动客户端选的模型",
+      );
+    },
+  });
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: qk.clients });
@@ -124,6 +142,29 @@ export default function ClientsPage({
             </Button>
           </div>
         )}
+
+        <Card>
+          <CardContent className="flex items-start justify-between gap-4 py-4">
+            <div className="space-y-1">
+              <Label>接管时写入当前模型</Label>
+              <p className="text-muted-foreground text-xs">
+                把「当前配置的模型」写进客户端配置。对 Codex 尤其有用：GPT 系模型名会让
+                它走 Responses Lite，工具被塞进 input 里的 additional_tools；而有些上游
+                收下这种请求、返回 200，工具却一个都不认，模型只能把工具调用当正文吐出来。
+                换成一个它不认识的名字，元数据就退回经典工具集。
+              </p>
+              <p className="text-muted-foreground text-xs">
+                代价：Codex 会失去 apply_patch（改用 shell 写文件），按模型名配的路由规则
+                也会跟着变。改完这个开关要重新接管一次才生效。
+              </p>
+            </div>
+            <Switch
+              checked={settings?.inject_client_model ?? false}
+              onCheckedChange={(v) => saveInject.mutate(v)}
+              disabled={!settings || saveInject.isPending}
+            />
+          </CardContent>
+        </Card>
 
         <Card className="py-0">
           <CardContent className="p-0">

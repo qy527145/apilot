@@ -30,7 +30,7 @@ pub fn preview_takeover(shell: State<'_, Arc<AppShell>>, client: String) -> AppR
     let id = ClientId::parse(&client).ok_or(AppError::UnknownClient(client))?;
     let base_url = gateway_base_url(&shell)?;
 
-    let patches = id.plan_apply(&base_url)?;
+    let patches = id.plan_apply(&base_url, shell.settings().client_model(id.as_str()))?;
 
     let mut out = String::new();
     for p in patches {
@@ -72,7 +72,7 @@ pub async fn apply_takeover(
     let base_url = gateway_base_url(&shell)?;
 
     let engine = TakeoverEngine::new();
-    let patches = id.plan_apply(&base_url)?;
+    let patches = id.plan_apply(&base_url, shell.settings().client_model(id.as_str()))?;
 
     let plan = TakeoverPlan {
         client: id.display_name().to_string(),

@@ -214,6 +214,9 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 只有它有，DeepSeek 已是 v4 命名），LiteLLM 模型更多但偏一手大厂。实测两者对
 个别模型（如 DeepSeek）报价能差一倍，所以界面上必须标出来源。
 
+**为什么不合成一个网络集成**：公开目录本来就同时维护价格和能力标志，分两次
+下载只是把同一个文件拉两遍。
+
 ---
 
 ### `codex/` — 发给客户端的模型目录
@@ -223,8 +226,16 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 | 文件 | 内容 |
 |---|---|
-| `mod.rs` | `catalog()`（内置目录 → 关掉 Responses Lite → 交给客户端）、`CATALOG_PATH`、`catalog_url` |
+| 文件 | 内容 |
+|---|---|
+| `mod.rs` | `catalog()`（内置目录 → 关掉 Responses Lite → 交给客户端）、`CATALOG_PATH` |
 | `../assets/codex/` | vendored 的 Codex 原文（`models.json` / `prompt.md`）+ 来源与更新说明 |
+
+**接管不会自动用它。** 默认那条路是「给客户端换一个它不认识的模型名」（见上面 takeover
+一节）：一行配置、不联网、不依赖客户端开关，代价是没有 `apply_patch`。这里这份是给
+**想要完整元数据的人手动配**的 —— 自己写 `model_catalog_url` 指向 `CATALOG_PATH`，
+外加 `[features] api_key_model_discovery = true`（不打开这个开关 Codex 根本不会去取）。
+早先接管流程自动写过一版，那两个开关让侵入性变得太大，撤了。
 
 **为什么要有它。** Codex 用不用 Responses Lite（把工具塞进 `input[].additional_tools`，
 形状是 `namespace > custom`）**只由模型元数据里的 `use_responses_lite` 决定**，而这份
@@ -234,7 +245,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 `/v1/responses` 就是）。直通转发看不出任何异常，模型那侧却一个工具都没有，只能把调用
 写成 `<｜DSML｜｜ calls>` 这样的正文 —— 客户端看到的是"模型把工具调用当普通文本吐出来"。
 
-所以网关把目录接管过来，逐条把 Lite 关掉再回给客户端。三个字段必须**一起**改：
+所以网关把目录接过来，逐条把 Lite 关掉再回给客户端。三个字段必须**一起**改：
 `use_responses_lite = false`（工具走顶层）、`tool_mode = "direct"`（否则 code mode 的
 自由格式 `exec` 会跑到顶层，而上游对顶层 `custom` 普遍只接受 `apply_patch`）、提示词换成
 通用那份（被 Lite 关住的条目，其提示词在教模型调 `functions.exec`，工具集一换就对不上）。
@@ -243,8 +254,9 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 目录是**整体替换**客户端内置那份的，所以 vendored 文件里每一条都得留着，包括不改的。
 拉取失败只会让客户端退回自己的兜底元数据（能用，只是没有 `apply_patch`），不会坏。
 
-**为什么不合成一个网络集成**：公开目录本来就同时维护价格和能力标志，分两次
-下载只是把同一个文件拉两遍。
+**它比换模型名多出来的只有 `apply_patch`**：兜底元数据（换名字那条路拿到的）不带这个工具，
+模型就只能用 shell 写文件。多出来的代价是客户端启动时必须够得着网关，以及那两个开关。
+
 
 ---
 
@@ -311,16 +323,26 @@ quota           += tool_call_surcharge × 工具调用次数
 判据是「客户端现在指的地址 ≠ 目标地址」，不是整份文件比 —— 后者会把用户手加的模型覆盖、
 密钥也当成"不一致"，然后被 `plan_apply` 抹掉。
 
-**Codex 额外写三样东西**（都在 `plan_codex` 里，原因是别让客户端走 Responses Lite，
-见 [`codex/`](#codex--发给客户端的模型目录)）：
+**Codex 多写的一样东西：模型名**（`plan_codex`，只在开关打开时写）。
 
-- `model_catalog_url` → 指向网关的 `/codex/models`。和 base_url 一样由**网关地址算出**，
-  所以换地址时跟着 `repoint_taken_over` 一起更新（同一个 `plan_apply` 重跑一遍就够）。
-- `features.api_key_model_discovery = true` —— **不打开这个开关，上面那行等于白写**：
-  Codex 不会去取 `model_catalog_url`。这条实测才发现（0.160.x 里它还是开发中特性，
-  默认关）。
-- `suppress_unstable_features_warning = true` —— 上一条会让 Codex 每次开会话都提示
-  「可能行为不可预期」。这个开关**只关警告本身**，不影响它提示别的开发中特性。
+Codex 用不用 Responses Lite 只由模型元数据决定，而 GPT 系名字在它**内置目录**里是
+Lite（工具塞进 `input[].additional_tools`）—— 那个形状对不少上游是**静默失效**的：
+收下请求、返回 200、工具一个不认，模型只能把调用写成 DSML 正文。换成一个它不认识的
+名字，元数据退回兜底那份（经典顶层 `tools`），**不用联网、不依赖任何客户端开关**。
+
+代价：兜底元数据不带 `apply_patch`（模型改用 shell 写文件），且按模型名配的路由规则会
+跟着变。所以它是**用户显式打开**的（`AppSettings::client_model`，客户端页的开关，默认关）。
+
+> 早先还写过一版自动注入 `model_catalog_url` + 两个 feature 开关的（见
+> [`codex/`](#codex--发给客户端的模型目录)），一次接管多三行、其中一个还是 Codex 的
+> 「开发中特性」，侵入性太大，撤成了**手动可选**。
+
+Claude Code / Gemini 那边**没有**注入模型：Claude 的接管反而是**清掉**模型覆盖键的，
+要给它注入得先想清楚和那个动作的关系。
+
+**判据是「客户端现在指的地址 ≠ 目标地址」**，所以只有地址变了才会写文件 —— 改上面那个
+开关本身不会触发写入，**改完开关要重新接管一次**。`repoint_taken_over` 逐客户端算模型名
+（模型策略允许给单个客户端单独指定），因此它收的是 `&AppSettings` 而不是一个模型名。
 
 ---
 

@@ -92,10 +92,15 @@ impl ClientId {
     }
 
     /// 生成接管改动。
-    pub fn plan_apply(&self, base_url: &str) -> AppResult<Vec<FilePatch>> {
+    ///
+    /// `client_model` 是要写进客户端配置的模型名（见 `AppSettings::client_model`）；
+    /// `None` 表示不碰客户端自己选的模型。**目前只有 Codex 消费它** —— 那儿的动机是
+    /// 绕开 Responses Lite（见 `plan_codex`）；Claude Code 那边我们反而是**清掉**模型
+    /// 覆盖键的，真要给它注入模型得先想清楚和那个动作的关系。
+    pub fn plan_apply(&self, base_url: &str, client_model: Option<&str>) -> AppResult<Vec<FilePatch>> {
         match self {
             Self::ClaudeCode => plan_claude(base_url),
-            Self::Codex => plan_codex(base_url),
+            Self::Codex => plan_codex(base_url, client_model),
             Self::GeminiCli => plan_gemini(base_url),
         }
     }
@@ -152,7 +157,14 @@ pub fn describe_all(engine: &TakeoverEngine) -> Vec<ClientInfo> {
 /// 哪儿跟它没关系 —— 顺手改掉就是越界，而且会毁掉用户手写的配置。
 ///
 /// 返回**真正被改动**的客户端名；没有变化时是空数组（绝大多数调用都是这种）。
-pub fn repoint_taken_over(base_url: &str) -> AppResult<Vec<String>> {
+///
+/// `settings` 用来取每个客户端各自要写的模型名（`AppSettings::client_model` 是按客户端
+/// 算的 —— 模型策略允许给单个客户端单独指定）。判据只看地址，所以改开关本身不会触发
+/// 写入：改完开关要重新接管一次才生效。
+pub fn repoint_taken_over(
+    base_url: &str,
+    settings: &crate::config::AppSettings,
+) -> AppResult<Vec<String>> {
     let engine = TakeoverEngine::new();
     let mut changed = Vec::new();
 
@@ -171,7 +183,7 @@ pub fn repoint_taken_over(base_url: &str) -> AppResult<Vec<String>> {
         }
 
         // 重跑一遍接管计划：改动只落在 floor keys 上，用户自己写的键原样保留。
-        let patches = id.plan_apply(base_url)?;
+        let patches = id.plan_apply(base_url, settings.client_model(id.as_str()))?;
         let plan = TakeoverPlan {
             client: id.display_name().to_string(),
             files: Vec::new(),
@@ -242,82 +254,81 @@ fn read_claude_base_url() -> Option<String> {
 // Codex
 // ---------------------------------------------------------------------------
 
-fn plan_codex(base_url: &str) -> AppResult<Vec<FilePatch>> {
+fn plan_codex(base_url: &str, client_model: Option<&str>) -> AppResult<Vec<FilePatch>> {
     let path = paths::codex_config_path();
     let original = patch::read_optional(&path)?.unwrap_or_default();
-
-    let table = format!("model_providers.{}", floor::CODEX_PROVIDER_NAME);
-    // Codex 会在 base_url 后面拼 `/responses`，所以这里带上 /v1。
-    let provider_base = format!("{}/v1", base_url.trim_end_matches('/'));
-
-    let content = patch::patch_toml(
-        &original,
-        &[
-            TomlOp::SetTop {
-                key: "model_provider".into(),
-                value: TomlValue::Str(floor::CODEX_PROVIDER_NAME.into()),
-            },
-            TomlOp::SetInTable {
-                table: table.clone(),
-                key: "name".into(),
-                value: TomlValue::Str("Apilot".into()),
-            },
-            TomlOp::SetInTable {
-                table: table.clone(),
-                key: "base_url".into(),
-                value: TomlValue::Str(provider_base),
-            },
-            // Codex 用 Responses 协议跟模型对话；我们网关会做协议转换。
-            TomlOp::SetInTable {
-                table: table.clone(),
-                key: "wire_api".into(),
-                value: TomlValue::Str("responses".into()),
-            },
-            // 让 Codex 来我们这儿取模型元数据，而不是用它内置那份 —— 内置那份把
-            // gpt-6-sol 一类的模型标成「Responses Lite」，工具会被塞进
-            // `input[].additional_tools`，而这形状对上游来说是**静默失效**的：
-            // 收下请求、返回 200，工具一个不认，模型只能把调用写成 DSML 正文。
-            // 详见 `crate::codex`。
-            TomlOp::SetInTable {
-                table: table.clone(),
-                key: "model_catalog_url".into(),
-                value: TomlValue::Str(crate::codex::catalog_url(base_url)),
-            },
-            // 留 false 的话 Codex 会先拿 websocket 连一次，失败再回落 —— 每次开
-            // 会话都白等一轮。网关只讲 HTTP。
-            TomlOp::SetInTable {
-                table: table.clone(),
-                key: "supports_websockets".into(),
-                value: TomlValue::Bool(false),
-            },
-            TomlOp::SetInTable {
-                table,
-                key: "experimental_bearer_token".into(),
-                value: TomlValue::Str(floor::LOCAL_PLACEHOLDER_KEY.into()),
-            },
-            // 拉 `model_catalog_url` 这件事在 Codex 里挂在 `api_key_model_discovery`
-            // 这个开关后面，不开就永远不去取，上面的地址等于白写。
-            TomlOp::SetInTable {
-                table: "features".into(),
-                key: "api_key_model_discovery".into(),
-                value: TomlValue::Bool(true),
-            },
-            // 上一条会被 Codex 归到「开发中特性」，每开一次会话都提示一遍
-            // 「可能行为不可预期」。这个开关不开用户就得天天看这句与己无关的警告；
-            // 开了就只关掉警告本身，不影响它提示别的开发中特性。
-            TomlOp::SetTop {
-                key: "suppress_unstable_features_warning".into(),
-                value: TomlValue::Bool(true),
-            },
-        ],
-    )?;
 
     // 刻意不动 ~/.codex/auth.json：那是用户的登录态，删掉会让人下次要重新登录。
     // 自定义 provider 走 experimental_bearer_token，不依赖 auth.json。
     Ok(vec![FilePatch {
         path,
-        content: Some(content),
+        content: Some(codex_config(&original, base_url, client_model)?),
     }])
+}
+
+/// [`plan_codex`] 的纯内核：原文件字节 → 改写后的字节。
+///
+/// 拆出来是为了测试能给固定输入。直接读 `~/.codex/config.toml` 的测试会随**本机**
+/// 配置变化 —— 断言看着通过，其实什么都没验。
+fn codex_config(
+    original: &[u8],
+    base_url: &str,
+    client_model: Option<&str>,
+) -> AppResult<Vec<u8>> {
+    let table = format!("model_providers.{}", floor::CODEX_PROVIDER_NAME);
+    // Codex 会在 base_url 后面拼 `/responses`，所以这里带上 /v1。
+    let provider_base = format!("{}/v1", base_url.trim_end_matches('/'));
+
+    let mut ops = vec![
+        TomlOp::SetTop {
+            key: "model_provider".into(),
+            value: TomlValue::Str(floor::CODEX_PROVIDER_NAME.into()),
+        },
+        TomlOp::SetInTable {
+            table: table.clone(),
+            key: "name".into(),
+            value: TomlValue::Str("Apilot".into()),
+        },
+        TomlOp::SetInTable {
+            table: table.clone(),
+            key: "base_url".into(),
+            value: TomlValue::Str(provider_base),
+        },
+        // Codex 用 Responses 协议跟模型对话；我们网关会做协议转换。
+        TomlOp::SetInTable {
+            table: table.clone(),
+            key: "wire_api".into(),
+            value: TomlValue::Str("responses".into()),
+        },
+        // 网关只讲 HTTP。留着 true 的话，哪天线上一默认打开 websocket，客户端会先
+        // 拿 ws 连一次、失败再回落 —— 每次开会话白等一轮。
+        TomlOp::SetInTable {
+            table: table.clone(),
+            key: "supports_websockets".into(),
+            value: TomlValue::Bool(false),
+        },
+        TomlOp::SetInTable {
+            table,
+            key: "experimental_bearer_token".into(),
+            value: TomlValue::Str(floor::LOCAL_PLACEHOLDER_KEY.into()),
+        },
+    ];
+
+    // 写模型名是**唯一**能让 Codex 别走 Responses Lite 的省事办法：GPT 系名字在它
+    // 内置目录里是 Lite，工具会被塞进 `input[].additional_tools`，而这形状对不少上游
+    // 是静默失效的（收下请求、返回 200、工具一个不认）。换成一个它不认识的名字，元数据
+    // 退回兜底那份 —— 经典顶层 `tools`，不用联网、不依赖任何开关。
+    //
+    // 代价要认：兜底元数据不带 `apply_patch`，模型会改用 shell 写文件；而且按模型名配的
+    // 路由规则会跟着变。所以这是**用户显式打开**的开关，不是默认行为。
+    if let Some(model) = client_model {
+        ops.push(TomlOp::SetTop {
+            key: "model".into(),
+            value: TomlValue::Str(model.to_string()),
+        });
+    }
+
+    patch::patch_toml(original, &ops)
 }
 
 fn read_codex_base_url() -> Option<String> {
@@ -432,11 +443,26 @@ mod tests {
 
     // --- Codex ---
 
+    /// 一份像样的用户配置：顶层有模型和思考档位，另有一个别的 provider。
+    /// 固定输入是刻意的 —— 直接读本机 `~/.codex/config.toml` 的测试会随环境变化，
+    /// 断言看着通过、其实什么都没验。
+    const CODEX_ORIGINAL: &[u8] = br#"model_provider = "kt"
+model = "gpt-6-sol"
+model_reasoning_effort = "medium"
+
+[model_providers.kt]
+name = "kt"
+base_url = "http://192.168.31.1:3000/v1"
+"#;
+
+    fn codex_doc(original: &[u8], model: Option<&str>) -> toml_edit::DocumentMut {
+        let out = codex_config(original, "http://127.0.0.1:8787", model).unwrap();
+        String::from_utf8(out).unwrap().parse().unwrap()
+    }
+
     #[test]
     fn codex_plan_sets_provider_and_wire_api() {
-        let patches = plan_codex("http://127.0.0.1:8787").unwrap();
-        let text = String::from_utf8(patches[0].content.clone().unwrap()).unwrap();
-        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        let doc = codex_doc(CODEX_ORIGINAL, None);
 
         assert_eq!(
             doc["model_provider"].as_str(),
@@ -445,78 +471,53 @@ mod tests {
         let provider = &doc["model_providers"][floor::CODEX_PROVIDER_NAME];
         assert_eq!(provider["base_url"].as_str(), Some("http://127.0.0.1:8787/v1"));
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        // 网关只讲 HTTP：声明成支持 websocket 会让客户端先白试一次 ws 再回落。
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
         assert_eq!(
             provider["experimental_bearer_token"].as_str(),
             Some(floor::LOCAL_PLACEHOLDER_KEY)
         );
+        // 开关关着时（这是默认）一个字都不碰模型设置。
+        assert_eq!(doc["model"].as_str(), Some("gpt-6-sol"));
     }
 
     #[test]
-    fn codex_plan_makes_the_client_stop_using_responses_lite() {
-        // 接管的核心目的之一：让 Codex 来取我们这份目录，而目录里所有模型都关掉了
-        // Responses Lite。它内置那份把 gpt-6-sol 标成 Lite，工具就被塞进
-        // `input[].additional_tools` —— 那个形状对不少上游是**静默失效**的
-        // （收下请求、返回 200，工具一个不认），模型只能把调用写成 DSML 正文。
-        let patches = plan_codex("http://127.0.0.1:8787").unwrap();
-        let text = String::from_utf8(patches[0].content.clone().unwrap()).unwrap();
-        let doc: toml_edit::DocumentMut = text.parse().unwrap();
-
-        let provider = &doc["model_providers"][floor::CODEX_PROVIDER_NAME];
-        // 目录不在 /v1 底下 —— 那是对话接口的前缀，带上会拼成 /v1/codex/models。
-        assert_eq!(
-            provider["model_catalog_url"].as_str(),
-            Some("http://127.0.0.1:8787/codex/models")
-        );
-        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
-        // 不打开这个开关，Codex 根本不会去取 model_catalog_url，上面那行等于白写。
-        assert_eq!(
-            doc["features"]["api_key_model_discovery"].as_bool(),
-            Some(true)
-        );
-        assert_eq!(
-            doc["suppress_unstable_features_warning"].as_bool(),
-            Some(true)
-        );
+    fn codex_plan_writes_the_model_that_keeps_lite_off() {
+        // 开关打开时写的这个名字，是**唯一**能省事绕开 Responses Lite 的东西：
+        // GPT 系名字在 Codex 内置目录里是 Lite，工具会被塞进 `input[].additional_tools`，
+        // 而这形状对不少上游是**静默失效**的（收下请求、返回 200、工具一个不认）。
+        // 换成一个它不认识的名字，元数据就退回兜底那份 —— 经典顶层 `tools`，
+        // 不联网、不依赖任何客户端开关。
+        let doc = codex_doc(CODEX_ORIGINAL, Some("deepseek-flash"));
+        assert_eq!(doc["model"].as_str(), Some("deepseek-flash"));
     }
 
     #[test]
-    fn codex_plan_keeps_the_users_own_feature_flags() {
-        // 铁律：只动「我拥有」的键。用户自己开过的 feature 不能被我们往
-        // `[features]` 里写的那一个键顺手清掉。
-        let original = b"[features]\nsome_other_flag = true\n";
-        let out = patch::patch_toml(
-            original,
-            &[TomlOp::SetInTable {
-                table: "features".into(),
-                key: "api_key_model_discovery".into(),
-                value: TomlValue::Bool(true),
-            }],
-        )
-        .unwrap();
-        let doc: toml_edit::DocumentMut = String::from_utf8(out).unwrap().parse().unwrap();
-        assert_eq!(doc["features"]["some_other_flag"].as_bool(), Some(true));
+    fn codex_plan_model_injection_keeps_neighbouring_keys() {
+        // 铁律：只动「我拥有」的键。往顶层写 `model` 不能顺手抹掉旁边的设置，
+        // 也不能碰用户别的 provider。
+        let doc = codex_doc(CODEX_ORIGINAL, Some("deepseek-flash"));
+
+        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("medium"));
         assert_eq!(
-            doc["features"]["api_key_model_discovery"].as_bool(),
-            Some(true)
+            doc["model_providers"]["kt"]["base_url"].as_str(),
+            Some("http://192.168.31.1:3000/v1")
         );
     }
 
     #[test]
     fn codex_plan_only_touches_config_toml() {
-        let patches = plan_codex("http://127.0.0.1:8787").unwrap();
+        let patches = plan_codex("http://127.0.0.1:8787", None).unwrap();
         assert_eq!(patches.len(), 1, "auth.json 必须不被触碰");
         assert!(patches[0].path.ends_with("config.toml"));
     }
 
     #[test]
     fn codex_plan_trailing_slash_does_not_double_up() {
-        let patches = plan_codex("http://127.0.0.1:8787/").unwrap();
-        let text = String::from_utf8(patches[0].content.clone().unwrap()).unwrap();
+        let out = codex_config(CODEX_ORIGINAL, "http://127.0.0.1:8787/", None).unwrap();
+        let text = String::from_utf8(out).unwrap();
         assert!(text.contains("http://127.0.0.1:8787/v1"));
         assert!(!text.contains("8787//v1"));
-        // 目录地址同理：尾斜杠不能拼出 `//codex`，那在客户端是 404。
-        assert!(text.contains("http://127.0.0.1:8787/codex/models"));
-        assert!(!text.contains("8787//codex"));
     }
 
     // --- Gemini ---
@@ -584,9 +585,9 @@ mod tests {
             Some(ClientId::ClaudeCode.stored_base_url(url).as_str())
         );
 
-        let codex = plan_codex(url).unwrap();
+        let codex = codex_config(CODEX_ORIGINAL, url, None).unwrap();
         let doc: toml_edit::DocumentMut =
-            String::from_utf8(codex[0].content.clone().unwrap()).unwrap().parse().unwrap();
+            String::from_utf8(codex).unwrap().parse().unwrap();
         assert_eq!(
             doc["model_providers"][floor::CODEX_PROVIDER_NAME]["base_url"].as_str(),
             Some(ClientId::Codex.stored_base_url(url).as_str())

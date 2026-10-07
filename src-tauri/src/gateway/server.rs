@@ -145,7 +145,7 @@ impl GatewayServer {
         // 没有变化时 `repoint_taken_over` 一个字节都不写，所以每次启动都来问一遍是安全的。
         // 失败只记日志：客户端配置没跟上不该让网关起不来。
         if let Some(base_url) = self.base_url() {
-            match crate::takeover::clients::repoint_taken_over(&base_url) {
+            match crate::takeover::clients::repoint_taken_over(&base_url, &shell.settings()) {
                 Ok(changed) if !changed.is_empty() => {
                     tracing::info!(%base_url, clients = ?changed, "已把接管的客户端指向新地址");
                 }

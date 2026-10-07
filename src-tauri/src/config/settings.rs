@@ -433,6 +433,19 @@ pub struct AppSettings {
     /// 全局模型替换。默认关闭。
     pub model_policy: ModelPolicy,
 
+    /// 接管客户端时，把「当前配置的模型」也写进客户端配置。
+    ///
+    /// **为什么需要这个开关。** Codex 用不用 Responses Lite 只由模型元数据决定，而
+    /// GPT 系名字内置就是 Lite（工具塞进 `input[].additional_tools`）—— 那个形状对
+    /// 不少上游是**静默失效**的：收下请求、返回 200、工具一个不认，模型只能把调用
+    /// 写成 DSML 正文。换成一个它不认识的名字，元数据就退回兜底那份（经典工具集）。
+    ///
+    /// **为什么默认关。** 它会覆盖用户在客户端里选的模型名；而按模型名配的路由规则、
+    /// 每模型渠道选择都会跟着变。对"模型策略已经把模型定死"的人（`Always` / `Fallback`
+    /// 且指定了 `active_model`）它是无副作用的，但那是用户自己该判断的事。
+    #[serde(default)]
+    pub inject_client_model: bool,
+
     /// 全局出站代理。默认跟随环境变量 —— 与引入本功能之前逐字等价。
     pub proxy: ProxySettings,
 }
@@ -456,12 +469,28 @@ impl Default for AppSettings {
             cache_max_entries: 1000,
 
             model_policy: ModelPolicy::default(), // 默认关闭
+            inject_client_model: false,            // 默认不碰客户端选的模型
             proxy: ProxySettings::default(),      // 默认跟随环境变量
         }
     }
 }
 
 impl AppSettings {
+    /// 接管 `client` 时要写进它配置的模型名；不该写时是 `None`。
+    ///
+    /// 三个条件缺一不可：开关开着、这个客户端的生效规则**指定了**模型、且那个模式
+    /// 真的会用它。`Custom` 和 `Passthrough` 都没有一个「Apilot 指定的模型名」可写 ——
+    /// 前者的模型要跑规则才知道，后者压根不改写，硬写一个名字反而会改变选路。
+    pub fn client_model(&self, client: &str) -> Option<&str> {
+        if !self.inject_client_model {
+            return None;
+        }
+        let rule = self.model_policy.effective(client);
+        match rule.mode {
+            ModelPolicyMode::Always | ModelPolicyMode::Fallback => rule.model,
+            _ => None,
+        }
+    }
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.listen_host, self.listen_port)
     }
@@ -767,6 +796,67 @@ mod tests {
         assert_eq!(n.form, CustomForm::Script);
         assert_eq!(n.table.len(), 1, "切成脚本不该把映射表丢掉");
         assert!(n.script.is_some());
+    }
+
+    #[test]
+    fn inject_client_model_needs_the_switch_and_a_named_model() {
+        // 开关关着时一个字都不写 —— 这是默认，用户选的模型名不该被我们改掉。
+        let settings = AppSettings {
+            inject_client_model: false,
+            model_policy: ModelPolicy {
+                mode: ModelPolicyMode::Fallback,
+                active_model: Some("deepseek-chat".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(settings.client_model("codex"), None);
+
+        // 打开开关、且策略真的指定了模型 —— 这时才有一个"Apilot 配置的模型"可写。
+        let settings = AppSettings {
+            inject_client_model: true,
+            ..settings
+        };
+        assert_eq!(settings.client_model("codex"), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn passthrough_mode_has_no_model_to_inject() {
+        // Passthrough 的意思就是"不改写客户端要的模型"，所以没有一个名字能写进
+        // 客户端配置；硬写一个反而会改变选路。
+        let settings = AppSettings {
+            inject_client_model: true,
+            model_policy: ModelPolicy {
+                mode: ModelPolicyMode::Passthrough,
+                active_model: Some("deepseek-chat".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(settings.client_model("codex"), None);
+    }
+
+    #[test]
+    fn injected_model_follows_each_clients_own_rule() {
+        // 模型策略允许给单个客户端单独指定模型；写进客户端配置的必须是**它自己**
+        // 生效的那个，不然客户端报的模型名和网关实际用的会对不上。
+        let mut policy = ModelPolicy {
+            mode: ModelPolicyMode::Fallback,
+            active_model: Some("deepseek-chat".into()),
+            ..Default::default()
+        };
+        policy.per_client.insert(
+            "codex".into(),
+            ClientOverride::Legacy("deepseek-reasoner".into()),
+        );
+        let settings = AppSettings {
+            inject_client_model: true,
+            model_policy: policy,
+            ..Default::default()
+        };
+
+        assert_eq!(settings.client_model("codex"), Some("deepseek-reasoner"));
+        assert_eq!(settings.client_model("claude-code"), Some("deepseek-chat"));
     }
 
     #[test]
