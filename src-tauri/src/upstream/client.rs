@@ -19,13 +19,47 @@ use crate::storage::models::{ChannelProxy, ChannelProxyMode};
 const NO_PROXY_LIST: &str = "localhost,127.0.0.1,::1,0.0.0.0,\
      10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,.local,.internal";
 
-/// 解析后的出站路径。**也是客户端缓存的键** —— 所以它必须完整描述客户端的一切
-/// 差异：两个渠道只有在解析结果相同时才能共用连接池。
+/// 解析后的出站路径（**不含** TLS 策略）。两个渠道只有在路径相同时才可能共用连接池，
+/// 但完整判定还要看 [`ClientSpec`]。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProxySpec {
     /// 明确直连，**连环境变量都不看**。
     Direct,
     Proxied { url: String },
+}
+
+/// 一个出站客户端的完整描述。**这就是客户端缓存的键** —— 所以它必须覆盖
+/// `reqwest::Client` 的一切差异：两个渠道只有在 `ClientSpec` 相等时才能共用连接池。
+///
+/// 为什么把 TLS 策略单拎出来、而不是塞进 `ProxySpec` 的变体里：走不走代理（路由）
+/// 和校不校验对端证书（TLS）是正交的两件事，揉在一起会让 `Direct` 读出
+/// "直连但校验"这种把路由和策略混为一谈的语义。分开之后，以后要把证书策略下沉到
+/// 渠道级，也只是给这个结构体加字段。
+///
+/// 这个字段必须参与缓存键，不能只存在设置里：`ClientPool` 在进程里只建一次
+/// （`shell.rs`），跨 `reload` 存活。若键里不含 `insecure_tls`，用户拨动开关后
+/// `resolve` 出来的路径没变，池子会把**旧客户端**原样还回去 —— 表现为
+/// "开关无效，重启才好"。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClientSpec {
+    pub proxy: ProxySpec,
+    pub insecure_tls: bool,
+}
+
+impl ClientSpec {
+    /// 严格校验、按指定路径出站。绝大多数场景就是这个。
+    pub fn new(proxy: ProxySpec) -> Self {
+        Self {
+            proxy,
+            insecure_tls: false,
+        }
+    }
+
+    /// 带上 TLS 策略。`resolve_*` 用它把设置里的开关接进来。
+    pub fn with_tls(mut self, insecure_tls: bool) -> Self {
+        self.insecure_tls = insecure_tls;
+        self
+    }
 }
 
 /// reqwest 能处理的代理协议前缀。
@@ -55,8 +89,8 @@ pub fn sanitize_proxy_url(url: Option<&str>) -> Option<String> {
 }
 
 /// 全局设置解析成实际出站路径。`System` 模式在这里读环境变量。
-pub fn resolve_global(settings: &ProxySettings) -> ProxySpec {
-    resolve_global_with(settings, &env_proxy_url)
+pub fn resolve_global(settings: &ProxySettings) -> ClientSpec {
+    ClientSpec::new(resolve_global_with(settings, &env_proxy_url)).with_tls(settings.insecure_tls)
 }
 
 /// 同上，环境变量来源可注入 —— 测试不能去改进程环境（并行跑会互相踩）。
@@ -82,15 +116,21 @@ fn resolve_global_with(
 }
 
 /// 渠道级设置解析成实际出站路径。`Inherit` 才回头看全局。
-pub fn resolve_channel(channel: &ChannelProxy, global: &ProxySettings) -> ProxySpec {
-    match channel.mode {
+///
+/// TLS 策略不分渠道，一律取全局的 —— 这条渠道说「直连」只是不走代理，
+/// 不代表它要求更严格的校验。
+pub fn resolve_channel(channel: &ChannelProxy, global: &ProxySettings) -> ClientSpec {
+    let proxy = match channel.mode {
         ChannelProxyMode::Direct => ProxySpec::Direct,
         ChannelProxyMode::Manual => match sanitize_proxy_url(channel.url.as_deref()) {
             Some(url) => ProxySpec::Proxied { url },
-            None => resolve_global(global),
+            None => resolve_global_with(global, &env_proxy_url),
         },
-        ChannelProxyMode::Inherit | ChannelProxyMode::Unknown => resolve_global(global),
-    }
+        ChannelProxyMode::Inherit | ChannelProxyMode::Unknown => {
+            resolve_global_with(global, &env_proxy_url)
+        }
+    };
+    ClientSpec::new(proxy).with_tls(global.insecure_tls)
 }
 
 /// 按解析结果构造 HTTP 客户端。
@@ -100,7 +140,7 @@ pub fn resolve_channel(channel: &ChannelProxy, global: &ProxySettings) -> ProxyS
 /// - 首字节超时（网关侧 `first_byte_timeout_ms`）
 /// - 空闲超时（网关侧 `idle_timeout_ms`）
 /// - 渠道整体超时（渠道的 `timeout_ms`）
-pub fn build_with(spec: &ProxySpec) -> reqwest::Client {
+pub fn build_with(spec: &ClientSpec) -> reqwest::Client {
     let builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(90))
@@ -114,9 +154,23 @@ pub fn build_with(spec: &ProxySpec) -> reqwest::Client {
         .deflate(true)
         .zstd(true);
 
+    // 证书校验在代理设置之前施加：它管的是"对端证书"，与请求经不经代理无关，
+    // 直连内网自签名服务时同样要生效。放进 match 的某一支里就会漏掉另一支。
+    let builder = if spec.insecure_tls {
+        // 这里刻意用 warn 而不是 debug：关掉校验之后中间人无法再被发现，
+        // 事后排查"为什么请求被人改了"时，这条日志是唯一的线索。
+        tracing::warn!(
+            "已关闭上游 TLS 证书校验（设置里的「忽略 TLS 证书校验」）——\
+             出站连接的中间人将无法被发现，仅建议在本地抓包调试时开启"
+        );
+        builder.danger_accept_invalid_certs(true)
+    } else {
+        builder
+    };
+
     // 代理全部自己显式设置，不让 reqwest 隐式接管 —— 它的默认行为是读环境变量，
     // 那样「强制直连」根本不起作用（`no_proxy()` 那一支就是在关掉这个探测）。
-    let builder = match spec {
+    let builder = match &spec.proxy {
         ProxySpec::Direct => builder.no_proxy(),
         ProxySpec::Proxied { url } => match reqwest::Proxy::all(url) {
             Ok(proxy) => builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string(NO_PROXY_LIST))),
@@ -134,13 +188,13 @@ pub fn build_with(spec: &ProxySpec) -> reqwest::Client {
 ///
 /// 为什么不能每个渠道一个客户端：`Client` 的开销不在 clone（那是 Arc），而在构造 ——
 /// 每个实例自带连接池与 TLS 配置，而 `reload()` 在每次渠道增删改后都会跑一遍，
-/// 每次都新建会把已建立的连接全丢掉。客户端数量因此等于**不同代理地址的个数**，
-/// 通常 1~3 个。
+/// 每次都新建会把已建立的连接全丢掉。客户端数量因此等于**不同 [`ClientSpec`] 的个数**，
+/// 通常是 1（全部严格校验）或 2（拨过开关之后新旧共存到进程退出）。
 ///
-/// 代价：原本所有渠道共用一份 `pool_max_idle_per_host`，现在按代理各有一份，
-/// 同主机跨代理时空闲连接上限会相乘。本地应用量级，可以忽略。
+/// 代价：原本所有渠道共用一份 `pool_max_idle_per_host`，现在按 spec 各有一份，
+/// 同主机跨 spec 时空闲连接上限会相乘。本地应用量级，可以忽略。
 pub struct ClientPool {
-    cache: DashMap<ProxySpec, reqwest::Client>,
+    cache: DashMap<ClientSpec, reqwest::Client>,
     /// 测试用：任何 spec 都返回同一个客户端，免得每个用例都真去建连接池。
     fixed: Option<reqwest::Client>,
 }
@@ -168,7 +222,7 @@ impl ClientPool {
 
     /// 取一个客户端，取不到才构造。返回的是 owned `Client`（内部是 Arc），
     /// 守卫不跨 await 残留。
-    pub fn get(&self, spec: ProxySpec) -> reqwest::Client {
+    pub fn get(&self, spec: ClientSpec) -> reqwest::Client {
         if let Some(c) = &self.fixed {
             return c.clone();
         }
@@ -213,6 +267,7 @@ mod tests {
         ProxySettings {
             mode,
             url: url.map(str::to_string),
+            insecure_tls: false,
         }
     }
 
@@ -225,13 +280,22 @@ mod tests {
         || None
     }
 
+    /// 直连、严格校验的 spec —— 大多数用例只关心路径，用它省掉包装。
+    fn direct() -> ClientSpec {
+        ClientSpec::new(ProxySpec::Direct)
+    }
+
+    fn proxied(url: &str) -> ClientSpec {
+        ClientSpec::new(ProxySpec::Proxied { url: url.into() })
+    }
+
     #[test]
     fn client_builds_without_panicking() {
         for spec in [
-            ProxySpec::Direct,
-            ProxySpec::Proxied {
-                url: "http://127.0.0.1:7890".into(),
-            },
+            direct(),
+            proxied("http://127.0.0.1:7890"),
+            direct().with_tls(true),
+            proxied("http://127.0.0.1:7890").with_tls(true),
         ] {
             let _ = build_with(&spec);
         }
@@ -330,7 +394,7 @@ mod tests {
             mode: ChannelProxyMode::Direct,
             url: None,
         };
-        assert_eq!(resolve_channel(&channel, &global), ProxySpec::Direct);
+        assert_eq!(resolve_channel(&channel, &global).proxy, ProxySpec::Direct);
     }
 
     #[test]
@@ -338,7 +402,7 @@ mod tests {
         let global = settings(ProxyMode::Manual, Some("http://corp:8080"));
         let channel = ChannelProxy::default();
         assert_eq!(
-            resolve_channel(&channel, &global),
+            resolve_channel(&channel, &global).proxy,
             ProxySpec::Proxied {
                 url: "http://corp:8080".into()
             }
@@ -353,7 +417,7 @@ mod tests {
             url: Some("socks5://127.0.0.1:1080".into()),
         };
         assert_eq!(
-            resolve_channel(&channel, &global),
+            resolve_channel(&channel, &global).proxy,
             ProxySpec::Proxied {
                 url: "socks5://127.0.0.1:1080".into()
             }
@@ -363,26 +427,20 @@ mod tests {
     #[test]
     fn a_socks_client_can_be_built() {
         // 只是别 panic：真正能不能连由运行时决定，但构造阶段就炸说明 feature 没开。
-        let _ = build_with(&ProxySpec::Proxied {
-            url: "socks5://127.0.0.1:1080".into(),
-        });
+        let _ = build_with(&proxied("socks5://127.0.0.1:1080"));
     }
 
     #[test]
     fn a_malformed_proxy_url_falls_back_to_a_direct_client_instead_of_panicking() {
         // 坏配置不该让应用起不来。能走到这里说明 URL 通过了前缀校验但 reqwest 不认，
         // 记一条 warn 后直连 —— 请求会失败，但失败的是那一条请求。
-        let _ = build_with(&ProxySpec::Proxied {
-            url: "socks5://".into(),
-        });
+        let _ = build_with(&proxied("socks5://"));
     }
 
     #[test]
     fn the_pool_reuses_one_client_per_proxy() {
         let pool = ClientPool::new();
-        let spec = ProxySpec::Proxied {
-            url: "http://127.0.0.1:7890".into(),
-        };
+        let spec = proxied("http://127.0.0.1:7890");
         let a = pool.get(spec.clone());
         let b = pool.get(spec);
         // reqwest::Client 不比指针，只能靠"缓存里有且只有一个条目"来验证复用。
@@ -393,10 +451,61 @@ mod tests {
     #[test]
     fn the_pool_keeps_distinct_clients_for_distinct_proxies() {
         let pool = ClientPool::new();
-        let _ = pool.get(ProxySpec::Direct);
-        let _ = pool.get(ProxySpec::Proxied {
-            url: "http://127.0.0.1:7890".into(),
-        });
+        let _ = pool.get(direct());
+        let _ = pool.get(proxied("http://127.0.0.1:7890"));
         assert_eq!(pool.cache.len(), 2);
+    }
+
+    #[test]
+    fn toggling_insecure_tls_must_yield_a_different_client() {
+        // 这条守的是"开关拨了却没反应"那个坑：ClientPool 跨 reload 存活，
+        // 若 TLS 策略不进缓存键，resolve 出来的路径没变就会命中同一个旧客户端，
+        // 用户看到的现象是"必须重启才生效"。
+        let pool = ClientPool::new();
+        let _ = pool.get(direct());
+        let _ = pool.get(direct().with_tls(true));
+        assert_eq!(pool.cache.len(), 2, "严格校验与忽略校验必须各占一个条目");
+
+        // 同一个"忽略校验"的 spec 仍然要复用，别把缓存写废了。
+        let _ = pool.get(direct().with_tls(true));
+        assert_eq!(pool.cache.len(), 2);
+    }
+
+    #[test]
+    fn the_global_switch_reaches_every_channel_mode() {
+        // 三种渠道模式都要带上开关：抓包时没人希望"这条渠道恰好漏了"。
+        let mut global = settings(ProxyMode::Manual, Some("http://127.0.0.1:8080"));
+        global.insecure_tls = true;
+
+        for channel in [
+            ChannelProxy {
+                mode: ChannelProxyMode::Inherit,
+                url: None,
+            },
+            ChannelProxy {
+                mode: ChannelProxyMode::Direct,
+                url: None,
+            },
+            ChannelProxy {
+                mode: ChannelProxyMode::Manual,
+                url: Some("http://127.0.0.1:9090".into()),
+            },
+        ] {
+            let mode = channel.mode;
+            assert!(
+                resolve_channel(&channel, &global).insecure_tls,
+                "{mode:?} 这条渠道漏掉了开关"
+            );
+        }
+    }
+
+    #[test]
+    fn the_global_switch_survives_a_direct_resolution() {
+        // 开关管的是"校不校验对端证书"，与走不走代理无关 —— 直连内网自签名服务同样适用。
+        let mut global = settings(ProxyMode::Direct, None);
+        global.insecure_tls = true;
+        let spec = resolve_global(&global);
+        assert_eq!(spec.proxy, ProxySpec::Direct);
+        assert!(spec.insecure_tls);
     }
 }

@@ -176,7 +176,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | `outbound.rs` | `Outbound` trait（`tag` / `wire` / `prepare` / `dial`）、`PreparedRequest`、`UpstreamResponse` / `UpstreamBody`、`UpstreamError::is_retryable` |
 | `channel.rs` | `Channel` —— 唯一的 HTTP 实现。转发请求头时的**剔除清单**、鉴权头注入、`looks_like_json` 判定 |
 | `registry.rs` | `ProviderRegistry`：`DashMap<String, Arc<dyn Outbound>>` + `ArcSwapOption<String>` 默认渠道 |
-| `client.rs` | 共享 `reqwest::Client` 与**出站代理**。`ProxySpec`（解析结果，也是 `ClientPool` 的缓存键）、`resolve_global` / `resolve_channel`（把设置折算成 spec）、`NO_PROXY_LIST`（回环与私有网段绕过代理） |
+| `client.rs` | 共享 `reqwest::Client` 与**出站代理**。`ProxySpec`（解析出的出站路径）、`ClientSpec`（路径 + TLS 策略，**也是 `ClientPool` 的缓存键**）、`resolve_global` / `resolve_channel`（把设置折算成 spec）、`NO_PROXY_LIST`（回环与私有网段绕过代理） |
 | `oneshot.rs` | **脱离网关管线的单次真实请求**：协议编码 → `prepare` → `dial`。模型测试与能力探测都走它 —— 走管线会写日志、计费、查缓存，对一次探测全是副作用 |
 
 **出站 URL 由渠道的线协议决定，与入站路径无关**：客户端说 Anthropic，
@@ -184,8 +184,15 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 **代理分两级**：全局 `AppSettings.proxy`（跟随环境变量 / 直连 / 指定地址），
 渠道 `Provider.proxy`（跟随全局 / 直连 / 指定地址）。解析成 `ProxySpec` 后按它
-在 `ClientPool` 里取客户端 —— 客户端数量 = 不同代理地址数，不是渠道数。
+在 `ClientPool` 里取客户端 —— 客户端数量 = 不同 `ClientSpec` 数，不是渠道数。
 `Direct` 分支必须显式 `no_proxy()`，否则 reqwest 会自己读环境变量绕过「直连」。
+
+**TLS 校验收在 `ClientSpec` 里，不随渠道变化**：`ProxySettings.insecure_tls`
+（「忽略 TLS 证书校验」，抓包时免装 CA）对所有出站连接生效，与走不走代理无关。
+它必须参与缓存键 —— `ClientPool` 跨 `reload` 存活，键里不带它就会在用户拨开关后
+把旧客户端还回去，表现为"开关无效，重启才好"。根证书走系统存储
+（`Cargo.toml` 里 reqwest 开 `rustls-tls-native-roots`）；用 reqwest 默认的
+`rustls-tls` 会只认编译期打包的 Mozilla 根，装了 CA 也照样 `UnknownIssuer`。
 
 ---
 
@@ -375,7 +382,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 |---|---|
 | `shell.rs` | **`AppShell`** —— 所有共享依赖的唯一所有权根（db / settings / registry / selectors / router / pricing / cache / aggregates / traffic / events / gateway）。`bootstrap()` 装配全部状态；`reload_*()` 做配置热重载；`spawn_background_tasks()` 跑流量推送、聚合落库、日志清理 |
 | `config/paths.rs` | 全部路径解析。用 `dirs::home_dir()` 而非 `HOME` 环境变量；`APILOT_HOME` 可覆盖数据根目录 |
-| `config/settings.rs` | `AppSettings`（单条 JSON 存 `settings_kv`）、`normalized()` 夹取非法值。`ModelPolicy` 也在这里：两级模式 + 客户端覆盖 + 自定义规则，**`normalized()` 同时负责老存档的折算**（`"off"` 靠 serde alias，`per_client` 的字符串值靠 untagged —— 认不出一个枚举串会让整份设置回落默认值）。`ProxySettings` 同理：`#[serde(other)]` 的 `Unknown` 兜住拼错的模式串 |
+| `config/settings.rs` | `AppSettings`（单条 JSON 存 `settings_kv`）、`normalized()` 夹取非法值。`ModelPolicy` 也在这里：两级模式 + 客户端覆盖 + 自定义规则，**`normalized()` 同时负责老存档的折算**（`"off"` 靠 serde alias，`per_client` 的字符串值靠 untagged —— 认不出一个枚举串会让整份设置回落默认值）。`ProxySettings` 同理：`#[serde(other)]` 的 `Unknown` 兜住拼错的模式串；`insecure_tls` 是新加字段，靠容器上的 `#[serde(default)]` 让老存档（没有这个键）读出来是「严格校验」而不是整份回落默认） |
 | `error.rs` | `AppError`：同时实现 `Serialize`（给 Tauri）与 `IntoResponse`（给 axum） |
 | `util.rs` | `now_ms` / `now_secs` / `hour_bucket` / `mask_secret` |
 

@@ -24,6 +24,16 @@ export type ProxyMode = "direct" | "system" | "manual";
 export interface ProxySettings {
   mode: ProxyMode;
   url?: string | null;
+  /**
+   * 忽略上游 TLS 证书校验（等价于 `curl -k`）。
+   *
+   * 给抓包工具兜底用：mitmproxy 之类要用自签 CA 重新签一遍才能解密 HTTPS，
+   * 装了 CA 是正路，这个开关是装不了 CA 时的退路。开启后中间人无法再被发现，
+   * 所以默认关，开启时界面上要挂警示。
+   *
+   * 后端 `ProxySettings.insecure_tls`，作用范围是**所有出站连接**，与走不走代理无关。
+   */
+  insecure_tls: boolean;
 }
 
 /** 协议名 → 中文标签。多处复用，避免同一个名字在三个页面里写法不一致。 */

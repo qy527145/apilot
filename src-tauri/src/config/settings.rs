@@ -375,6 +375,19 @@ pub struct ProxySettings {
     pub mode: ProxyMode,
     /// `mode == Manual` 时的地址，支持 `http:// https:// socks5:// socks5h://`。
     pub url: Option<String>,
+    /// 忽略上游 TLS 证书校验（等价于 `curl -k`）。
+    ///
+    /// 存在的理由只有一个：抓包工具（mitmproxy / Fiddler / Charles）要解密 HTTPS 就得
+    /// 用自签的 CA 重新签一遍，而那个 CA 默认不在系统信任库里。装了 CA 是正路，
+    /// 但装 CA 有门槛、有时也改不动（无管理员权限、公司管控的机器），这个开关是兜底。
+    ///
+    /// 代价必须说清楚：证书链与主机名都不再校验，中间人无法再被发现。所以它是
+    /// **opt-in 且默认关**，开启时 `build_with` 会打一条 warn，界面上也要挂警示。
+    ///
+    /// 作用范围是**所有出站连接**，与走不走代理无关 —— 开关说的是"不校验对端证书"，
+    /// 内网自签名证书的模型服务同样适用。绑在代理模式上会造出一个隐性状态：
+    /// 拨了开关却因为代理没启用而静默地仍然严格校验。
+    pub insecure_tls: bool,
 }
 
 impl ProxySettings {
@@ -829,6 +842,7 @@ mod tests {
             proxy: ProxySettings {
                 mode: ProxyMode::Manual,
                 url: Some("   ".into()),
+                insecure_tls: false,
             },
             ..Default::default()
         };
@@ -842,6 +856,7 @@ mod tests {
         let s = ProxySettings {
             mode: ProxyMode::Manual,
             url: None,
+            insecure_tls: false,
         };
         assert_eq!(s.normalized().mode, ProxyMode::Direct);
     }
@@ -851,9 +866,46 @@ mod tests {
         let s = ProxySettings {
             mode: ProxyMode::Manual,
             url: Some("  socks5://127.0.0.1:1080  ".into()),
+            insecure_tls: false,
         };
         let n = s.normalized();
         assert_eq!(n.mode, ProxyMode::Manual);
         assert_eq!(n.url.as_deref(), Some("socks5://127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn an_old_proxy_block_without_the_tls_switch_still_loads() {
+        // 这一行是升级前真实落库的样子。缺字段必须回落成"严格校验"，
+        // 而且**不能**因为缺字段就把 mode/url 一起打回默认 —— 那等于用户
+        // 升级一次，代理配置就没了。
+        let raw = r#"{"mode":"manual","url":"http://127.0.0.1:8080"}"#;
+        let parsed: ProxySettings = serde_json::from_str(raw).expect("老配置必须能读进来");
+        assert_eq!(parsed.mode, ProxyMode::Manual);
+        assert_eq!(parsed.url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert!(!parsed.insecure_tls, "缺字段时默认必须是严格校验");
+    }
+
+    #[test]
+    fn the_tls_switch_survives_a_round_trip() {
+        let s = ProxySettings {
+            mode: ProxyMode::Manual,
+            url: Some("http://127.0.0.1:8080".into()),
+            insecure_tls: true,
+        };
+        let parsed: ProxySettings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(parsed.insecure_tls);
+    }
+
+    #[test]
+    fn normalization_never_silently_flips_the_tls_switch_back_on() {
+        // 规范化只该动 mode/url。悄悄把开关关掉会让用户以为"抓包又坏了"，
+        // 而他明明没碰过这个开关。
+        let s = ProxySettings {
+            mode: ProxyMode::Manual,
+            url: None, // 会被折成 Direct
+            insecure_tls: true,
+        };
+        assert!(s.normalized().insecure_tls);
     }
 }

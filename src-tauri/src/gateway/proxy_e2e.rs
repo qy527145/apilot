@@ -21,12 +21,12 @@ use crate::protocol::oai_chat::{ChatStreamDecoder, ChatStreamEncoder};
 use crate::protocol::dto::Protocol;
 use crate::storage::models::{AuthStyle, Provider, ProviderKind};
 use crate::upstream::channel::Channel;
-use crate::upstream::client::{build_with, ProxySpec};
+use crate::upstream::client::{build_with, ClientSpec, ProxySpec};
 use crate::upstream::outbound::{Outbound, UpstreamBody};
 
 /// e2e 都打本地假上游，直连即可 —— 也用不上宿主机的环境代理。
 fn direct_client() -> reqwest::Client {
-    build_with(&ProxySpec::Direct)
+    build_with(&ClientSpec::new(ProxySpec::Direct))
 }
 
 /// 上游收到的请求快照，用于断言出站请求确实带上了该带的东西。
@@ -653,7 +653,7 @@ async fn a_configured_proxy_never_swallows_loopback_requests() {
     for url in ["http://127.0.0.1:1", "socks5://127.0.0.1:1"] {
         let channel = Channel::new(
             provider(&base, ProviderKind::Anthropic),
-            build_with(&ProxySpec::Proxied { url: url.into() }),
+            build_with(&ClientSpec::new(ProxySpec::Proxied { url: url.into() })),
         );
         let (bytes, _, _) = run_pipeline(&channel, false).await;
         assert!(
@@ -678,7 +678,7 @@ async fn a_non_chat_request_reaches_the_upstream_verbatim() {
     let (base, captured) = spawn_echo_upstream(200, r#"{"input_tokens":1234}"#).await;
     let channel = Channel::new(
         provider(&base, ProviderKind::Anthropic),
-        build_with(&ProxySpec::Direct),
+        build_with(&ClientSpec::new(ProxySpec::Direct)),
     );
 
     let body = Bytes::from_static(
@@ -731,7 +731,7 @@ async fn an_upstream_error_comes_back_verbatim() {
     .await;
     let channel = Channel::new(
         provider(&base, ProviderKind::Anthropic),
-        build_with(&ProxySpec::Direct),
+        build_with(&ClientSpec::new(ProxySpec::Direct)),
     );
 
     let prepared = channel

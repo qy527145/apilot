@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { FolderOpen, Save } from "lucide-react";
+import { AlertTriangle, FolderOpen, Save } from "lucide-react";
 import { toast } from "sonner";
 
 import { ErrorState } from "@/components/common/StatCard";
@@ -195,6 +195,33 @@ export default function SettingsPage() {
                   />
                 </div>
               </div>
+
+              <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                <div>
+                  <Label>忽略 TLS 证书校验</Label>
+                  <p className="text-muted-foreground text-xs">
+                    不装 CA 也能让抓包工具解密 HTTPS。对所有出站连接生效，
+                    与走不走代理无关。
+                  </p>
+                </div>
+                <Switch
+                  checked={form.proxy.insecure_tls}
+                  onCheckedChange={(v) =>
+                    set("proxy", { ...form.proxy, insecure_tls: v })
+                  }
+                />
+              </div>
+
+              {form.proxy.insecure_tls && (
+                <div className="border-amber-500/40 bg-amber-500/10 flex items-start gap-3 rounded-md border p-3">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
+                  <p className="text-muted-foreground text-xs">
+                    证书链和主机名都不再校验，出站请求被中间人截改将无法发现。
+                    只建议在本地抓包调试时开启，排查完记得关掉。
+                  </p>
+                </div>
+              )}
+
               <p className="text-muted-foreground text-xs">
                 {PROXY_MODE_HINT[form.proxy.mode]}
                 <br />
