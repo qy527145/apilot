@@ -348,6 +348,8 @@ fn decode_tool(v: &Value) -> Option<ToolDef> {
     let name = v.get("name")?.as_str()?.to_string();
     Some(ToolDef {
         name,
+        // Anthropic 没有 namespace 的概念，工具本来就是平的。
+        namespace: None,
         description: v
             .get("description")
             .and_then(|d| d.as_str())

@@ -189,6 +189,14 @@ impl UnifiedMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDef {
     pub name: String,
+    /// Codex 的 Responses Lite 用 `type: "namespace"` 把一组工具打包（`functions` 里装着
+    /// exec / wait，`collaboration` 里装着 spawn_agent / …）。那种条目在解码时被展平成
+    /// 一个个裸名工具，组名留在这里。
+    ///
+    /// 只用于展示。出站编码一律只用 `name`：OpenAI 与 Anthropic 的函数名只允许
+    /// `[a-zA-Z0-9_-]`，`functions.exec` 这种带点的名字上游会直接拒掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// 统一成 JSON Schema。OpenAI 与 Anthropic 的表述差异在 codec 里抹平。

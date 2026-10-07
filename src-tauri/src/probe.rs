@@ -68,6 +68,7 @@ fn build_request(model: &str, capability: Capability) -> UnifiedRequest {
         Capability::Tools => {
             req.tools = vec![ToolDef {
                 name: "get_time".into(),
+                namespace: None,
                 description: Some("查询当前时间".into()),
                 input_schema: json!({
                     "type": "object",

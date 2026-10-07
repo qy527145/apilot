@@ -444,9 +444,16 @@ export function RequestView({ req }: { req: UnifiedRequest }) {
           </p>
         ) : (
           tools.map((t) => (
-            <div key={t.name} className="rounded-md border p-2">
+            <div key={`${t.namespace ?? ""}\u0000${t.name}`} className="rounded-md border p-2">
               <div className="mb-1 flex items-center gap-1.5">
                 <Wrench className="size-3.5 shrink-0" />
+                {/* Codex 的 namespace 工具（functions / clock / collaboration …）由后端展平成
+                    一个个裸名工具，组名单独标出来，免得看着像一堆平级工具。 */}
+                {t.namespace && (
+                  <span className="bg-muted text-muted-foreground rounded px-1 py-0.5 font-mono text-[10px]">
+                    {t.namespace}
+                  </span>
+                )}
                 <span className="font-mono text-xs font-medium">{t.name}</span>
               </div>
               {t.description && (

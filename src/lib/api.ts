@@ -499,6 +499,13 @@ export interface UnifiedMessage {
 
 export interface ToolDef {
   name: string;
+  /**
+   * Codex 的 Responses Lite 用 `type: "namespace"` 把工具分组，后端展平后把组名留在这里。
+   *
+   * 只用于展示：出站编码一律只用 `name`，因为 OpenAI / Anthropic 的函数名不接受
+   * `functions.exec` 这种带点的写法。
+   */
+  namespace?: string | null;
   description?: string | null;
   /** 统一成 JSON Schema；OpenAI 与 Anthropic 的表述差异由后端抹平。 */
   input_schema: unknown;

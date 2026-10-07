@@ -270,6 +270,42 @@ mod tests {
     }
 
     #[test]
+    fn namespace_tools_reach_a_chat_upstream_under_their_bare_names() {
+        // Codex 真实报文里工具全在 namespace 里（functions / clock / collaboration）。
+        // Chat Completions 没有分组的概念，只能按裸名平铺 —— 带点的 `functions.exec`
+        // 会被上游按函数名格式直接拒掉。组名因此只能留在 IR 上给监控看。
+        let r = CodecRegistry::new();
+        let raw = r#"{"model":"gpt-6","tools":null,"input":[
+            {"type":"additional_tools","role":"developer","tools":[
+                {"type":"namespace","name":"functions","tools":[
+                    {"type":"function","name":"exec","parameters":{"type":"object"}},
+                    {"type":"function","name":"wait","parameters":{"type":"object"}}]}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+        ]}"#;
+
+        let out = r
+            .convert_request(
+                Protocol::OpenAiResponses,
+                Protocol::OpenAiChat,
+                raw.as_bytes(),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        let names: Vec<&str> = v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["exec", "wait"]);
+        assert!(
+            !out.windows(9).any(|w| w == b"namespace"),
+            "namespace 是 IR 上的展示字段，不该被编码出去"
+        );
+    }
+
+    #[test]
     fn extract_error_message_handles_common_shapes() {
         let r = CodecRegistry::new();
         let c = r.codec(Protocol::AnthropicMessages);

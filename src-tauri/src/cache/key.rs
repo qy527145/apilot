@@ -49,8 +49,12 @@ pub fn cache_key(protocol: Protocol, req: &UnifiedRequest) -> String {
     }
     hasher.update([2u8]);
 
-    // 工具定义：名称 + schema，顺序敏感（顺序会影响模型行为）
+    // 工具定义：组名 + 名称 + schema，顺序敏感（顺序会影响模型行为）。
+    // 组名要计入：展平后不同 namespace 下可能有同名同 schema 的工具，看着一样，
+    // 但模型看到的分组不同、调用回来的名字也不同，不能共用一个键。
     for tool in &req.tools {
+        hasher.update(tool.namespace.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0u8]);
         hasher.update(tool.name.as_bytes());
         hasher.update([0u8]);
         hasher.update(tool.description.as_deref().unwrap_or("").as_bytes());
@@ -213,6 +217,7 @@ mod tests {
         let mut with_tool = base();
         with_tool.tools = vec![ToolDef {
             name: "search".into(),
+            namespace: None,
             description: Some("搜索".into()),
             input_schema: json!({"type": "object"}),
         }];

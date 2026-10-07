@@ -159,6 +159,7 @@ mod tests {
         with_tools.messages = vec![UnifiedMessage::user_text("hi")];
         with_tools.tools = vec![ToolDef {
             name: "get_weather".into(),
+            namespace: None,
             description: Some("Get the current weather for a city".into()),
             input_schema: json!({
                 "type": "object",

@@ -119,7 +119,9 @@ fn decode_request(raw: &[u8]) -> Result<UnifiedRequest, ConvertError> {
     // 顶层 tools 必须先于 input 解析：Codex 的 Responses Lite 格式会把工具塞进
     // input 里的 `additional_tools` 条目，那些条目要追加到这里已经建好的列表上。
     if let Some(tools) = obj.get("tools").and_then(|t| t.as_array()) {
-        req.tools = tools.iter().filter_map(decode_tool).collect();
+        for t in tools {
+            decode_tools_into(t, None, &mut req.tools);
+        }
     }
     if let Some(tc) = obj.get("tool_choice") {
         req.tool_choice = decode_tool_choice(tc);
@@ -217,12 +219,17 @@ fn decode_item(item: &Value, req: &mut UnifiedRequest) -> Result<(), ConvertErro
         // 工具都没有，Codex 直接瘫掉；所以必须把里面的工具捞出来并进 req.tools。
         Some("additional_tools") => {
             if let Some(tools) = item.get("tools").and_then(|t| t.as_array()) {
+                let mut defs = Vec::new();
                 for t in tools {
-                    if let Some(def) = decode_tool(t) {
-                        // 与顶层 tools 重名时保留先到的，避免同名工具被两个 schema 打架。
-                        if !req.tools.iter().any(|existing| existing.name == def.name) {
-                            req.tools.push(def);
-                        }
+                    decode_tools_into(t, None, &mut defs);
+                }
+                for def in defs {
+                    // 与顶层 tools 重名时保留先到的，避免同名工具被两个 schema 打架。
+                    // 比的是「组名 + 裸名」：不同 namespace 下可以各有一个同名工具。
+                    if !req.tools.iter().any(|existing| {
+                        existing.name == def.name && existing.namespace == def.namespace
+                    }) {
+                        req.tools.push(def);
                     }
                 }
             }
@@ -432,11 +439,37 @@ fn encode_request(req: &UnifiedRequest) -> Result<Vec<u8>, ConvertError> {
     serde_json::to_vec(&Value::Object(obj)).map_err(|e| ConvertError::encode(P, e))
 }
 
-fn decode_tool(v: &Value) -> Option<ToolDef> {
+/// 把一个 Responses 工具条目展开成 0..n 个 `ToolDef`，追加到 `out`。
+///
+/// `type: "namespace"` 是 1→N 的条目：Codex 的 Responses Lite 把成组工具打成
+/// `{"type":"namespace","name":"functions","tools":[…]}`，真正的工具在里层。当成普通
+/// 工具解的话，模型手里会只剩一个叫 `functions`、schema 是空对象的壳子，`exec` / `wait`
+/// / `spawn_agent` 这些一个都不剩 —— 而 Codex 走的就是这些工具，等于直接把客户端废掉。
+///
+/// 组名不参与出站编码（见 `ToolDef::namespace` 的说明），只带在 IR 上供监控展示，
+/// 以及给同名工具做去重时的二级判据。
+fn decode_tools_into(v: &Value, ns: Option<&str>, out: &mut Vec<ToolDef>) {
+    if v.get("type").and_then(|t| t.as_str()) == Some("namespace") {
+        // 嵌套 namespace 时以最内层的名字为准，外层名不再有意义。
+        let ns = v.get("name").and_then(|n| n.as_str()).or(ns);
+        if let Some(nested) = v.get("tools").and_then(|t| t.as_array()) {
+            for t in nested {
+                decode_tools_into(t, ns, out);
+            }
+        }
+        return;
+    }
+    if let Some(def) = decode_tool(v, ns) {
+        out.push(def);
+    }
+}
+
+fn decode_tool(v: &Value, ns: Option<&str>) -> Option<ToolDef> {
     // Responses 的 function 工具字段在顶层；但部分中转会套一层 "function"，两者都认。
     let src = v.get("function").unwrap_or(v);
     Some(ToolDef {
         name: src.get("name")?.as_str()?.to_string(),
+        namespace: ns.map(String::from),
         description: src
             .get("description")
             .and_then(|d| d.as_str())
@@ -741,6 +774,86 @@ mod tests {
         .unwrap();
         assert_eq!(req.tools.len(), 1);
         assert_eq!(req.tools[0].description.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn namespace_tools_expand_into_their_members() {
+        // Codex 真实的 Responses Lite 形状：additional_tools 里放的是 namespace 条目，
+        // 工具在里层。不展开的话模型手上只剩一个叫 "functions"、schema 空对象的壳子。
+        let req = decode_request(
+            br#"{"model":"gpt-6","tools":null,"input":[
+                {"type":"additional_tools","role":"developer","tools":[
+                    {"type":"namespace","name":"functions","description":"","tools":[
+                        {"type":"custom","name":"exec","description":"run js"},
+                        {"type":"function","name":"wait","parameters":{"type":"object","properties":{"cell_id":{"type":"string"}}}}
+                    ]},
+                    {"type":"namespace","name":"clock","description":"time","tools":[
+                        {"type":"function","name":"sleep","parameters":{"type":"object"}}
+                    ]}
+                ]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let got: Vec<(&str, &str)> = req
+            .tools
+            .iter()
+            .map(|t| (t.namespace.as_deref().unwrap_or(""), t.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("functions", "exec"), ("functions", "wait"), ("clock", "sleep")]
+        );
+        // 里层工具自己的 schema 要跟着走，不能被外层空 description 顶掉。
+        assert_eq!(
+            req.tools[1].input_schema["properties"]["cell_id"]["type"],
+            "string"
+        );
+        // 组自己的 description 不该漏到成员身上（clock 组写着 "time"，sleep 自己没写）。
+        assert_eq!(req.tools[2].description, None);
+    }
+
+    #[test]
+    fn nested_namespaces_take_the_innermost_name() {
+        let req = decode_request(
+            br#"{"model":"m","input":[
+                {"type":"additional_tools","tools":[
+                    {"type":"namespace","name":"outer","tools":[
+                        {"type":"namespace","name":"inner","tools":[
+                            {"type":"function","name":"f","parameters":{"type":"object"}}]}]}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].namespace.as_deref(), Some("inner"));
+    }
+
+    #[test]
+    fn namespace_tools_in_the_top_level_array_expand_too() {
+        let req = decode_request(
+            br#"{"model":"m","tools":[
+                {"type":"namespace","name":"ns","tools":[
+                    {"type":"function","name":"f","parameters":{"type":"object"}}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "f");
+    }
+
+    #[test]
+    fn same_name_in_different_namespaces_both_survive() {
+        // 去重按「组名 + 裸名」比，不是光比裸名 —— 否则后一个组里的同名工具会被静默吃掉。
+        let req = decode_request(
+            br#"{"model":"m","input":[
+                {"type":"additional_tools","tools":[
+                    {"type":"namespace","name":"a","tools":[
+                        {"type":"function","name":"run","description":"from a","parameters":{"type":"object"}}]},
+                    {"type":"namespace","name":"b","tools":[
+                        {"type":"function","name":"run","description":"from b","parameters":{"type":"object"}}]}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.tools.len(), 2);
+        assert_eq!(req.tools[0].description.as_deref(), Some("from a"));
+        assert_eq!(req.tools[1].description.as_deref(), Some("from b"));
     }
 
     #[test]
