@@ -81,21 +81,69 @@ export interface Provider {
 /* --------------------------- 模型（模型视角） --------------------------- */
 
 /**
- * 全局模型替换。不管客户端发什么模型名，统一换成选定的那个。
+ * 模型替换的模式。全局与客户端两级用的是同一套。
  *
- * - `off` 不替换（默认）
- * - `always` 一律替换
- * - `fallback` 只当请求的模型没有任何可用渠道时才替换
- * - `per_client` 按客户端分别指定，没配到的客户端用 `active_model`
+ * - `passthrough` 用客户端请求的模型（默认）
+ * - `always` 一律换成选定的模型
+ * - `fallback` 只当请求的模型在 Apilot 里没有可用渠道时才换
+ * - `custom` 自定义规则（映射表或 JS 脚本）
  */
-export type ModelPolicyMode = "off" | "always" | "fallback" | "per_client";
+export type ModelPolicyMode = "passthrough" | "always" | "fallback" | "custom";
+
+/** 客户端的模式：多一个「跟随全局」。 */
+export type ClientMode =
+  | "inherit"
+  | "passthrough"
+  | "always"
+  | "fallback"
+  | "custom";
+
+/** 自定义规则的两种写法。两套会同时保存，切换时另一套不丢。 */
+export type CustomForm = "table" | "script";
+
+/** 映射表一行的匹配方式。 */
+export type MatchKind = "prefix" | "glob" | "regex" | "exact" | "any";
+
+export interface MappingRow {
+  /** 只对这个客户端生效；空 = 任何客户端都适用。 */
+  client?: string | null;
+  match_kind: MatchKind;
+  /** 表达式；`any` 时忽略。 */
+  pattern?: string | null;
+  /** 命中后换成它；空 = 「保持原样」，在此停下且不改写。 */
+  target?: string | null;
+}
+
+export interface CustomRules {
+  form: CustomForm;
+  /** 自上而下，首个命中生效。 */
+  table: MappingRow[];
+  /** JS 源码，须定义一个 `resolve(ctx)`。 */
+  script?: string | null;
+}
+
+/** 单个客户端的覆盖。没写的字段沿用全局。 */
+export interface ClientRule {
+  mode: ClientMode;
+  /** `always` / `fallback` 用的模型；留空则沿用全局的 `active_model`。 */
+  model?: string | null;
+  /** `custom` 用的规则。 */
+  custom: CustomRules;
+}
 
 export interface ModelPolicy {
   mode: ModelPolicyMode;
-  /** `always` / `fallback` 用的模型；`per_client` 里没配到的客户端也用它。 */
+  /** `always` / `fallback` 的目标模型；客户端规则没写模型时也用它。 */
   active_model?: string | null;
-  /** `per_client` 模式：客户端标识 → 模型名。 */
-  per_client: Record<string, string>;
+  /** 客户端级覆盖：客户端标识 → 覆盖配置。 */
+  per_client: Record<string, ClientRule>;
+  /** 全局 `custom` 用的规则。 */
+  custom: CustomRules;
+}
+
+/** 空的自定义规则 —— 新建客户端覆盖时用它兜底。 */
+export function emptyCustomRules(): CustomRules {
+  return { form: "table", table: [], script: null };
 }
 
 /** 同一个模型在多个渠道都有时怎么选。 */
@@ -163,7 +211,7 @@ export interface AppSettings {
   cache_enabled: boolean;
   cache_ttl_secs: number;
   cache_max_entries: number;
-  /** 全局模型替换。默认 `mode: "off"`。 */
+  /** 模型替换。默认 `mode: "passthrough"`（不改写）。 */
   model_policy: ModelPolicy;
 }
 
@@ -692,6 +740,9 @@ export const api = {
   getModelPolicy: () => call<ModelPolicy>("get_model_policy"),
   setModelPolicy: (policy: ModelPolicy) =>
     call<ModelPolicy>("set_model_policy", { policy }),
+  /** 校验一段模型脚本；null 表示可用，否则是给用户看的错因。 */
+  validateModelScript: (source: string) =>
+    call<string | null>("validate_model_script", { source }),
 
   listModelCatalog: () => call<ModelCatalogEntry[]>("list_model_catalog"),
   listModelOptions: () => call<ModelOption[]>("list_model_options"),

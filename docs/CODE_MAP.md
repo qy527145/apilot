@@ -121,7 +121,8 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 | 文件 | 内容 |
 |---|---|
-| `model_policy.rs` | **全局模型替换**：`effective_model()`（关闭 / 无条件 / 兜底 / 按客户端四种模式）。判定是纯函数，"有没有渠道"作为参数传入 —— 只有兜底模式才查库 |
+| `model_policy.rs` | **模型替换的判定**：「这次请求该用哪个模型名」。全局与客户端两级在 `ModelPolicy::effective()` 里拼成一条规则，`effective_model()` 再把那条规则算成模型名。判定是纯函数 —— 需要向外部问的两件事（有没有渠道、跑一段脚本）都从 `ModelEnv` 注入，所以四种模式（不改写 / 强制覆盖 / 兜底 / 自定义规则）都能脱离数据库与 JS 引擎测 |
+| `model_script.rs` | **用户 JS 脚本的执行器**（QuickJS，见 `Cargo.toml` 的 rquickjs）。脚本被限制成 `ctx` 的**纯函数**（无 I/O、无 `hasChannels()`），因此结果能按 (脚本, 模型, 客户端) 缓存，命中完全不进引擎。任何语法错 / 抛错 / 超时 / 非字符串返回都折成"不改写"，**绝不失败请求** |
 | `model_select.rs` | **按模型策略给候选渠道排序**（`order()`）：按优先级 / 按延迟 / 加权随机。随机源与延迟都从外面传，所以三种策略都能脱离数据库测 |
 | `metadata.rs` | `RouteMetadata`（贯穿规则链的上下文，可被非终结动作改写）、`RouteOptions` |
 | `rule_item.rs` | 匹配条件：`RuleItem` 枚举（client / model / protocol / path / header / token_estimate / logical）、`glob_match` |
@@ -129,8 +130,9 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | `engine.rs` | `Router::route()` —— 遍历规则，终结即停，非终结改写后继续；`RouteOutcome` |
 | `selector.rs` | `Selector`（`ArcSwap` 热切换）、`SelectorManager`（按 tag 索引 + 兜底解析）、`SelectionEvent` |
 
-**模型的两次改写，顺序不能调**：先在 `pipeline::handle` 解码后应用全局模型策略
-（`model_policy::effective_model`），再跑规则链（`meta` 可被 `ModelOverride` 再改）。
+**模型的两次改写，顺序不能调**：先在 `pipeline::handle` 解码后应用模型替换策略
+（`model_policy::effective_model` —— 它内部先按客户端把两级配置拼成一条规则），
+再跑规则链（`meta` 可被 `ModelOverride` 再改）。
 规则链因此看到的是生效模型，也能在它之上继续改。
 
 **三个模型名各司其职，别混用**（`RequestLogRecord` 上同名）：
@@ -284,14 +286,14 @@ apilot://cache             → CacheStats
 
 | 文件 | 命令数 | 内容 |
 |---|---|---|
-| `app.rs` | 3 | `app_info`、`get_settings`、`update_settings` |
+| `app.rs` | 5 | `app_info`、`get_settings`、`update_settings`、`set_model_policy`（只改模型策略，避免整份 `AppSettings` 回传冲掉别处刚改的设置）、`validate_model_script`（只编译不执行，给脚本文本框做行内报错） |
 | `gateway.rs` | 3 | `gateway_start` / `stop` / `status` |
 | `providers.rs` | 7 | 渠道 CRUD、`test_provider`、模型映射、`fetch_provider_models`（拉上游 `/v1/models`）；同文件的 **`probe()`** 是普通函数而非命令，被路由页复用 |
 | `routing.rs` | 10 | 规则 CRUD + 排序、selector CRUD + **`switch_selector`**（热切换）、`run_urltest` |
 | `billing.rs` | 6 | 单价 CRUD、`billing_summary` / `totals` / `timeseries` |
 | `cache.rs` | 4 | `cache_stats`、`clear_cache`、策略读写 |
 | `takeover.rs` | 6 | `detect_clients`、`takeover_status`、`takeover_readiness`（接管前置条件）、`preview_takeover`、`apply_takeover`、`restore_client` |
-| `models.rs` | 8 | 模型视角：`list_model_catalog` / `list_model_options`、`get_model_policy`（全局替换）、`upsert_model_policy` / `reset_model_policy` / `switch_model_channel`（每模型选渠道）、`set_model_candidates`、`probe_model_candidates` |
+| `models.rs` | 8 | 模型视角：`list_model_catalog` / `list_model_options`、`get_model_policy`（模型替换，与 `app.rs` 的 `set_model_policy` 一对）、`upsert_model_policy` / `reset_model_policy` / `switch_model_channel`（每模型选渠道）、`set_model_candidates`、`probe_model_candidates` |
 | `logs.rs` | 3 | `query_logs`、`get_request_detail`、`clear_logs`（只清明细与捕获，不动 `usage_hourly`） |
 
 **命令注册**：全部在 `lib.rs` 的 `generate_handler!` 里，用**完整路径**。
@@ -308,7 +310,7 @@ apilot://cache             → CacheStats
 |---|---|
 | `shell.rs` | **`AppShell`** —— 所有共享依赖的唯一所有权根（db / settings / registry / selectors / router / pricing / cache / aggregates / traffic / events / gateway）。`bootstrap()` 装配全部状态；`reload_*()` 做配置热重载；`spawn_background_tasks()` 跑流量推送、聚合落库、日志清理 |
 | `config/paths.rs` | 全部路径解析。用 `dirs::home_dir()` 而非 `HOME` 环境变量；`APILOT_HOME` 可覆盖数据根目录 |
-| `config/settings.rs` | `AppSettings`（单条 JSON 存 `settings_kv`）、`normalized()` 夹取非法值 |
+| `config/settings.rs` | `AppSettings`（单条 JSON 存 `settings_kv`）、`normalized()` 夹取非法值。`ModelPolicy` 也在这里：两级模式 + 客户端覆盖 + 自定义规则，**`normalized()` 同时负责老存档的折算**（`"off"` 靠 serde alias，`per_client` 的字符串值靠 untagged —— 认不出一个枚举串会让整份设置回落默认值） |
 | `error.rs` | `AppError`：同时实现 `Serialize`（给 Tauri）与 `IntoResponse`（给 axum） |
 | `util.rs` | `now_ms` / `now_secs` / `hour_bucket` / `mask_secret` |
 
@@ -347,8 +349,9 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
-| `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings。**Models 是模型视角**（全局模型替换 + 每个模型的候选渠道与策略），Providers 是渠道视角 —— 同一份 `provider_models` 的两个方向 |
+| `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings。**两页分工**：Models 只管**模型名**（全局 + 客户端两级替换、模型并集列表只读）；Routing 管**渠道**（selector 热切换、规则链、每个模型走哪个渠道）。Providers 是渠道视角 —— 同一份 `provider_models` 的三个方向 |
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
+| `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明）、模型映射面板（`ModelPickerDialog` 负责从上游拉列表并勾选） |
 | `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应」两段，内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细） |
