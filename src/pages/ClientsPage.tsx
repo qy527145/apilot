@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
+import { ManualOnboarding } from "@/components/clients/ManualOnboarding";
 import { PageShell } from "@/components/layout/PageShell";
 import type { ViewKey } from "@/components/layout/nav";
 import { Badge } from "@/components/ui/badge";
@@ -103,131 +104,135 @@ export default function ClientsPage({
         </Button>
       }
     >
-      {blocked && (
-        <div className="border-amber-500/40 bg-amber-500/10 flex items-start gap-3 rounded-md border p-3">
-          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
-          <div className="flex-1 space-y-1">
-            <p className="text-sm font-medium">暂时不能接管</p>
-            <p className="text-muted-foreground text-xs">
-              {readiness?.reason}
-              。接管前先备好渠道和模型，客户端才不会一上来就报错。
-            </p>
+      <div className="space-y-6">
+        {blocked && (
+          <div className="border-amber-500/40 bg-amber-500/10 flex items-start gap-3 rounded-md border p-3">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
+            <div className="flex-1 space-y-1">
+              <p className="text-sm font-medium">暂时不能接管</p>
+              <p className="text-muted-foreground text-xs">
+                {readiness?.reason}
+                。接管前先备好渠道和模型，客户端才不会一上来就报错。
+              </p>
+            </div>
+            <Button size="sm" variant="outline" onClick={() => onNavigate("providers")}>
+              去渠道管理
+            </Button>
           </div>
-          <Button size="sm" variant="outline" onClick={() => onNavigate("providers")}>
-            去渠道管理
-          </Button>
-        </div>
-      )}
+        )}
 
-      <Card className="py-0">
-        <CardContent className="p-0">
-          {isLoading ? (
-            <div className="p-4">
-              <TableSkeleton rows={3} cols={4} />
-            </div>
-          ) : isError ? (
-            <div className="p-4">
-              <ErrorState onRetry={() => refetch()} />
-            </div>
-          ) : clients.length === 0 ? (
-            <div className="p-6">
-              <EmptyState
-                icon={ShieldCheck}
-                title="未检测到支持的客户端"
-                description="Apilot 支持接管 Claude Code / Codex / Gemini CLI。安装其中任意一个后点击「重新检测」。"
-              />
-            </div>
-          ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>客户端</TableHead>
-                  <TableHead className="text-center">检测</TableHead>
-                  <TableHead className="text-center">接管</TableHead>
-                  <TableHead>配置文件</TableHead>
-                  <TableHead>当前 Base URL</TableHead>
-                  <TableHead className="text-right">操作</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {clients.map((c) => (
-                  <TableRow key={c.id}>
-                    <TableCell className="font-medium">{c.name}</TableCell>
-                    <TableCell className="text-center">
-                      <Badge variant={c.detected ? "success" : "secondary"}>
-                        {c.detected ? "已安装" : "未安装"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="text-center">
-                      <Badge variant={c.taken_over ? "success" : "outline"}>
-                        {c.taken_over ? "已接管" : "未接管"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell
-                      className="text-muted-foreground max-w-[260px] truncate text-xs"
-                      title={c.config_path}
-                    >
-                      {c.config_path}
-                    </TableCell>
-                    <TableCell
-                      className="text-muted-foreground max-w-[220px] truncate text-xs"
-                      title={c.current_base_url ?? ""}
-                    >
-                      {c.current_base_url || "—"}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          disabled={previewLoading === c.id}
-                          onClick={() => openPreview(c)}
-                        >
-                          <Eye className="size-4" />
-                          预览变更
-                        </Button>
-                        {c.taken_over ? (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={restore.isPending}
-                            onClick={() => restore.mutate(c.id)}
-                          >
-                            <RotateCcw className="size-4" />
-                            还原
-                          </Button>
-                        ) : (
-                          <Button
-                            size="sm"
-                            disabled={!c.detected || blocked || apply.isPending}
-                            title={blocked ? readiness?.reason ?? undefined : undefined}
-                            onClick={() => apply.mutate(c.id)}
-                          >
-                            <ShieldCheck className="size-4" />
-                            接管
-                          </Button>
-                        )}
-                      </div>
-                    </TableCell>
+        <Card className="py-0">
+          <CardContent className="p-0">
+            {isLoading ? (
+              <div className="p-4">
+                <TableSkeleton rows={3} cols={4} />
+              </div>
+            ) : isError ? (
+              <div className="p-4">
+                <ErrorState onRetry={() => refetch()} />
+              </div>
+            ) : clients.length === 0 ? (
+              <div className="p-6">
+                <EmptyState
+                  icon={ShieldCheck}
+                  title="未检测到支持的客户端"
+                  description="Apilot 支持接管 Claude Code / Codex / Gemini CLI。安装其中任意一个后点击「重新检测」。"
+                />
+              </div>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>客户端</TableHead>
+                    <TableHead className="text-center">检测</TableHead>
+                    <TableHead className="text-center">接管</TableHead>
+                    <TableHead>配置文件</TableHead>
+                    <TableHead>当前 Base URL</TableHead>
+                    <TableHead className="text-right">操作</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
-        </CardContent>
-      </Card>
+                </TableHeader>
+                <TableBody>
+                  {clients.map((c) => (
+                    <TableRow key={c.id}>
+                      <TableCell className="font-medium">{c.name}</TableCell>
+                      <TableCell className="text-center">
+                        <Badge variant={c.detected ? "success" : "secondary"}>
+                          {c.detected ? "已安装" : "未安装"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-center">
+                        <Badge variant={c.taken_over ? "success" : "outline"}>
+                          {c.taken_over ? "已接管" : "未接管"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell
+                        className="text-muted-foreground max-w-[260px] truncate text-xs"
+                        title={c.config_path}
+                      >
+                        {c.config_path}
+                      </TableCell>
+                      <TableCell
+                        className="text-muted-foreground max-w-[220px] truncate text-xs"
+                        title={c.current_base_url ?? ""}
+                      >
+                        {c.current_base_url || "—"}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={previewLoading === c.id}
+                            onClick={() => openPreview(c)}
+                          >
+                            <Eye className="size-4" />
+                            预览变更
+                          </Button>
+                          {c.taken_over ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={restore.isPending}
+                              onClick={() => restore.mutate(c.id)}
+                            >
+                              <RotateCcw className="size-4" />
+                              还原
+                            </Button>
+                          ) : (
+                            <Button
+                              size="sm"
+                              disabled={!c.detected || blocked || apply.isPending}
+                              title={blocked ? readiness?.reason ?? undefined : undefined}
+                              onClick={() => apply.mutate(c.id)}
+                            >
+                              <ShieldCheck className="size-4" />
+                              接管
+                            </Button>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
 
-      <Dialog open={!!preview} onOpenChange={(o) => !o && setPreview(null)}>
-        <DialogContent className="sm:max-w-3xl">
-          <DialogHeader>
-            <DialogTitle>预览变更 · {preview?.client.name}</DialogTitle>
-            <DialogDescription>
-              即将写入 <code>{preview?.client.config_path}</code> 的内容差异。
-            </DialogDescription>
-          </DialogHeader>
-          <DiffView text={preview?.diff ?? ""} />
-        </DialogContent>
-      </Dialog>
+        <ManualOnboarding />
+
+        <Dialog open={!!preview} onOpenChange={(o) => !o && setPreview(null)}>
+          <DialogContent className="sm:max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>预览变更 · {preview?.client.name}</DialogTitle>
+              <DialogDescription>
+                即将写入 <code>{preview?.client.config_path}</code> 的内容差异。
+              </DialogDescription>
+            </DialogHeader>
+            <DiffView text={preview?.diff ?? ""} />
+          </DialogContent>
+        </Dialog>
+      </div>
     </PageShell>
   );
 }

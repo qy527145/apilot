@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, Copy, Loader2 } from "lucide-react";
-import { toast } from "sonner";
+import { ArrowRight, Loader2 } from "lucide-react";
 
-import { JsonViewer, tryParseJson } from "@/components/common/JsonViewer";
+import { CopyButton } from "@/components/common/CopyButton";
+import { RawBody } from "@/components/common/RawBody";
 import { ResponseView, RequestView } from "@/components/traffic/InspectViews";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -460,89 +460,6 @@ function DecodeFailure({ error }: { error?: string | null }) {
         流被中途截断，或它本来就不是这个协议的格式。
       </p>
     </div>
-  );
-}
-
-function RawBody({
-  text,
-  rawMode,
-  note,
-  empty = "未捕获",
-}: {
-  text?: string | null;
-  rawMode: boolean;
-  note?: string;
-  empty?: string;
-}) {
-  if (!text) {
-    return (
-      <p className="text-muted-foreground py-6 text-center text-xs">{empty}</p>
-    );
-  }
-
-  return (
-    <div className="space-y-1.5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-muted-foreground text-[11px] tabular-nums">
-          {formatNumber(text.length)} 字符
-          {note ? `（${note}）` : rawMode ? "（未加工）" : "（已格式化）"}
-        </span>
-        <CopyButton text={text} />
-      </div>
-      {rawMode ? (
-        // 原始模式用 `pre`：不折行、横向滚动，否则分不清哪些空白是报文里真有的。
-        <pre className="bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre">
-          {text}
-        </pre>
-      ) : (
-        <FormattedBody text={text} />
-      )}
-    </div>
-  );
-}
-
-/**
- * 格式化视图。是 JSON 就给可折叠的树，不是就退回纯文本。
- *
- * SSE 事件流、上游返回的 HTML 错误页都不是 JSON —— 那种情况硬塞进 JSON 树
- * 只会报错，所以退回纯文本并说明原因，而不是显示一片空白。
- */
-function FormattedBody({ text }: { text: string }) {
-  const parsed = tryParseJson(text);
-
-  if (parsed === undefined) {
-    return (
-      <div className="space-y-1">
-        <p className="text-muted-foreground text-[11px]">
-          这段不是 JSON（可能是 SSE 事件流或纯文本），按原文显示。切到「原始」
-          可以看未经折行的版本。
-        </p>
-        <pre className="bg-muted/30 max-h-[45vh] min-h-[6rem] overflow-auto rounded-md border p-3 font-mono text-xs whitespace-pre-wrap">
-          {text}
-        </pre>
-      </div>
-    );
-  }
-
-  return <JsonViewer value={parsed} />;
-}
-
-function CopyButton({ text }: { text: string }) {
-  return (
-    <Button
-      variant="ghost"
-      size="sm"
-      className="h-6 px-2 text-[11px]"
-      onClick={() => {
-        navigator.clipboard
-          .writeText(text)
-          .then(() => toast.success("已复制到剪贴板"))
-          .catch(() => toast.error("复制失败，请手动选中复制"));
-      }}
-    >
-      <Copy className="size-3" />
-      复制
-    </Button>
   );
 }
 
