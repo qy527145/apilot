@@ -40,7 +40,7 @@ import {
   type Protocol,
   type Provider,
 } from "@/lib/api";
-import { formatNumber, truncate } from "@/lib/utils";
+import { formatNumber } from "@/lib/utils";
 
 const KIND_LABEL: Record<string, string> = {
   anthropic: "Anthropic",
@@ -148,7 +148,9 @@ export default function ProvidersPage() {
                   <TableHead>名称</TableHead>
                   <TableHead>Tag</TableHead>
                   <TableHead>类型</TableHead>
-                  <TableHead>Base URL</TableHead>
+                  <TableHead className="w-full min-w-[112px] max-w-0">
+                    Base URL
+                  </TableHead>
                   <TableHead className="text-center">状态</TableHead>
                   <TableHead className="text-right">优先级</TableHead>
                   <TableHead className="text-right">权重</TableHead>
@@ -217,11 +219,20 @@ export default function ProvidersPage() {
                             )}
                           </div>
                         </TableCell>
-                        <TableCell
-                          className="text-muted-foreground max-w-[240px] truncate text-xs"
-                          title={p.base_url}
-                        >
-                          {truncate(p.base_url, 34)}
+                        {/*
+                          宽度靠 CSS 自适应，不用 truncate(s, 34) 那种按字符数硬砍：
+                          窗口宽时白占位、窄时又砍不出足够空间。表头与本格同用
+                          w-full + max-w-0，这列就吃掉整张表的剩余宽度，由内层
+                          truncate 按实际空间截断。
+
+                          min-w 是刻意的下限：不给下限时这列在窄窗口会被压到
+                          60px 出头，只剩「https:...」，读不出是哪家上游。宁可
+                          让表格在窗口窄于约 1050px 时横向滚动，也别把 URL 压废。
+                        */}
+                        <TableCell className="text-muted-foreground w-full min-w-[112px] max-w-0 text-xs">
+                          <div className="truncate" title={p.base_url}>
+                            {p.base_url}
+                          </div>
                         </TableCell>
                         <TableCell className="text-center">
                           <Badge variant={p.enabled ? "success" : "secondary"}>

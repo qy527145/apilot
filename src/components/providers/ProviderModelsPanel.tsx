@@ -133,7 +133,12 @@ export function ProviderModelsPanel({
   }
 
   return (
-    <div className="bg-muted/30 space-y-3 rounded-md p-4">
+    // whitespace-normal 是必须的:这个面板挂在 TableCell 里,而 TableCell 基类带
+    // whitespace-nowrap（表格式的默认）。不显式盖掉，下面那段说明文字会变成一整行
+    // 不换行 —— 实测宽 1516px，把整张表从 1006 撑到 1548，所有列被推出屏幕。
+    // 放在组件自己身上而不是调用处的 td 上：这是组件自身的排版责任，
+    // 换个地方挂（比如以后的抽屉）也不该重蹈覆辙。
+    <div className="bg-muted/30 space-y-3 rounded-md p-4 whitespace-normal">
       <div className="flex items-center justify-between">
         <p className="text-xs font-medium">该渠道支持的模型</p>
         <div className="flex items-center gap-2">
