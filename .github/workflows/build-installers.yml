@@ -94,8 +94,7 @@ jobs:
 
       # 打包交给 tauri-action 而不是 `bun run build`：
       #   - 每个 runner 都是目标平台本机，build.mjs 里「本机还是交叉」的分支在这里是恒等变换；
-      #   - 动作知道产物落在哪（bundle/macos/*.dmg、bundle/nsis/*-setup.exe …），能直接传成
-      #     Release 资产；自己按扩展名去 bundle/ 里翻，会在 Tauri 改目录结构后悄悄失配。
+      #   - 动作知道产物落在哪（bundle/macos/*.dmg、bundle/nsis/*-setup.exe …），能直接传成制品。
       # 不写 tauriScript：动作自己认 bun.lock（utils.ts 里 bun.lockb / bun.lock 都查）→ 跑 `bun tauri`。
       # 它还会替我们置 TAURI_BUNDLER_DMG_IGNORE_CI，免得 dmg 打包在 CI 里去找 Finder。
       - name: 打包
@@ -107,14 +106,84 @@ jobs:
           # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY / APPLE_ID /
           # APPLE_PASSWORD / APPLE_TEAM_ID，Tauri 见到这些环境变量会自动签名 + 公证。
         with:
-          # 空串 = 不建 Release（动作内部按真值判断）。所以手动触发只出 artifact。
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: Apilot ${{ github.ref_name }}
-          # 草稿：推完标签还要人去 Release 页面点「发布」，避免误推一个标签就把包发出去。
-          releaseDraft: true
-          generateReleaseNotes: true
-          # 必须显式打开（默认 false）：手动触发时没有 Release 可挂，不留 artifact 的话
-          # 跑完几十分钟产物就随 runner 一起没了。推 tag 时两份都有，公开仓库不占配额。
+          # 只构建 + 上传 workflow artifact，**Release 由下面的 publish job 挂**。
+          # 不用这个动作自带的 Release 那套（tagName/releaseName/releaseDraft）：它的 tagName 为空时
+          # 只打一行 "skipping all uploads" 就正常结束，步骤仍然是绿的 —— 出问题没有任何信号。
+          # 换成显式步骤后，每一步都留在日志里，失败即红。
           uploadWorkflowArtifacts: true
           # 想要 Intel Mac 的包：给 macOS 那行加 `args: --target universal-apple-darwin`，
           # 并给上面 rust-toolchain 那步加 `targets: aarch64-apple-darwin,x86_64-apple-darwin`。
+
+  # 单开一个 job 而不是让三个平台各自往 Release 里塞：谁先构建完谁建 Release 会打架，
+  # 而且失败会散落在三个 job 里。这里等三个平台全部成功再一次性挂上去，日志只有一份。
+  publish:
+    name: 挂到草稿 Release
+    needs: build
+    # 只有推标签才发版；手动触发只出 artifact，不碰 Release。
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: 取回三个平台刚上传的制品
+        uses: actions/download-artifact@v8
+        with:
+          path: bundles
+
+      # 这一步刻意**不用** ${{ github.ref_name }} 之类的表达式取值，而是读 runner 注入的
+      # GITHUB_REF_NAME / GITHUB_REPOSITORY：同样是取 tag，shell 变量这条路有本次运行的证据
+      # （verify 那个 step 就是靠 ${GITHUB_REF_NAME#v} 取到 0.1.0 并通过的）。
+      - name: 建/更新草稿 Release 并挂上安装包
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          tag="$GITHUB_REF_NAME"
+
+          # 不用 `gh release upload <tag>`：草稿用 tag 查不到（REST 的 getReleaseByTag 对草稿
+          # 返回 404，gh 于是报 release not found），所以先按 tag 在 Release 列表里找 id，
+          # 之后一律按 id 操作。列表只查第一页 —— 这个仓库远到不了 100 个 Release。
+          id=$(gh api "repos/$repo/releases?per_page=100" \
+                 -q "[.[] | select(.tag_name == \"$tag\") | .id] | first // empty")
+
+          if [ -z "$id" ]; then
+            echo "没有 tag=$tag 的 Release，建一个草稿。"
+            # 草稿：推完标签还要人去 Release 页面点「发布」。想推完就公开，把 draft 改成 false。
+            id=$(gh api -X POST "repos/$repo/releases" \
+                   -f tag_name="$tag" -f name="Apilot $tag" \
+                   -F draft=true -F generate_release_notes=true -q .id)
+          else
+            echo "复用已有 Release id=$id。"
+          fi
+
+          # 只挑安装包本体：darwin 的 app 制品是整棵 .app 目录树，全传上去会变成几千个资产。
+          mapfile -t files < <(find bundles -type f \
+            \( -iname '*.dmg' -o -iname '*.msi' -o -iname '*.exe' \
+               -o -iname '*.deb' -o -iname '*.rpm' -o -iname '*.appimage' \) | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::bundles/ 里一个安装包都没找到，不建空 Release。"
+            exit 1
+          fi
+          printf '找到 %d 个安装包：\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+
+          for file in "${files[@]}"; do
+            name=$(basename "$file")
+            # 同名资产先删后传：同一个标签重跑时，GitHub 对重名资产返回 422。
+            old=$(gh api "repos/$repo/releases/$id/assets?per_page=100" \
+                    -q "[.[] | select(.name == \"$name\") | .id] | first // empty")
+            [ -z "$old" ] || gh api -X DELETE "repos/$repo/releases/assets/$old" >/dev/null
+            # 上传走 uploads.github.com 这个专用域名：gh api 在这条路径上会把 body 当 JSON 处理。
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$file" \
+              "https://uploads.github.com/repos/$repo/releases/$id/assets?name=$name" >/dev/null
+            echo "已挂上 $name（$(du -m "$file" | cut -f1) MB）"
+          done
+
+          echo "=== Release 现状 ==="
+          gh api "repos/$repo/releases/$id" -q '"tag=\(.tag_name)  draft=\(.draft)  资产 \(.assets | length) 个"'
+          gh api "repos/$repo/releases/$id/assets?per_page=100" -q '.[] | "  \(.name)  \(.size/1048576|floor) MB"'
+          echo "草稿要点「发布」才对用户可见：https://github.com/$repo/releases"

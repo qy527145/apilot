@@ -174,6 +174,12 @@ brew install llvm makensis     # clang-cl / llvm-rc / lld-link 与 NSIS 的 make
 
 配置在 [.github/workflows/build-installers.yml](.github/workflows/build-installers.yml)。
 
+挂载在一个独立的 `publish` job 里：等三个平台都构建成功，再按 tag 找到（或创建）那个 Release，
+逐个上传安装包 —— 不在三个构建 job 里各挂一次，那样谁先构建完谁建 Release，失败也会散在三处。
+
+想重跑同一个版本：把四处版本号改成新号码再推新标签（推荐），或删掉远程标签重推 ——
+`publish` 会复用同名 Release 并把同名资产换成新的。
+
 ### 环境说明
 
 本机有两处特殊配置，已在仓库里处理好：
