@@ -1,0 +1,120 @@
+name: 构建安装包
+
+# 只在「人主动发起」时跑：推 v* 标签，或在 Actions 页面手动触发。
+# 不挂 push/PR —— 三平台全量构建要几十分钟，日常提交不值得付这个成本。
+#
+#   推 tag v0.2.0  → 三平台打包，安装包挂到一个**草稿** Release（要人点一下才对外可见）
+#   手动 dispatch  → 三平台打包，产物作为 workflow artifact 供下载自取
+#
+# 三个平台各在自己的 runner 上**本机**编译，所以 scripts/build.mjs 的交叉编译分支在这里
+# 用不上（那是给「在 macOS 上出 Windows 包」准备的），CI 与本地走的是同一条 `tauri build`。
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+# 建 Release、传资产要写权限，其余一律不给。
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: 校验版本号
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # 版本号散在四处：tag、tauri.conf.json（决定安装包文件名）、Cargo.toml（进二进制）、
+      # package.json。对不上就会产出「标签写 v0.2.0、文件名叫 0.1.0」的 Release，事后极难解释，
+      # 所以宁可在这里失败 —— 校验只花十几秒，排在几十分钟的编译之前。
+      #
+      # 条件写在 step 上而不是 job 上：job 被 skip 会让 needs 它的 build 一起被 skip
+      # （依赖被跳过时依赖方也跳过），那样手动触发就一个包都不会出。
+      - name: tag 与三处版本号必须一致
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cargo=$(awk -F'"' '/^version *=/{print $2; exit}' src-tauri/Cargo.toml)
+          pkg=$(node -p "require('./package.json').version")
+          echo "tag=v$tag  tauri.conf.json=$conf  Cargo.toml=$cargo  package.json=$pkg"
+
+          bad=""
+          [ "$conf"  = "$tag" ] || bad="$bad  src-tauri/tauri.conf.json($conf)"
+          [ "$cargo" = "$tag" ] || bad="$bad  src-tauri/Cargo.toml($cargo)"
+          [ "$pkg"   = "$tag" ] || bad="$bad  package.json($pkg)"
+          if [ -n "$bad" ]; then
+            echo "::error::tag v$tag 与仓库里的版本号不一致：$bad 。先统一版本号再重打标签。"
+            exit 1
+          fi
+
+  build:
+    name: 打包 ${{ matrix.label }}
+    needs: verify
+    strategy:
+      # 一个平台失败不该顺手取消其余平台 —— 一次跑完看到全部结果，比失败即停省事。
+      fail-fast: false
+      matrix:
+        include:
+          # 只出 Apple Silicon 的包。要连 Intel Mac 一起支持，见下面 tauri-action 那步的注释。
+          - platform: macos-latest
+            label: macOS (arm64)
+          # 固定 24.04 而不是 ubuntu-latest：apt 包名会随 Ubuntu 版本变（libappindicator3-dev
+          # 在 24.04 已被 libayatana-appindicator3-dev 取代），跟着 latest 漂会某天突然构建失败。
+          - platform: ubuntu-24.04
+            label: Linux (x86_64)
+          - platform: windows-latest
+            label: Windows (x64)
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      # Tauri 在 Linux 上动态链接 webkit2gtk，这些库 runner 镜像里没有，缺一个都会在编译中途报错。
+      - name: 装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: 装前端依赖
+        run: bun install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 只缓存 src-tauri 的 target：仓库根目录没有 Cargo 工程，缓存整个仓库是白费。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # 打包交给 tauri-action 而不是 `bun run build`：
+      #   - 每个 runner 都是目标平台本机，build.mjs 里「本机还是交叉」的分支在这里是恒等变换；
+      #   - 动作知道产物落在哪（bundle/macos/*.dmg、bundle/nsis/*-setup.exe …），能直接传成
+      #     Release 资产；自己按扩展名去 bundle/ 里翻，会在 Tauri 改目录结构后悄悄失配。
+      # 不写 tauriScript：动作自己认 bun.lock（utils.ts 里 bun.lockb / bun.lock 都查）→ 跑 `bun tauri`。
+      # 它还会替我们置 TAURI_BUNDLER_DMG_IGNORE_CI，免得 dmg 打包在 CI 里去找 Finder。
+      - name: 打包
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 目前没有签名：macOS 的 dmg 未公证、Windows 的 exe 无代码签名，用户首次打开会看到
+          # 「未知开发者」提示（macOS 上右键 → 打开可绕过）。要签名就往仓库 secrets 里加
+          # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY / APPLE_ID /
+          # APPLE_PASSWORD / APPLE_TEAM_ID，Tauri 见到这些环境变量会自动签名 + 公证。
+        with:
+          # 空串 = 不建 Release（动作内部按真值判断）。所以手动触发只出 artifact。
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: Apilot ${{ github.ref_name }}
+          # 草稿：推完标签还要人去 Release 页面点「发布」，避免误推一个标签就把包发出去。
+          releaseDraft: true
+          generateReleaseNotes: true
+          # 必须显式打开（默认 false）：手动触发时没有 Release 可挂，不留 artifact 的话
+          # 跑完几十分钟产物就随 runner 一起没了。推 tag 时两份都有，公开仓库不占配额。
+          uploadWorkflowArtifacts: true
+          # 想要 Intel Mac 的包：给 macOS 那行加 `args: --target universal-apple-darwin`，
+          # 并给上面 rust-toolchain 那步加 `targets: aarch64-apple-darwin,x86_64-apple-darwin`。

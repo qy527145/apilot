@@ -158,6 +158,22 @@ brew install llvm makensis     # clang-cl / llvm-rc / lld-link 与 NSIS 的 make
 平台判定、交叉工具链预检与参数透传都在 [scripts/build.mjs](scripts/build.mjs)：
 `bun run build -- --debug` 这类额外参数原样转给 `tauri build`。
 
+### CI 打包
+
+推一个 `v*` 标签（或在 Actions 页面手动触发）会让 GitHub 上的三个 runner 各自**本机**出一份安装包：
+
+| 触发方式 | 结果 |
+|---|---|
+| 推 tag `v0.2.0` | macOS dmg / Linux deb+rpm+AppImage / Windows msi+nsis，挂到一个**草稿** Release，需手动点一下发布 |
+| 手动 dispatch | 只作为 workflow artifact，供下载自取 |
+
+版本号必须四处一致（tag、`tauri.conf.json`、`Cargo.toml`、`package.json`），不一致会在编译前就失败 ——
+安装包文件名取自 `tauri.conf.json`，对不上就会得到一个「标签与文件名互相矛盾」的 Release。
+
+目前不签名：macOS 的 dmg 未公证、Windows 的 exe 无代码签名，用户首次打开会看到系统的「未知开发者」提示。
+
+配置在 [.github/workflows/build-installers.yml](.github/workflows/build-installers.yml)。
+
 ### 环境说明
 
 本机有两处特殊配置，已在仓库里处理好：

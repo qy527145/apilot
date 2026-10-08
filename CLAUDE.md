@@ -27,6 +27,10 @@ cargo build
 macOS 与 Linux 的包只能在各自系统上构建。**`tauri.conf.json` 的 `beforeBuildCommand` 必须指向
 `build:web`——指向 `build` 会自我递归。**
 
+CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-installers.yml)：推 `v*` 标签或手动触发，
+三平台各自在目标系统的 runner 上**本机**打包（不涉及交叉编译）。**版本号必须四处一致**
+（tag / `tauri.conf.json` / `Cargo.toml` / `package.json`），不一致会在编译前失败。
+
 其他环境坑见 [README.md](README.md) 的「环境说明」。
 
 ## 架构一览
