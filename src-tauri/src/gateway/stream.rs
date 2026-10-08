@@ -956,6 +956,53 @@ mod tests {
         assert_eq!(o.usage.cache_read_tokens, 400);
     }
 
+    /// 用户的真实配置：上游是 Chat 协议，客户端是 Codex（Responses）。
+    /// Chat 解码器不产 BlockStop，所以这条路最容易丢掉 `output_item.done`。
+    #[tokio::test]
+    async fn chat_upstream_tool_call_reaches_codex_as_a_complete_item() {
+        use crate::protocol::oai_responses::ResponsesStreamEncoder;
+
+        let chunks = vec![
+            "data: {\"id\":\"c\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_observed(
+            upstream(chunks),
+            Box::new(ChatStreamDecoder::new()),
+            Some(Box::new(ResponsesStreamEncoder::new())),
+            StreamTimeouts::default(),
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+        let bytes = run(body).await;
+        let text = String::from_utf8_lossy(&bytes);
+
+        // done 必须出现，且带着拼全的 arguments —— 否则 Codex 不会执行工具。
+        let done_line = text
+            .lines()
+            .find(|l| l.starts_with("data:") && l.contains("response.output_item.done"))
+            .expect("必须发出 output_item.done");
+        let v: serde_json::Value =
+            serde_json::from_str(done_line.trim_start_matches("data:").trim()).unwrap();
+        assert_eq!(v["item"]["type"], "function_call");
+        assert_eq!(v["item"]["call_id"], "call_1");
+        assert_eq!(v["item"]["name"], "exec_command");
+        assert_eq!(v["item"]["arguments"], r#"{"cmd":"ls"}"#);
+
+        // 顺序：done 在 completed 之前。
+        let di = text.find("response.output_item.done").unwrap();
+        let ci = text.find("response.completed").unwrap();
+        assert!(di < ci, "done 必须早于 completed");
+
+        let _ = rx.await;
+    }
+
     #[tokio::test]
     async fn sse_done_marker_alone_is_handled() {
         let (tx, rx) = tokio::sync::oneshot::channel();
