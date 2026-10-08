@@ -118,6 +118,23 @@ cargo build           # 构建二进制
 
 测试覆盖到了协议转换的字段等价性、SSE 跨 chunk 的 UTF-8 边界、规则链求值顺序、计费公式、接管补丁的解析失败拒绝写入，以及**真实 HTTP 的端到端链路**（起一个假上游，跑通出站 → 流式转码 → 下游）。
 
+### 打包安装包
+
+```bash
+bun run build          # 按当前操作系统自动选择
+bun run build:win      # Windows：.msi + 安装程序 .exe
+bun run build:mac      # macOS：.app + .dmg
+bun run build:linux    # Linux：.deb / .rpm / .AppImage
+bun run build:web      # 只构建前端（tsc && vite build）
+```
+
+产物在 `src-tauri/target/release/bundle/`，脚本跑完会把安装包路径和大小列出来。
+
+安装包**必须在本系统上构建**，Tauri 不支持交叉打包 —— 在 macOS 上执行 `build:win` 会立刻中止并说明原因，
+而不是吐出一个装不上的包。Windows 下若用 Git Bash，先 `source scripts/msvc-env.sh`，否则会在链接阶段失败。
+
+平台判定与参数透传都在 [scripts/build.mjs](scripts/build.mjs)：`bun run build -- --debug` 这类额外参数原样转给 `tauri build`。
+
 ### 环境说明
 
 本机有两处特殊配置，已在仓库里处理好：

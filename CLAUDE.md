@@ -21,7 +21,10 @@ cargo check --all-targets      # 期望零警告
 cargo build
 ```
 
-前端在仓库根目录：`bun run build`（即 `tsc && vite build`）。
+前端在仓库根目录：`bun run build:web`（即 `tsc && vite build`）。打包安装包用 `bun run build`（按当前系统自选）
+或 `build:win` / `build:mac` / `build:linux`；入口是 [scripts/build.mjs](scripts/build.mjs)（安装包必须在本系统上构建，
+不支持交叉打包），产物在 `src-tauri/target/release/bundle`。**`tauri.conf.json` 的 `beforeBuildCommand`
+必须指向 `build:web`——指向 `build` 会自我递归。**
 
 其他环境坑见 [README.md](README.md) 的「环境说明」。
 
