@@ -82,6 +82,48 @@ wire = 入站协议 ∈ 渠道声明的协议集合 ? 入站协议 : 渠道的�
 
 ---
 
+## 客户端的硬契约：Responses 流靠 `output_item.done` 收工具调用
+
+这一节不是「转换折损」，而是**必须发对、发错客户端就静默失效**的字段形状。
+踩过一次，代价是「文字正常显示、工具一个都不执行」，且上游全程 200。
+
+Codex 的 SSE 解析器（`codex-api/src/sse/responses.rs::process_responses_event`）只认
+**少数几类事件**，其余直接 `trace!` 掉。其中工具调用的唯一来源是：
+
+```rust
+"response.output_item.done" => {
+    if let Some(item_val) = event.item {                 // ← 没有 item 就整个跳过
+        if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
+            return Ok(Some(ResponseEvent::OutputItemDone(item)));
+        }
+    }
+}
+```
+
+`response.function_call_arguments.delta` 在 Codex 里**只用于界面回显**，
+不参与构造工具调用（`core/src/stream_events_utils.rs::handle_output_item_done`
+拿的是 done 里那个完整 item）。所以：
+
+1. **`output_item.done` 必须带完整的 `item`**，不能只发 `output_index`。
+   `arguments` 是**拼全后的字符串**（不是对象、不是分片）；
+   空参数要给 `"{}"` —— 空串会让 Codex 解析报错。
+2. **收尾必须兜底补 done**。`BlockStop` 是 done 的触发点，
+   但 **OpenAI Chat 的解码器根本不产 `BlockStop`**（Chat 只有 `finish_reason`）。
+   所以「Chat 上游 → Codex」这条最常见的路，靠 `BlockStop` 是等不到 done 的 ——
+   编码器要在 `finish()` 里按 `output_index` 顺序补齐。有端到端测试钉着：
+   `gateway/stream.rs::chat_upstream_tool_call_reaches_codex_as_a_complete_item`。
+3. **reasoning 也要先 `output_item.added`**，且 `reasoning_summary_text.delta`
+   必须带 `summary_index`（`(delta, summary_index)` 缺一即被忽略）。
+   没有 active item 的 summary delta 走的是 `error_or_panic` ——
+   **debug 构建直接 panic**。
+4. **reasoning item 的 `encrypted_content` 必须存在**（null 也算）。
+   该字段在 `ResponseItem` 上没有 `#[serde(default)]`，缺了整个 item 反序列化失败，
+   而 Codex 只打一行 debug 日志就把这一项丢掉 —— 又一个静默失败。
+
+顺序上 `done` 一律早于 `response.completed`：客户端收尾后再补 item 已经晚了。
+
+---
+
 ## 损耗清单
 
 转换不是无损的。下面每一条都对应代码里的具体位置。

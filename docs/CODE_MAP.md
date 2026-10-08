@@ -67,7 +67,7 @@
 | `codec.rs` | `Codec` / `StreamDecoder` / `StreamEncoder` trait、`ConvertError`、**`CodecRegistry`**（转换调度入口） |
 | `anthropic/` | Anthropic Messages 的 `mod`（Codec 实现）/ `request` / `response` / `stream` |
 | `oai_chat/` | OpenAI Chat Completions，同结构 |
-| `oai_responses/` | OpenAI Responses，同结构（`mod.rs` 内含 request+response） |
+| `oai_responses/` | OpenAI Responses，同结构（`mod.rs` 内含 request+response）。**流式编码器的 `output_item.done` 必须带完整 item** —— Codex 只从这里取工具调用，见 [PROTOCOL_MATRIX.md](PROTOCOL_MATRIX.md#客户端的硬契约responses-流靠-output_itemdone-收工具调用) |
 | `shared/tokens.rs` | 无上游 usage 时的本地 token 估算（按 CJK / 拉丁字符分档） |
 | `shared/tools.rs` | 工具调用的跨协议处理（分片 JSON 累积、结果拍平） |
 | `inspect.rs` | 把**捕获的报文**解成 IR，供监控页做语义化展示。解四个方向（入站在此协议、出站协议各一份请求与响应），流式响应从 `captures.response_content` 还原。解码失败只填 `error`，不抛错 |
