@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, Pause, Play, RefreshCw, Trash2, X } from "lucide-react";
+import { Activity, Clock, Pause, Play, RefreshCw, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
 import { PageShell } from "@/components/layout/PageShell";
+import { FilterExprPanel } from "@/components/traffic/FilterExprPanel";
 import { LiveStreamDialog, MAX_LIVE_FRAMES, type LiveRequest } from "@/components/traffic/LiveStreamDialog";
 import { RequestDetailDialog } from "@/components/traffic/RequestDetailDialog";
 import { Badge } from "@/components/ui/badge";
@@ -19,7 +20,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -27,6 +27,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
 import {
   Table,
   TableBody,
@@ -46,6 +47,7 @@ import {
   type Protocol,
 } from "@/lib/api";
 import { useApilotEvent, type TrafficSnapshot } from "@/lib/events";
+import { buildInflightContext, compileExpr, inflightMatches } from "@/lib/logExpr";
 import {
   cn,
   formatMs,
@@ -106,12 +108,18 @@ export default function TrafficPage() {
   const [snapshot, setSnapshot] = useState<TrafficSnapshot | null>(null);
 
   // --- 筛选条件 ---
+  // 时间单独控（见下方的时间行）；其余是高频条件，平铺在筛选卡第一行。
   const [range, setRange] = useState<RangePreset>("all");
   const [client, setClient] = useState<string>(ANY);
+  /** 客户端请求时写的模型名（`request_model`）。 */
+  const [requestModel, setRequestModel] = useState<string>(ANY);
+  /** 实际路由到的模型名（`model`）。与上面是两个轴，别合并。 */
+  const [routedModel, setRoutedModel] = useState<string>(ANY);
   const [protocol, setProtocol] = useState<string>(ANY);
   const [status, setStatus] = useState<string>(ANY);
-  const [modelLike, setModelLike] = useState("");
   const [onlyStream, setOnlyStream] = useState(false);
+  /** 自定义 JS 表达式。空 = 不筛。 */
+  const [expr, setExpr] = useState("");
   const [limit, setLimit] = useState(PAGE_SIZE);
 
   const from = useMemo(() => rangeFrom(range), [range]);
@@ -122,15 +130,17 @@ export default function TrafficPage() {
       offset: 0,
       from,
       client: client === ANY ? null : client,
+      request_model: requestModel === ANY ? null : requestModel,
+      model: routedModel === ANY ? null : routedModel,
       protocol: protocol === ANY ? null : (protocol as Protocol),
       status: status === ANY ? null : (status as LogStatus),
       is_stream: onlyStream ? true : null,
-      model_like: modelLike.trim() || null,
+      expr: expr.trim() || null,
     }),
-    [limit, from, client, protocol, status, onlyStream, modelLike],
+    [limit, from, client, requestModel, routedModel, protocol, status, onlyStream, expr],
   );
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: qk.logs(`${LOGS_QUERY_KEY}-${JSON.stringify(filter)}`),
     queryFn: () => api.queryLogs(filter),
     refetchInterval: live ? 1000 : false,
@@ -256,13 +266,39 @@ export default function TrafficPage() {
     });
   });
 
+  // 表达式编译一次复用。空表达式编译为 null，`inflightMatches` 对 null 一律放行。
+  const compiledExpr = useMemo(() => compileExpr(expr), [expr]);
+
   // 进行中且未结束的请求，按时间倒序（最新的在最上方）。
+  // 同时应用与历史日志相同的筛选条件 —— 筛选器对进行中请求同样生效。
+  //
+  // 表达式这边走的是前端求值（`lib/logExpr.ts`）：进行中的请求没有捕获报文、
+  // 也不分页，本地算就够了。响应侧字段一律为 null，所以只读请求侧的表达式
+  // 才能在这几行上命中。
   const inflightList = useMemo(
     () =>
       [...inflight.values()]
-        .filter((r) => !r.done)
+        .filter((r) => {
+          if (r.done) return false;
+          if (from !== null && r.ts < from) return false;
+          if (client !== ANY && r.client !== client) return false;
+          if (requestModel !== ANY && r.request_model !== requestModel) return false;
+          if (routedModel !== ANY && r.model !== routedModel) return false;
+          if (protocol !== ANY && r.protocol_in !== protocol) return false;
+          if (onlyStream && !r.is_stream) return false;
+          return inflightMatches(compiledExpr, buildInflightContext(r));
+        })
         .sort((a, b) => b.ts - a.ts),
-    [inflight],
+    [
+      inflight,
+      from,
+      client,
+      requestModel,
+      routedModel,
+      protocol,
+      onlyStream,
+      compiledExpr,
+    ],
   );
 
   const clear = useMutation({
@@ -281,22 +317,30 @@ export default function TrafficPage() {
   const hasFilter =
     range !== "all" ||
     client !== ANY ||
+    requestModel !== ANY ||
+    routedModel !== ANY ||
     protocol !== ANY ||
     status !== ANY ||
     onlyStream ||
-    modelLike.trim() !== "";
+    expr.trim() !== "";
 
   const resetFilters = () => {
     setRange("all");
     setClient(ANY);
+    setRequestModel(ANY);
+    setRoutedModel(ANY);
     setProtocol(ANY);
     setStatus(ANY);
     setOnlyStream(false);
-    setModelLike("");
+    setExpr("");
     setLimit(PAGE_SIZE);
   };
 
   const openLive = liveStream ? inflight.get(liveStream) ?? null : null;
+
+  // 表达式在后端执行，其错因（语法错、执行超时）只有查询失败时才拿得到，
+  // 顺手显示出来 —— 否则用户只能看到一个笼统的「加载失败」。
+  const errorMessage = error instanceof Error ? error.message : null;
 
   return (
     <PageShell
@@ -340,81 +384,116 @@ export default function TrafficPage() {
     >
       <div className="space-y-6">
         <Card className="py-0">
-          <CardContent className="flex flex-wrap items-center gap-3 p-3">
-            <Tabs value={range} onValueChange={(v) => setRange(v as RangePreset)}>
-              <TabsList>
-                {(Object.keys(RANGE_LABEL) as RangePreset[]).map((r) => (
-                  <TabsTrigger key={r} value={r}>
-                    {RANGE_LABEL[r]}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
+          <CardContent className="space-y-3 p-3">
+            {/* 高频筛选条件 */}
+            <div className="flex flex-wrap items-center gap-3">
+              <Select value={client} onValueChange={setClient}>
+                <SelectTrigger size="sm" className="h-8 w-36">
+                  <SelectValue placeholder="客户端" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部客户端</SelectItem>
+                  {(facets.data?.clients ?? []).map((c) => (
+                    <SelectItem key={c} value={c}>
+                      {c}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <Select value={client} onValueChange={setClient}>
-              <SelectTrigger size="sm" className="h-8 w-36">
-                <SelectValue placeholder="客户端" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>全部客户端</SelectItem>
-                {(facets.data?.clients ?? []).map((c) => (
-                  <SelectItem key={c} value={c}>
-                    {c}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              <Select value={requestModel} onValueChange={setRequestModel}>
+                <SelectTrigger size="sm" className="h-8 w-44">
+                  <SelectValue placeholder="请求模型" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部请求模型</SelectItem>
+                  {(facets.data?.models ?? []).map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {m}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <Select value={protocol} onValueChange={setProtocol}>
-              <SelectTrigger size="sm" className="h-8 w-44">
-                <SelectValue placeholder="协议" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>全部协议</SelectItem>
-                {ALL_PROTOCOLS.map((p) => (
-                  <SelectItem key={p} value={p}>
-                    {PROTOCOL_LABEL[p]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              <Select value={routedModel} onValueChange={setRoutedModel}>
+                <SelectTrigger size="sm" className="h-8 w-44">
+                  <SelectValue placeholder="实际模型" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部实际模型</SelectItem>
+                  {(facets.data?.routed_models ?? []).map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {m}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <Select value={status} onValueChange={setStatus}>
-              <SelectTrigger size="sm" className="h-8 w-32">
-                <SelectValue placeholder="状态" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>全部状态</SelectItem>
-                <SelectItem value="ok">只看成功</SelectItem>
-                <SelectItem value="error">只看失败</SelectItem>
-              </SelectContent>
-            </Select>
+              <Select value={protocol} onValueChange={setProtocol}>
+                <SelectTrigger size="sm" className="h-8 w-40">
+                  <SelectValue placeholder="协议" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部协议</SelectItem>
+                  {ALL_PROTOCOLS.map((p) => (
+                    <SelectItem key={p} value={p}>
+                      {PROTOCOL_LABEL[p]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <Input
-              className="h-8 w-44"
-              placeholder="模型名包含…"
-              value={modelLike}
-              onChange={(e) => setModelLike(e.target.value)}
-            />
+              <Select value={status} onValueChange={setStatus}>
+                <SelectTrigger size="sm" className="h-8 w-32">
+                  <SelectValue placeholder="状态" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部状态</SelectItem>
+                  <SelectItem value="ok">只看成功</SelectItem>
+                  <SelectItem value="error">只看失败</SelectItem>
+                </SelectContent>
+              </Select>
 
-            <Button
-              variant={onlyStream ? "default" : "outline"}
-              size="sm"
-              onClick={() => setOnlyStream((v) => !v)}
-            >
-              只看流式
-            </Button>
-
-            {hasFilter && (
-              <Button variant="ghost" size="sm" onClick={resetFilters}>
-                <X className="size-4" />
-                清除筛选
+              <Button
+                variant={onlyStream ? "default" : "outline"}
+                size="sm"
+                onClick={() => setOnlyStream((v) => !v)}
+              >
+                只看流式
               </Button>
-            )}
 
-            <span className="text-muted-foreground ml-auto text-xs tabular-nums">
-              共 {formatNumber(total)} 条
-            </span>
+              <FilterExprPanel value={expr} onChange={setExpr} />
+
+              {hasFilter && (
+                <Button variant="ghost" size="sm" onClick={resetFilters}>
+                  <X className="size-4" />
+                  清除筛选
+                </Button>
+              )}
+
+              <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+                共 {formatNumber(total)} 条
+              </span>
+            </div>
+
+            <Separator />
+
+            {/* 时间：单独一组，不与高频条件混在一行。 */}
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-muted-foreground flex items-center gap-1.5 text-xs">
+                <Clock className="size-3.5" />
+                时间范围
+              </span>
+              <Tabs value={range} onValueChange={(v) => setRange(v as RangePreset)}>
+                <TabsList>
+                  {(Object.keys(RANGE_LABEL) as RangePreset[]).map((r) => (
+                    <TabsTrigger key={r} value={r}>
+                      {RANGE_LABEL[r]}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+              </Tabs>
+            </div>
           </CardContent>
         </Card>
 
@@ -425,8 +504,13 @@ export default function TrafficPage() {
                 <TableSkeleton rows={8} cols={8} />
               </div>
             ) : isError ? (
-              <div className="p-4">
+              <div className="space-y-2 p-4">
                 <ErrorState onRetry={() => refetch()} />
+                {errorMessage && (
+                  <p className="text-muted-foreground text-center text-xs">
+                    {errorMessage}
+                  </p>
+                )}
               </div>
             ) : inflightList.length === 0 && items.length === 0 ? (
               <div className="p-6">

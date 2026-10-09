@@ -419,13 +419,14 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 
 ---
 
-### `traffic/` — 实时统计与事件（419 行）
+### `traffic/` — 实时统计与事件（1480 行）
 
 | 文件 | 内容 |
 |---|---|
 | `mod.rs` | `TrafficStats`（并发守护 `ActiveRequest`、累计计数、TTFB 环形窗口）、`TrafficEvent` |
 | `events.rs` | `EventBus`（按类型推送 + 节流）、`Throttle`、`event_names` |
 | `stream_events.rs` | **流式实时事件**：`StreamBatcher`（攒批 + 封顶 + 单帧截断，纯逻辑）、`StreamEmitter`（观察者实现，`Drop` 兜底断连）、`StreamDelta`（推流用的增量形态） |
+| `log_filter.rs` | **监控页「自定义表达式」筛选的求值器**：QuickJS 里跑用户表达式，逐行判断要不要显示。线程本地引擎，单行 50ms / 整批 500ms 预算。求值放在**后端**是因为日志分页、报文在 `captures` 另一张表 —— 前端只看得见当前页。内置对象与字段见 `expr_context` |
 
 **事件名**（前端 `listen` 用的字面量，改了就静默破坏订阅）：
 
@@ -524,6 +525,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 |---|---|
 | `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 62 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
+| `src/lib/logExpr.ts` | 监控页自定义表达式筛选的**前端那一半**：为「进行中」请求组装内置对象并求值（已落库的走后端 QuickJS）。两边必须同语义，改一个就要改另一个 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
 | `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / Models / Routing / Traffic / Billing / Cache / Settings。**两页分工**：Models 只管**模型名**（全局 + 客户端两级替换、模型并集列表只读）；Routing 管**渠道**（selector 热切换、规则链、每个模型走哪个渠道、以及该渠道上的**上游模型名**）。Providers 是渠道视角 —— 同一份 `provider_models` 的三个方向 |
@@ -531,7 +533,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择 + 每渠道的上游模型名，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明与**自动检测** —— 逐个协议探一次，只补勾不取消；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选；每行还有**单次模型测试**与三枚**能力徽标**，点徽标即实测一项）；`CatalogCapabilitiesDialog` / `CatalogPriceDialog` 是两个目录导入入口 |
-| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库） |
+| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库）；`FilterExprPanel`（监控页的**自定义表达式**筛选：编辑框 + 后端行内校验 + 示例 + 内置对象结构说明） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
 只会在运行时静默失败。

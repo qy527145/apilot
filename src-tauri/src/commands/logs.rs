@@ -32,6 +32,15 @@ pub async fn list_log_facets(
     crate::storage::logs::facets(&shell.db, 2000).await
 }
 
+/// 校验筛选表达式能否编译。给编辑框做行内报错用。
+///
+/// 只编译、不求值 —— 求值需要一个真实的请求上下文，而用户打字时还没有。
+/// 返回 `Err` 时前端拿到的就是给用户看的那句话。
+#[tauri::command]
+pub fn validate_log_expr(expr: String) -> Result<(), String> {
+    crate::traffic::log_filter::validate(&expr)
+}
+
 /// 详情命令的返回：日志 + 捕获原文 + 语义化视图。
 ///
 /// `flatten` 让前端看到的就是一个扁平的 `RequestDetail` 再加一个 `views` 字段

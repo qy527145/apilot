@@ -4,6 +4,7 @@
 //! 统计互补：DB 回答"过去一小时花了多少"，这里回答"现在正在跑什么"。
 
 pub mod events;
+pub mod log_filter;
 pub mod stream_events;
 
 use std::collections::HashMap;

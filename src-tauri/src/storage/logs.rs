@@ -101,8 +101,13 @@ pub struct LogFilter {
     pub status: Option<String>,
     /// 只看流式 / 只看非流式。
     pub is_stream: Option<bool>,
-    /// 模型名模糊匹配。`model` 是精确匹配，这个是给"记不全名字"用的。
+    /// 客户端请求的模型名精确匹配（`request_model` 列）。
+    pub request_model: Option<String>,
+    /// 模型名模糊匹配，同时命中 `model`（实际路由模型）和 `request_model`（客户端请求模型）。
     pub model_like: Option<String>,
+    /// 自定义 JS 表达式筛选。对「日志字段 + 捕获报文」求值，命中的才返回。
+    /// 求值在后端做，见 `traffic::log_filter` 里关于「为什么不能放前端」的说明。
+    pub expr: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -128,7 +133,9 @@ impl Default for LogFilter {
             protocol: None,
             status: None,
             is_stream: None,
+            request_model: None,
             model_like: None,
+            expr: None,
             limit: default_limit(),
             offset: 0,
         }
@@ -159,6 +166,11 @@ impl LogFilter {
 
         self.model_like = self
             .model_like
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        self.expr = self
+            .expr
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
@@ -260,6 +272,11 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
 pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<(Vec<RequestLog>, i64)> {
     let filter = filter.clone().normalized();
 
+    // 表达式筛选走另一条路：它要读捕获报文，没法下推给 SQL 分页。
+    if let Some(expr) = filter.expr.clone() {
+        return query_with_expr(pool, &filter, &expr).await;
+    }
+
     // 计数与取数用同一套 WHERE，避免两者口径漂移。
     let mut count_qb: QueryBuilder<sqlx::Sqlite> =
         QueryBuilder::new(format!("SELECT COUNT(*) FROM {LOG_FROM} WHERE 1=1"));
@@ -278,11 +295,168 @@ pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<(Vec<Requ
     Ok((rows.iter().map(row_to_log).collect(), total))
 }
 
+/// 表达式筛选时最多扫多少行。
+///
+/// 表达式没法下推给 SQL —— 它要读捕获报文，那是另一张表的内容。所以只能先把
+/// 候选行捞上来、在内存里逐行求值、再在内存里分页。限制扫描量是为了让最坏情况
+/// 有界：本地库几十万行时全表求值会把界面卡死好几秒。
+///
+/// 代价是**超过这个数的匹配项不会出现在结果里**，因此界面上的「共 N 条」在
+/// 表达式生效时实际是「最近 N 行里的匹配数」。这是刻意的取舍。
+const EXPR_SCAN_CAP: i64 = 5000;
+
+/// 表达式路径下的捕获列。别名 `c_` 前缀用来和日志列区分 ——
+/// 两张表都有 `upstream_url`、`path` 这类同名列，不前缀会在 `row.get` 撞上。
+const CAPTURE_COLUMNS: &str = "c.method AS c_method, \
+     c.request_headers AS c_request_headers, c.request_body AS c_request_body, \
+     c.upstream_headers AS c_upstream_headers, c.upstream_body AS c_upstream_body, \
+     c.upstream_response_headers AS c_upstream_response_headers, \
+     c.upstream_response_body AS c_upstream_response_body, \
+     c.response_headers AS c_response_headers, c.response_body AS c_response_body, \
+     c.stream_text AS c_stream_text";
+
+/// 带表达式的查询：JOIN 捕获 → 逐行求值 → 内存里过滤和分页。
+async fn query_with_expr(
+    pool: &SqlitePool,
+    filter: &LogFilter,
+    expr: &str,
+) -> AppResult<(Vec<RequestLog>, i64)> {
+    let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(format!(
+        "SELECT {LOG_COLUMNS}, {CAPTURE_COLUMNS} \
+         FROM {LOG_FROM} LEFT JOIN captures c ON c.request_id = l.request_id WHERE 1=1"
+    ));
+    // 其余筛选条件（客户端、协议、时间…）照常下推给 SQL —— 少求值一行是一行。
+    push_where(&mut qb, filter);
+    qb.push(" ORDER BY l.ts DESC, l.id DESC LIMIT ")
+        .push_bind(EXPR_SCAN_CAP);
+
+    let rows = qb.build().fetch_all(pool).await?;
+
+    let mut logs = Vec::with_capacity(rows.len());
+    let mut contexts = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let log = row_to_log(r);
+        contexts.push(expr_context(&log, r));
+        logs.push(log);
+    }
+
+    // 表达式出错（语法错 / 执行超时）时**如实报错**，不能静默返回空 ——
+    // 空结果看起来就是「没有匹配的请求」，会把用户引到完全错误的方向。
+    let mask = crate::traffic::log_filter::filter(expr, &contexts)
+        .map_err(|e| crate::error::AppError::msg(format!("筛选表达式出错：{e}")))?;
+
+    let matched: Vec<RequestLog> = logs
+        .into_iter()
+        .zip(mask)
+        .filter_map(|(l, hit)| hit.then_some(l))
+        .collect();
+
+    let total = matched.len() as i64;
+    let offset = filter.offset.max(0) as usize;
+    let limit = filter.limit.max(1) as usize;
+    let page = matched.into_iter().skip(offset).take(limit).collect();
+    Ok((page, total))
+}
+
+/// 组装一段表达式能看到的上下文 —— 就是界面上「内置对象」那份说明的实现。
+///
+/// 字段名用 camelCase：写表达式的用户面对的是 JS，`latency_ms` 那种下划线
+/// 命名在 JS 里格格不入。**改这里就必须同步改前端的说明面板与
+/// `src/lib/logExpr.ts` 的进行中求值**，否则文档与行为会对不上。
+fn expr_context(log: &RequestLog, r: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
+    use serde_json::json;
+
+    let headers = |col: &str| parse_json(r.get::<Option<String>, _>(col));
+    let method: String = r.get::<Option<String>, _>("c_method").unwrap_or_default();
+
+    json!({
+        // --- 日志本身的字段 ---
+        "id": log.request_id,
+        "ts": log.ts,
+        "client": log.client,
+        "model": log.model,
+        "requestModel": log.request_model,
+        "upstreamModel": log.upstream_model,
+        "protocolIn": log.protocol_in,
+        "protocolOut": log.protocol_out,
+        "provider": log.provider_name.clone().or_else(|| log.provider_tag.clone()),
+        "path": log.path,
+        "status": log.status_code,
+        "upstreamStatus": log.upstream_status,
+        "isStream": log.is_stream,
+        "error": log.error_message,
+        "latencyMs": log.latency_ms,
+        "ttfbMs": log.ttfb_ms,
+        "inputTokens": log.input_tokens,
+        "outputTokens": log.output_tokens,
+        "cacheReadTokens": log.cache_read_tokens,
+        "cacheCreationTokens": log.cache_creation_tokens,
+        "quota": log.quota,
+        "costUsd": log.cost_usd,
+        "cacheHit": log.cache_hit,
+
+        // --- 客户端 → Apilot ---
+        "request": {
+            "method": method,
+            "path": log.path,
+            "headers": headers("c_request_headers"),
+            "body": body_to_json(r.get::<Option<Vec<u8>>, _>("c_request_body")),
+        },
+        // --- Apilot → 客户端 ---
+        "response": {
+            "headers": headers("c_response_headers"),
+            "body": response_body(r),
+        },
+        // --- Apilot → 上游 ---
+        "upstreamRequest": {
+            "url": log.upstream_url,
+            "headers": headers("c_upstream_headers"),
+            "body": body_to_json(r.get::<Option<Vec<u8>>, _>("c_upstream_body")),
+        },
+        // --- 上游 → Apilot ---
+        "upstreamResponse": {
+            "status": log.upstream_status,
+            "headers": headers("c_upstream_response_headers"),
+            "body": body_to_json(r.get::<Option<Vec<u8>>, _>("c_upstream_response_body")),
+        },
+    })
+}
+
+/// 客户端收到的那份响应体。流式没有完整 body，回落到拼接后的文本 ——
+/// 否则对绝大多数流式请求来说 `ctx.response.body` 恒为 null，等于没用。
+fn response_body(r: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
+    let body = body_to_json(r.get::<Option<Vec<u8>>, _>("c_response_body"));
+    if !body.is_null() {
+        return body;
+    }
+    match r.get::<Option<String>, _>("c_stream_text") {
+        Some(t) => serde_json::Value::String(t),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// 报文 → 表达式里的值：能当 JSON 解就解成对象，否则按字符串给。
+///
+/// 不强制 JSON 是有意的：被截断的报文、非 JSON 的内容都解不出来，而那些恰恰
+/// 可能是用户想筛的东西 —— 退化成字符串比变成 `null` 有用得多。
+fn body_to_json(bytes: Option<Vec<u8>>) -> serde_json::Value {
+    match bytes {
+        None => serde_json::Value::Null,
+        Some(b) => serde_json::from_slice(&b).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&b).into_owned())
+        }),
+    }
+}
+
 /// 筛选下拉的数据源：最近这些请求里实际出现过的客户端 / 模型 / 协议。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LogFacets {
     pub clients: Vec<String>,
+    /// 客户端请求的模型名（`request_model` 列）。
     pub models: Vec<String>,
+    /// 实际路由到的模型名（`model` 列）。与 `models` 分开，
+    /// 是因为模型策略会把客户端要的名字映射成另一个 —— 两者都要能单选。
+    pub routed_models: Vec<String>,
     pub protocols: Vec<String>,
 }
 
@@ -294,7 +468,7 @@ pub struct LogFacets {
 pub async fn facets(pool: &SqlitePool, scan: i64) -> AppResult<LogFacets> {
     let scan = scan.clamp(1, 10_000);
     let rows = sqlx::query(
-        "SELECT client, model, protocol_in FROM request_logs ORDER BY ts DESC LIMIT ?1",
+        "SELECT client, request_model, model, protocol_in FROM request_logs ORDER BY ts DESC LIMIT ?1",
     )
     .bind(scan)
     .fetch_all(pool)
@@ -302,17 +476,22 @@ pub async fn facets(pool: &SqlitePool, scan: i64) -> AppResult<LogFacets> {
 
     let mut clients = std::collections::BTreeSet::new();
     let mut models = std::collections::BTreeSet::new();
+    let mut routed_models = std::collections::BTreeSet::new();
     let mut protocols = std::collections::BTreeSet::new();
 
     for r in &rows {
         let c: String = r.get("client");
-        let m: String = r.get("model");
+        let m: String = r.get("request_model");
+        let rm: String = r.get("model");
         let p: String = r.get("protocol_in");
         if !c.is_empty() {
             clients.insert(c);
         }
         if !m.is_empty() {
             models.insert(m);
+        }
+        if !rm.is_empty() {
+            routed_models.insert(rm);
         }
         if !p.is_empty() {
             protocols.insert(p);
@@ -322,6 +501,7 @@ pub async fn facets(pool: &SqlitePool, scan: i64) -> AppResult<LogFacets> {
     Ok(LogFacets {
         clients: clients.into_iter().collect(),
         models: models.into_iter().collect(),
+        routed_models: routed_models.into_iter().collect(),
         protocols: protocols.into_iter().collect(),
     })
 }
@@ -360,12 +540,19 @@ fn push_where(qb: &mut QueryBuilder<'_, sqlx::Sqlite>, f: &LogFilter) {
     if let Some(s) = f.is_stream {
         qb.push(" AND is_stream = ").push_bind(s as i64);
     }
+    if let Some(m) = &f.request_model {
+        qb.push(" AND request_model = ").push_bind(m.clone());
+    }
     if let Some(m) = &f.model_like {
         // 转义 LIKE 的通配符：模型名里出现 % 或 _ 时不该被当成通配符。
         let escaped = m.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        qb.push(" AND model LIKE ")
-            .push_bind(format!("%{escaped}%"))
-            .push(" ESCAPE '\\'");
+        let pattern = format!("%{escaped}%");
+        // 同时命中客户端请求的模型名（request_model）和实际路由模型名（model）。
+        qb.push(" AND (model LIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR request_model LIKE ")
+            .push_bind(pattern)
+            .push(" ESCAPE '\\')");
     }
 }
 

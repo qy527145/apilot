@@ -479,6 +479,8 @@ export type LogStatus = "ok" | "error";
 export interface LogFilter {
   client?: string | null;
   model?: string | null;
+  /** 客户端请求的模型名精确匹配（下拉筛选用）。 */
+  request_model?: string | null;
   provider_tag?: string | null;
   from?: number | null;
   to?: number | null;
@@ -487,8 +489,13 @@ export interface LogFilter {
   protocol?: Protocol | null;
   status?: LogStatus | null;
   is_stream?: boolean | null;
-  /** 模型名模糊匹配（`model` 是精确匹配）。 */
+  /** 模型名模糊匹配，同时命中实际路由模型（`model`）和客户端请求模型（`request_model`）。 */
   model_like?: string | null;
+  /**
+   * 自定义 JS 表达式筛选。后端对「日志字段 + 捕获报文」求值，命中的才返回。
+   * 内置对象与写法见 `FilterExprPanel`，实现见 `src-tauri/src/traffic/log_filter.rs`。
+   */
+  expr?: string | null;
   limit: number;
   offset: number;
 }
@@ -496,7 +503,10 @@ export interface LogFilter {
 /** 筛选下拉的候选值，来自最近这些请求里实际出现过的内容。 */
 export interface LogFacets {
   clients: string[];
+  /** 客户端请求的模型名（`request_model`）。 */
   models: string[];
+  /** 实际路由到的模型名（`model`）。 */
+  routed_models: string[];
   protocols: string[];
 }
 
@@ -1091,6 +1101,20 @@ export const api = {
   queryLogs: (filter: LogFilter) => call<Page<RequestLog>>("query_logs", { filter }),
   /** 筛选下拉的候选值。进监控页时取一次即可。 */
   listLogFacets: () => call<LogFacets>("list_log_facets"),
+  /**
+   * 校验筛选表达式能否编译，返回错因（`null` = 通过）。
+   *
+   * 刻意**不走 `call`**：那个失败会弹 toast，而这里每次按键都要调一次 ——
+   * 用户还在打字时不停弹「语法错误」既吵又没意义。错因由编辑框自己显示。
+   */
+  validateLogExpr: async (expr: string): Promise<string | null> => {
+    try {
+      await invoke<void>("validate_log_expr", { expr });
+      return null;
+    } catch (err) {
+      return normalizeError(err).message;
+    }
+  },
   getRequestDetail: (requestId: string) =>
     call<RequestDetail>("get_request_detail", { requestId }),
   /** 查询当前正在进行的请求。进监控页时调用一次，补齐用户进页前已开始的请求。 */
