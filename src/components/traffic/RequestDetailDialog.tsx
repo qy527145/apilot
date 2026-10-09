@@ -277,31 +277,36 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
               {timeline && (
                 <TabsContent value="timeline" className="pt-3">
                   {/* 左耗时、右正文放在同一屏：看到"这一下慢"的时候，
-                      下一件想知道的事就是"它到底发了什么"，不该再切一次页签。 */}
-                  <div className="grid gap-3 md:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
-                    <StreamTimeline
-                      entries={timeline.entries}
-                      truncated={timeline.truncated}
-                      barClassName="w-12"
-                      showAbsolute={false}
-                      selected={selectedSeq}
-                      onSelect={setSelectedSeq}
-                    />
-                    <ChunkView
-                      seq={selectedSeq}
-                      entry={
-                        selectedSeq === null
-                          ? null
-                          : (timeline.entries[selectedSeq - 1] ?? null)
-                      }
-                      block={
-                        selectedSeq === null
-                          ? null
-                          : (events.blocks[selectedSeq - 1] ?? null)
-                      }
-                      mismatch={events.mismatch}
-                      rawTruncated={data.stream_raw_truncated}
-                    />
+                      下一件想知道的事就是"它到底发了什么"，不该再切一次页签。
+                      两列各自独立滚动：左边事件多时滚左边，右边内容长时滚右边，互不影响。 */}
+                  <div className="grid h-[56vh] min-h-32 gap-3 md:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
+                    <div className="min-h-0 overflow-y-auto pr-1">
+                      <StreamTimeline
+                        entries={timeline.entries}
+                        truncated={timeline.truncated}
+                        barClassName="w-12"
+                        showAbsolute={false}
+                        selected={selectedSeq}
+                        onSelect={setSelectedSeq}
+                      />
+                    </div>
+                    <div className="min-h-0 overflow-y-auto">
+                      <ChunkView
+                        seq={selectedSeq}
+                        entry={
+                          selectedSeq === null
+                            ? null
+                            : (timeline.entries[selectedSeq - 1] ?? null)
+                        }
+                        block={
+                          selectedSeq === null
+                            ? null
+                            : (events.blocks[selectedSeq - 1] ?? null)
+                        }
+                        mismatch={events.mismatch}
+                        rawTruncated={data.stream_raw_truncated}
+                      />
+                    </div>
                   </div>
                 </TabsContent>
               )}
