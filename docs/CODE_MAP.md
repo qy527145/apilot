@@ -500,7 +500,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
 | `model_policies` | `model` | 每个模型的渠道选择策略（priority / latency / weight + 手动选中的渠道）。**没有行 = 交给 selector 与路由规则** |
-| `providers` | `tag` 唯一 | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、派生的模型映射、权重、超时、**代理覆盖**（`proxy`，NULL = 跟随全局） |
+| `providers` | `tag` 唯一（内部生成，界面不显示） | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、派生的模型映射、权重、超时、**代理覆盖**（`proxy`，NULL = 跟随全局） |
 | `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃**。`upstream_model` 就是「客户端发这个名，上游该收哪个名」。写入都会重算 `providers.model_mapping`（见上） |
 | `route_rules` | `id` | 规则链，按 `sort_index` 求值；`items` / `action` 存 JSON |
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |

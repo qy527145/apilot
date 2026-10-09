@@ -56,7 +56,6 @@ const AUTH_LABELS: Record<AuthStyle, string> = {
 };
 
 interface FormState {
-  tag: string;
   name: string;
   kind: ProviderKind;
   base_url: string;
@@ -77,7 +76,6 @@ interface FormState {
 }
 
 const EMPTY: FormState = {
-  tag: "",
   name: "",
   kind: "anthropic",
   base_url: "",
@@ -161,7 +159,6 @@ function toForm(p: Provider): FormState {
   }
 
   return {
-    tag: p.tag,
     name: p.name,
     kind: p.kind,
     base_url: p.base_url,
@@ -353,7 +350,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
       return {
         ...f,
         name: p.name,
-        tag: p.tag,
         kind: p.kind,
         base_url: p.base_url,
         auth_style: p.auth_style,
@@ -379,7 +375,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
 
     const input: ProviderInput = {
       id: provider?.id ?? null,
-      tag: form.tag.trim() || undefined,
       name: form.name.trim(),
       kind: form.kind,
       base_url: form.base_url.trim(),

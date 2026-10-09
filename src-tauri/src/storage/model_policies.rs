@@ -95,7 +95,6 @@ mod tests {
             p,
             &ProviderInput {
                 id: None,
-                tag: tag.into(),
                 name: tag.into(),
                 kind: ProviderKind::OpenAiChat,
                 base_url: "https://x".into(),

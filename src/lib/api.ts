@@ -69,8 +69,6 @@ export interface ProtocolEndpoint {
 
 export interface ProviderInput {
   id?: number | null;
-  /** tag 为空时由后端按名称自动生成 slug；前端不需要填写也不显示。 */
-  tag?: string;
   name: string;
   kind: ProviderKind;
   base_url: string;

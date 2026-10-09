@@ -319,7 +319,7 @@ const PROBE_BODY: &str = "{}";
 
 /// 协议自动检测的入参。
 ///
-/// 不复用 `ProviderInput`：那个要求 tag / name / base_url 齐全，而检测发生在保存
+/// 不复用 `ProviderInput`：那个要求 name / kind / base_url 等一整套字段，而检测发生在保存
 /// **之前** —— 用户往往先把地址与密钥填好、点一下检测、再去起名字。这里只要"怎么连"。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProtocolDetectInput {
