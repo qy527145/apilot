@@ -53,6 +53,25 @@ wire = 入站协议 ∈ 渠道声明的协议集合 ? 入站协议 : 渠道的�
 > 之所以优先直通：转换是经 IR 的两段式，未建模的原生字段会在这一步丢掉
 > （见下方[损耗清单](#损耗清单)）。直通没有这个问题。
 
+### 拿不准勾哪几种？让 Apilot 探一遍
+
+渠道对话框里「支持的协议」旁边有「自动检测」：按当前的 base url、密钥与路径，
+对三种协议的入口各发一次**故意不合法**的请求（体是 `{}`），按回包判定。
+
+- **不花 token、不占配额**：`{}` 少了 model / messages / input，必然在参数校验阶段
+  就被打回。真发一条最小对话才是花钱的那种做法（那是「模型测试」干的事）。
+- 判定**保守**：只有"路径存在"的证据才算数 —— `400/422`（请求进到了参数校验）、
+  `2xx 且回包是 JSON`。`404/501` 判无入口；`405`（不收 POST）也判无入口，
+  因为 Apilot 对这三个入口只会 POST；而 `401/403`、`429`、`5xx`、回包是网页
+  一律记「未知」。**误报比漏报危险得多**：漏报只是退回协议转换（功能照旧），
+  误报会让 Apilot 把请求直接打到不存在的路径上，用户拿到的是硬错误。
+- 检测**只补勾、不取消**，也**不写库** —— 结论会误判（中转对未知路径回 200 的
+  兜底页、网关在路由之前就做鉴权），最终怎么配仍由你按保存决定。
+- 否定结论会直接标在对应那一行，不藏起来：勾了却探测到没入口是个明确的坏配置。
+
+> 填了覆盖路径就按覆盖路径探，所以「路径写错」和「服务商没有这个入口」能分开 ——
+> 前者同样得到 404，但徽标的悬浮提示里会带出实际打的那个地址。
+
 ---
 
 ## 矩阵
@@ -79,6 +98,48 @@ wire = 入站协议 ∈ 渠道声明的协议集合 ? 入站协议 : 渠道的�
 - 流式响应没有完整响应体，可视化用的是**由增量重建**的内容块
   （`captures.response_content`）—— 那是流式请求唯一能看到思考与工具调用的地方；
 - 「原始」看未经加工的报文（流式就是 SSE 帧），「格式化」看排整齐的 JSON。
+
+---
+
+## 客户端的硬契约：Responses 流靠 `output_item.done` 收工具调用
+
+这一节不是「转换折损」，而是**必须发对、发错客户端就静默失效**的字段形状。
+踩过一次，代价是「文字正常显示、工具一个都不执行」，且上游全程 200。
+
+Codex 的 SSE 解析器（`codex-api/src/sse/responses.rs::process_responses_event`）只认
+**少数几类事件**，其余直接 `trace!` 掉。其中工具调用的唯一来源是：
+
+```rust
+"response.output_item.done" => {
+    if let Some(item_val) = event.item {                 // ← 没有 item 就整个跳过
+        if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
+            return Ok(Some(ResponseEvent::OutputItemDone(item)));
+        }
+    }
+}
+```
+
+`response.function_call_arguments.delta` 在 Codex 里**只用于界面回显**，
+不参与构造工具调用（`core/src/stream_events_utils.rs::handle_output_item_done`
+拿的是 done 里那个完整 item）。所以：
+
+1. **`output_item.done` 必须带完整的 `item`**，不能只发 `output_index`。
+   `arguments` 是**拼全后的字符串**（不是对象、不是分片）；
+   空参数要给 `"{}"` —— 空串会让 Codex 解析报错。
+2. **收尾必须兜底补 done**。`BlockStop` 是 done 的触发点，
+   但 **OpenAI Chat 的解码器根本不产 `BlockStop`**（Chat 只有 `finish_reason`）。
+   所以「Chat 上游 → Codex」这条最常见的路，靠 `BlockStop` 是等不到 done 的 ——
+   编码器要在 `finish()` 里按 `output_index` 顺序补齐。有端到端测试钉着：
+   `gateway/stream.rs::chat_upstream_tool_call_reaches_codex_as_a_complete_item`。
+3. **reasoning 也要先 `output_item.added`**，且 `reasoning_summary_text.delta`
+   必须带 `summary_index`（`(delta, summary_index)` 缺一即被忽略）。
+   没有 active item 的 summary delta 走的是 `error_or_panic` ——
+   **debug 构建直接 panic**。
+4. **reasoning item 的 `encrypted_content` 必须存在**（null 也算）。
+   该字段在 `ResponseItem` 上没有 `#[serde(default)]`，缺了整个 item 反序列化失败，
+   而 Codex 只打一行 debug 日志就把这一项丢掉 —— 又一个静默失败。
+
+顺序上 `done` 一律早于 `response.completed`：客户端收尾后再补 item 已经晚了。
 
 ---
 
@@ -173,6 +234,29 @@ Responses 里 `{"type":"custom"}` 的工具（Codex 的 `apply_patch`、code mod
 「单个字符串参数的 function」、回来时再还原成 `custom_tool_call` + 对应历史条目。
 **目前没做**，所以这条损耗是实打实的。
 
+### 9. 未建模的**内容块**整块原样留着（跨协议时才丢）
+
+各协议的解码器遇到不认识的 `content[]` 类型**不再报错**，
+而是整块存进 `ContentBlock::Unmodeled { raw }`：
+
+- **同协议**（直通，或从 IR 编回本协议）：原样写回，一个字段都不改；
+- **跨协议**：目标协议没有能装下它的位置，这才是真正丢的时候
+  （Chat 退化成空文本块，与加密思考同一个处置）；
+- **缓存键**把它算进去 —— 两个只差一份附件的请求不会撞键；
+- **监控**里它就以原始 JSON 出现在语义化视图里，不做渲染。
+
+这是踩过的坑：Claude Code 带附件时会发 `document` 块，Apilot 解不出就回 400，
+用户看到的是"发个文件都发不出去"。可这个块对 Apilot **本就不需要理解** ——
+渠道支持 Anthropic 时请求逐字直通，它一个字节都不用改。解不出只该让语义化视图
+缺一块（`protocol/inspect.rs` 的 `error` 字段），不该把请求挡在门外。
+
+同一个道理在 Responses 的 input 条目上早就这么做了
+（`oai_responses/mod.rs` 里跳过 `web_search_call` / `local_shell_call` 的那一段）。
+
+**流式**同理：上游事件解不出时，Apilot 把它**原样转发给客户端**
+（只在转码那条路补发，直通时本来就发过了），而不是替客户端丢掉。
+坏帧只影响监控里的语义化视图，不影响客户端拿到的内容。
+
 ---
 
 ## 用路径覆盖修 404
@@ -253,3 +337,4 @@ Moonshot 和百炼的预设就是这么配的。
 | 直通 / 转换的分叉 | `gateway/pipeline.rs::try_outbound` 的 `needs_conversion` |
 | 流式转码 | `gateway/stream.rs::translate_stream` |
 | 渠道协议声明 | `providers.protocols`（迁移 v2） |
+| 协议自动检测 | `commands/providers.rs::detect_provider_protocols` / `judge_protocol` |

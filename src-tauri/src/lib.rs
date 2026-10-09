@@ -74,6 +74,8 @@ pub fn run() {
             commands::providers::list_provider_models,
             commands::providers::set_provider_models,
             commands::providers::fetch_provider_models,
+            commands::providers::set_provider_enabled,
+            commands::providers::detect_provider_protocols,
             // --- 上游目录（价格与能力共用同一个网络集成） ---
             commands::catalog::catalog_price_preview,
             commands::catalog::catalog_price_apply,
@@ -124,7 +126,9 @@ pub fn run() {
             // --- 日志 ---
             commands::logs::query_logs,
             commands::logs::list_log_facets,
+            commands::logs::validate_log_expr,
             commands::logs::get_request_detail,
+            commands::logs::get_inflight_requests,
             commands::logs::clear_logs,
             commands::logs::delete_log,
         ])

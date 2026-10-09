@@ -268,6 +268,21 @@ function BlockRenderer({
         </div>
       );
 
+    // 后端没建模的块（附件的 `document`、服务端工具的产物……）：
+    // 只摊开原文，不猜它是什么 —— 硬猜一个语义才是真的会骗人。
+    case "unmodeled":
+      return (
+        <div className="space-y-1">
+          <div className="text-muted-foreground text-[11px]">
+            未识别的内容块（原样展示，不做语义化渲染）
+          </div>
+          <pre className="bg-muted/30 overflow-auto rounded border p-2 font-mono text-[11px]">
+            {JSON.stringify(block.raw, null, 2)}
+          </pre>
+        </div>
+      );
+
+    // 兜底：IR 以后再加块类型时，至少把原文摊开，别让详情页白屏。
     default:
       return (
         <pre className="bg-muted/30 overflow-auto rounded border p-2 font-mono text-[11px]">
@@ -606,6 +621,7 @@ const RESPONSE_BLOCK_LABEL: Record<ContentBlock["type"], string> = {
   tool_use: "工具调用",
   tool_result: "工具结果",
   image: "图片",
+  unmodeled: "未识别的内容块",
 };
 
 /**

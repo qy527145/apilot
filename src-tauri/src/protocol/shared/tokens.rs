@@ -101,6 +101,9 @@ fn estimate_block_tokens(block: &super::super::dto::ContentBlock) -> u64 {
             content.iter().map(estimate_block_tokens).sum()
         }
         ContentBlock::RedactedThinking { data } => estimate_text_tokens(data),
+        // 没有语义可估（多半是附件或服务端工具的产物），按原文的字符量粗略算。
+        // 这一整条路只是"上游没报 usage"时的兜底，数量级对就够了。
+        ContentBlock::Unmodeled { raw } => estimate_text_tokens(&raw.to_string()),
     }
 }
 

@@ -16,7 +16,6 @@ use crate::util::now_ms;
 pub struct ProviderInput {
     /// 更新时必填；新建时忽略。
     pub id: Option<i64>,
-    pub tag: String,
     pub name: String,
     pub kind: ProviderKind,
     pub base_url: String,
@@ -59,17 +58,6 @@ fn default_timeout() -> i64 {
 impl ProviderInput {
     /// 基本校验。失败时返回可读原因，供前端直接展示。
     pub fn validate(&self) -> Result<(), String> {
-        if self.tag.trim().is_empty() {
-            return Err("tag 不能为空".into());
-        }
-        // tag 会被 selector / 路由规则引用，限制字符集避免歧义。
-        if !self
-            .tag
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        {
-            return Err("tag 只能包含字母、数字、-、_、.".into());
-        }
         if self.name.trim().is_empty() {
             return Err("名称不能为空".into());
         }
@@ -82,8 +70,6 @@ impl ProviderInput {
         if self.timeout_ms < 1000 {
             return Err("超时不能小于 1 秒".into());
         }
-        // 代理地址在保存时就拦下来 —— 等到构造客户端才发现写错了，
-        // 表现是"请求都失败"而没有任何指向配置的提示。
         if let Some(url) = self.proxy.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
             if !crate::upstream::client::is_supported_proxy_url(url) {
                 return Err(format!(
@@ -93,6 +79,62 @@ impl ProviderInput {
         }
         Ok(())
     }
+
+}
+
+/// 由名称摊出一个候选渠道标识：小写、非 ASCII 字母数字的字符转连字符、去掉空段。
+///
+/// 标识只在内部流动（selector 成员、注册表索引、`active_provider`、日志），
+/// 界面既不显示也不接受输入，所以只要求"合法、稳定、能唯一"，不要求好看。
+/// 名字全是非 ASCII 时（"智谱"）会摊成空串，退化成 `channel`；重名由
+/// [`unique_tag`] 加序号解决。
+fn slugify(name: &str) -> String {
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug: String = slug
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "channel".into()
+    } else {
+        slug
+    }
+}
+
+/// 给 `base` 找一个没被占用的标识：占了就试 `base-2`、`base-3`……
+///
+/// 存在的理由：用户能看到的只有名称，两条渠道同名（"DeepSeek 官方" 再建一条
+/// 做成备用）是完全正常的配置。若让自动生成的标识直接撞唯一约束，用户看到的是
+/// 一个自己既看不见、也改不了的字段在报错，而正确的做法是内部把序号补上。
+async fn unique_tag(pool: &SqlitePool, base: &str) -> AppResult<String> {
+    let taken: std::collections::HashSet<String> = sqlx::query_scalar("SELECT tag FROM providers")
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .collect();
+
+    if !taken.contains(base) {
+        return Ok(base.to_string());
+    }
+    // 序号从 2 开始：`x` 与 `x-2` 并存比 `x` 与 `x-1` 更符合直觉。
+    for n in 2..10_000u32 {
+        let candidate = format!("{base}-{n}");
+        if !taken.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::msg("渠道标识冲突，请重试"))
 }
 
 const SELECT_COLUMNS: &str = "id, tag, name, kind, base_url, api_key, auth_style, \
@@ -186,15 +228,17 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
     let id = match input.id {
         Some(id) => {
             // 留空 api_key 表示"不改动已存的密钥"，避免前端因为不回显密钥而把 key 抹掉。
+            // **不写 tag**：它是 selector 成员、注册表索引与 `active_provider`
+            // 共同引用的稳定标识。跟着名字重算的话，用户改一次名，这些引用就全指向
+            // 一个不存在的渠道了 —— 界面上表现为"渠道莫名不参与路由"。
             let result = sqlx::query(
-                "UPDATE providers SET tag=?1, name=?2, kind=?3, base_url=?4,
-                     api_key = COALESCE(?5, api_key), auth_style=?6, protocols=?7,
-                     extra_headers=?8, param_override=?9, weight=?10,
-                     priority=?11, enabled=?12, timeout_ms=?13, updated_at=?14,
-                     proxy=?15
-                 WHERE id=?16",
+                "UPDATE providers SET name=?1, kind=?2, base_url=?3,
+                     api_key = COALESCE(?4, api_key), auth_style=?5, protocols=?6,
+                     extra_headers=?7, param_override=?8, weight=?9,
+                     priority=?10, enabled=?11, timeout_ms=?12, updated_at=?13,
+                     proxy=?14
+                 WHERE id=?15",
             )
-            .bind(&input.tag)
             .bind(&input.name)
             .bind(input.kind.as_str())
             .bind(&input.base_url)
@@ -219,13 +263,14 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             id
         }
         None => {
+            let tag = unique_tag(pool, &slugify(&input.name)).await?;
             let result = sqlx::query(
                 "INSERT INTO providers (tag, name, kind, base_url, api_key, auth_style,
                      protocols, extra_headers, param_override, weight, priority,
                      enabled, timeout_ms, created_at, updated_at, proxy)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,?15)",
             )
-            .bind(&input.tag)
+            .bind(&tag)
             .bind(&input.name)
             .bind(input.kind.as_str())
             .bind(&input.base_url)
@@ -243,9 +288,10 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .execute(pool)
             .await
             .map_err(|e| {
-                // tag 有唯一约束；给出比原始 SQL 错误更可读的提示。
+                // `unique_tag` 已经避开了一次性查出来的冲突，走到这里只剩
+                // 「两次保存之间的窗口」这一种可能（同名单并发插入）。
                 if e.to_string().contains("UNIQUE") {
-                    AppError::msg(format!("tag「{}」已被占用", input.tag))
+                    AppError::msg(format!("渠道标识「{tag}」已被占用，请重试"))
                 } else {
                     AppError::Db(e)
                 }
@@ -268,6 +314,25 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
 
 pub async fn delete(pool: &SqlitePool, id: i64) -> AppResult<()> {
     let r = sqlx::query("DELETE FROM providers WHERE id = ?1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if r.rows_affected() == 0 {
+        return Err(AppError::ProviderNotFound(id.to_string()));
+    }
+    Ok(())
+}
+
+/// 只翻转启用位。
+///
+/// 刻意不走 `upsert`：那条路要求调用方把 tag / base_url / 协议声明 / 密钥等一整套
+/// 回传，而表格里的开关手上只有列表刷新出来的那几列 —— **密钥根本不回显**。
+/// 少传一项就是一次静默的数据丢失：关一下渠道，密钥或协议声明被抹成默认值，
+/// 而且不会有任何报错，用户下次发请求才发现。
+pub async fn set_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> AppResult<()> {
+    let r = sqlx::query("UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(enabled as i64)
+        .bind(now_ms())
         .bind(id)
         .execute(pool)
         .await?;
@@ -636,11 +701,12 @@ mod tests {
     use super::*;
     use crate::storage::models::ChannelProxyMode;
 
-    fn input(tag: &str) -> ProviderInput {
+    /// 渠道标识（tag）改由名称自动生成，所以这里的参数就是**名称**；
+    /// 传的都是小写 ASCII，摊出来的 slug 与它逐字相同，下面按 tag 的断言据此成立。
+    fn input(name: &str) -> ProviderInput {
         ProviderInput {
             id: None,
-            tag: tag.into(),
-            name: format!("渠道 {tag}"),
+            name: name.into(),
             kind: ProviderKind::Anthropic,
             base_url: "https://api.anthropic.com".into(),
             api_key: Some("sk-test".into()),
@@ -704,20 +770,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_tag_is_rejected_with_readable_message() {
+    async fn same_name_channels_are_saved_with_distinct_tags() {
         let p = pool().await;
-        upsert(&p, &input("dup")).await.unwrap();
-        let err = upsert(&p, &input("dup")).await.unwrap_err();
-        assert!(err.to_string().contains("已被占用"), "实际: {err}");
+        let first = upsert(&p, &input("dup")).await.unwrap();
+        let second = upsert(&p, &input("dup")).await.unwrap();
+
+        assert_eq!(first.tag, "dup");
+        assert_eq!(second.tag, "dup-2", "同名渠道不该被内部标识挡回去");
+        assert_eq!(second.name, "dup", "名称照旧，用户看到的就是它");
+    }
+
+    #[tokio::test]
+    async fn a_name_without_usable_ascii_still_gets_a_tag() {
+        let p = pool().await;
+        let mut inp = input("x");
+        inp.name = "智谱 GLM".into();
+        let created = upsert(&p, &inp).await.unwrap();
+        assert_eq!(created.tag, "glm");
+    }
+
+    #[tokio::test]
+    async fn renaming_a_channel_keeps_its_tag() {
+        let p = pool().await;
+        let created = upsert(&p, &input("stable")).await.unwrap();
+
+        let mut upd = input("stable");
+        upd.id = Some(created.id);
+        upd.name = "换个名字".into();
+        let after = upsert(&p, &upd).await.unwrap();
+
+        assert_eq!(after.tag, "stable", "改名不该动标识：selector 与手动切换都指着它");
     }
 
     #[tokio::test]
     async fn validation_rejects_bad_input() {
         let p = pool().await;
-
-        let mut bad = input("ok");
-        bad.tag = "has space".into();
-        assert!(upsert(&p, &bad).await.is_err());
 
         let mut bad = input("ok");
         bad.base_url = "ftp://x".into();
@@ -1162,5 +1249,51 @@ mod tests {
 
         let read = get(&p, created.id).await.unwrap().unwrap();
         assert_eq!(read.proxy.mode, ChannelProxyMode::Inherit);
+    }
+
+    #[tokio::test]
+    async fn toggling_enabled_touches_nothing_but_the_flag() {
+        // 开关走的是独立的 UPDATE 而不是 upsert：后者要求把密钥、协议声明等整套
+        // 回传，而前端手上没有（密钥不回显），少传一项就是一次静默的数据丢失。
+        let p = pool().await;
+        let mut i = input("a");
+        i.protocols = vec![ProtocolEndpoint {
+            protocol: crate::protocol::dto::Protocol::AnthropicMessages,
+            path: Some("/anthropic/v1/messages".into()),
+        }];
+        let created = upsert(&p, &i).await.unwrap();
+
+        set_enabled(&p, created.id, false).await.unwrap();
+
+        let read = get(&p, created.id).await.unwrap().unwrap();
+        assert!(!read.enabled);
+        assert_eq!(read.api_key.as_deref(), Some("sk-test"), "密钥不能被抹掉");
+        assert_eq!(read.protocols, created.protocols, "协议声明不能被重置");
+        assert_eq!(read.base_url, created.base_url);
+        assert_eq!(read.weight, created.weight);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_channel_drops_out_of_list_enabled() {
+        // 网关的注册表读的是 list_enabled：停用必须就此从路由里消失，
+        // 而列表页仍要看得到它（否则用户没法把它再打开）。
+        let p = pool().await;
+        let created = upsert(&p, &input("a")).await.unwrap();
+        assert_eq!(list_enabled(&p).await.unwrap().len(), 1);
+
+        set_enabled(&p, created.id, false).await.unwrap();
+        assert!(list_enabled(&p).await.unwrap().is_empty());
+        assert_eq!(list(&p).await.unwrap().len(), 1);
+
+        set_enabled(&p, created.id, true).await.unwrap();
+        assert_eq!(list_enabled(&p).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn toggling_an_unknown_channel_errors_instead_of_lying() {
+        // 静默成功会让界面停留在一个并不存在的变化上（乐观更新已经先改了本地状态）。
+        let p = pool().await;
+        let err = set_enabled(&p, 999, false).await.unwrap_err().to_string();
+        assert!(err.contains("999"), "错误要指名道姓: {err}");
     }
 }

@@ -16,12 +16,21 @@ Tauri 2 + React 19，后端约 21k 行 Rust。
 ```bash
 source scripts/msvc-env.sh     # 每个新 shell 都要执行一次
 cd src-tauri
-cargo test                     # 502 个测试
+cargo test                     # 856 个测试
 cargo check --all-targets      # 期望零警告
 cargo build
 ```
 
-前端在仓库根目录：`bun run build`（即 `tsc && vite build`）。
+前端在仓库根目录：`bun run build:web`（即 `tsc && vite build`）。打包安装包用 `bun run build`（按当前系统自选）、
+`build:win` / `build:mac` / `build:linux`。**命令名指目标平台**，入口 [scripts/build.mjs](scripts/build.mjs)
+按当前系统决定本机编还是交叉编：只有「→ Windows」能交叉（macOS/Linux 出 nsis，msi 要 Windows），
+macOS 与 Linux 的包只能在各自系统上构建。**`tauri.conf.json` 的 `beforeBuildCommand` 必须指向
+`build:web`——指向 `build` 会自我递归。**
+
+CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-installers.yml)：推 `v*` 标签或手动触发，
+三平台各自在目标系统的 runner 上**本机**打包（不涉及交叉编译）。**版本号必须四处一致**
+（tag / `tauri.conf.json` / `Cargo.toml` / `package.json`），不一致会在编译前失败 ——
+用 `bun run upgrade <patch|minor|major|版本号>` 一次改齐（默认提交并打标签，加 `--push` 才推远端）。
 
 其他环境坑见 [README.md](README.md) 的「环境说明」。
 
@@ -43,7 +52,7 @@ cargo build
 | 缓存 | `src-tauri/src/cache/` | 缓存键、策略、存储与 LRU 淘汰 |
 | 接管 | `src-tauri/src/takeover/` | 客户端配置的保序补丁与原子写入 |
 | 存储 | `src-tauri/src/storage/` | SQLite 连接、迁移、各领域读写 |
-| 命令 | `src-tauri/src/commands/` | Tauri 命令层（60 个） |
+| 命令 | `src-tauri/src/commands/` | Tauri 命令层（62 个） |
 | 前端 | `src/` | 9 个页面 + shadcn/ui 组件 |
 
 ## 改什么去哪里
@@ -53,10 +62,12 @@ cargo build
 | **加一个新协议**（如 Gemini） | `protocol/dto.rs` 加 `Protocol` 变体 → 新建 `protocol/<name>/`（request/response/stream/mod）→ `protocol/codec.rs::CodecRegistry::new` 注册 → 按需加 `gateway/router.rs` 路由 |
 | **加一个新客户端接管** | `takeover/clients.rs` 加 `ClientId` 变体 + `config_paths()` + `plan_apply()`（顺带补 `stored_base_url()`）；`config/paths.rs` 加路径函数 |
 | **改「客户端配置里的网关地址」** | 写地址的只有一条路：`gateway/server.rs::base_url()`（通配监听地址会折算成回环）。网关换地址后跟着改的逻辑是 `takeover/clients.rs::repoint_taken_over`，**触发点在 `gateway/server.rs::serve_on` 而不是设置命令里**（只有那里知道网关真正跑在哪）。**Codex 还要顺手重启它的常驻 app-server**（`takeover/codex_daemon.rs`）—— 接管/还原/换地址三条路都接上了，漏掉任一条，用户看到的就是「明明改了却不生效」|
-| **改「Codex 走不走 Responses Lite」** | **`use_responses_lite` 是唯一开关**（决定工具走 `input[].additional_tools` 还是顶层 `tools`），而它来自 Codex 的**内置模型目录** —— GPT 系名字内置就是 Lite，而上游对这形状常常「收下、200、静默忽略」。两条对策由 `AppSettings::client_model_mode` 四选一（`takeover/clients.rs::codex_config`）：写模型名（`rename`，不依赖网关但没有 `apply_patch`）/ 下发目录（`catalog`，有 `apply_patch` 但要多两个开关 + 网关得可达）/ 都写（`both`）/ 不碰。目录内容在 `codex/mod.rs`（**分两半**：vendored 那半管 GPT 系名字，`entry` 那半管 Apilot 自己的模型名，**三个字段必须一起改**），出口是 `gateway/router.rs` 的 `/codex/models` |
+| **改接管策略 / 模型策略什么时候生效** | **保存即重写**：`update_settings` / `set_model_policy` 之后跑 `commands/app.rs::reapply_after_policy_change` → `takeover/clients.rs::reapply_taken_over`（只碰**会消费 `ClientPlan`** 的客户端，目前只有 Codex；产出与现状一致就不写，网关没起时用配置里现存的地址）。判据是 `takeover/clients.rs::plan_inputs_differ`（只看真会写进客户端的那两样）—— 与「换地址」那条（`repoint_taken_over`，只看地址）**不是同一个判据**，别合并 |
+| **改「Codex 走不走 Responses Lite」** | **`use_responses_lite` 是唯一开关**（决定工具走 `input[].additional_tools` 还是顶层 `tools`），而它来自 Codex 的**内置模型目录** —— GPT 系名字内置就是 Lite，而上游对这形状常常「收下、200、静默忽略」。两条对策由 `AppSettings::client_model_mode` 四选一（默认 `both`，见 `takeover/clients.rs::codex_config`）：写模型名（`rename`，不依赖网关但没有 `apply_patch`）/ 下发目录（`catalog`，有 `apply_patch` 但要多两个开关 + 网关得可达）/ 都写（`both`）/ 不碰。目录内容在 `codex/mod.rs`（**分两半**：vendored 那半管 GPT 系名字，`entry` 那半管 Apilot 自己的模型名，**三个字段必须一起改**），出口是 `gateway/router.rs` 的 `/codex/models` |
 | **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → 同文件 `Provider::auth_header()`（**鉴权头的唯一构造点**，出站转发、连通探测、拉模型列表都走它） |
 | **改「直通还是转换」的判定** | `storage/models.rs::Provider::wire_for`（渠道声明的协议集合命中就直通）+ `gateway/pipeline.rs::prefer_native_protocol`（多渠道路由时同协议优先）→ 同步更新 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md) |
 | **改出站 URL 拼接** | `storage/models.rs::Provider::endpoint`（协议默认路径，会补 `/v1`）/ `endpoint_verbatim`（用户手写路径，**不补** `/v1`） |
+| **改渠道启停 / 协议自动检测** | 启停走 `storage/providers.rs::set_enabled`（只改启用位，**别借道 `upsert`** —— 密钥不回显，改个开关就会把它抹掉）+ `commands/providers.rs::set_provider_enabled`（写完必须 `reload_providers`）。检测的判定全在 `commands/providers.rs::judge_protocol`，探测体 `PROBE_BODY` 是**故意的空对象**（不消耗 token）→ 前端 `ProviderDialog` 的「自动检测」 |
 | **改「用哪个模型」（模型名）** | 判定在 `routing/model_policy.rs::effective_model`（在 `gateway/pipeline.rs` 解码后、路由前应用）；两级配置（全局 + 客户端覆盖）在 `config/settings.rs::ModelPolicy::effective` 里拼成一条规则；模式 4 的 JS 沙箱在 `routing/model_script.rs`。规则链的 `ModelOverride` 在它之上再改 |
 | **改「用哪个渠道」（服务商）** | `routing/model_select.rs::order`（按模型策略排序）+ `gateway/pipeline.rs::build_candidates`（未配策略时回落 selector）。**优先级是「模型策略 > selector」，别反过来**。策略存在 `model_policies` 表，界面上在**路由页**改 |
 | **改计费公式** | `billing/engine.rs::settle`（唯一真源）→ 对应更新其测试；倍率字段在 `billing/pricing.rs` |
@@ -107,6 +118,12 @@ cargo build
 
 9. **发往回环与私有网段的请求要绕过系统代理。** 清单在 `upstream/client.rs::NO_PROXY_LIST`。
    少了它，配了 `HTTP_PROXY` 的机器连不上本地的 ollama / LM Studio。
+
+10. **解不出不等于要失败。** 客户端与上游总在先用上新结构（Claude Code 带附件时发的
+    `document` 内容块）。IR 不认识就**整块原样留着**（`ContentBlock::Unmodeled`）放请求过去，
+    只在跨协议转换时才降级 —— 直通那条路本就不需要理解它们，报 400 挡掉的反而是完全正常的路。
+    响应侧同理：非流式解不出就透传原文（`gateway/pipeline.rs::try_outbound`），
+    流式的坏帧原样转发给客户端（`gateway/stream.rs`）。
 
 ## 代码约定
 

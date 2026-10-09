@@ -60,6 +60,7 @@ async fn migrate(pool: &SqlitePool) -> AppResult<()> {
         // 真实形状，健康就立刻返回，所以对正常的库是纯读。
         repair_legacy_model_capabilities(pool).await?;
         ensure_usage_hourly_v8(pool).await?;
+        ensure_usage_hourly_speed_columns(pool).await?;
         return Ok(());
     }
 
@@ -85,6 +86,7 @@ async fn migrate(pool: &SqlitePool) -> AppResult<()> {
 
     repair_legacy_model_capabilities(pool).await?;
     ensure_usage_hourly_v8(pool).await?;
+    ensure_usage_hourly_speed_columns(pool).await?;
     Ok(())
 }
 
@@ -131,6 +133,51 @@ async fn ensure_usage_hourly_v8(pool: &SqlitePool) -> AppResult<()> {
     }
     tx.commit().await?;
 
+    Ok(())
+}
+
+/// 补上 v10 那四列（`usage_hourly` 的观感指标累加量）。
+///
+/// 与上面那条修复一样**看表的真实形状，不看版本号**，而且必须排在它后面跑：
+/// `ensure_usage_hourly_v8` 会重建整张表，重建用的是 v8 的 DDL。一个形状停在
+/// 重建前的库会先跑完 v10 迁移（列加上去了），随后被重建抹掉，而版本戳在那次
+/// 修复里已被顶到最新 —— 那条迁移再也不会重跑。少了这一步，聚合 flush 会每
+/// 10 秒报一次 `no such column` 然后被吞掉，统计页静默地缺这三项指标。
+async fn ensure_usage_hourly_speed_columns(pool: &SqlitePool) -> AppResult<()> {
+    // 列名来自这张封闭清单，不是用户输入，拼接安全。
+    for column in [
+        "sample_requests",
+        "ttfb_sum_ms",
+        "decode_ms_sum",
+        "decode_tokens_sum",
+    ] {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('usage_hourly') WHERE name = ?1",
+        )
+        .bind(column)
+        .fetch_one(pool)
+        .await?;
+        if exists > 0 {
+            continue;
+        }
+
+        // 表都不在（理论上到不了这里）—— 留给下一轮启动，别在结构未知的库上动手。
+        let table_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'usage_hourly'",
+        )
+        .fetch_one(pool)
+        .await?;
+        if table_exists == 0 {
+            return Ok(());
+        }
+
+        tracing::warn!(column, "usage_hourly 缺少观感指标列，按形状补上");
+        sqlx::query(&format!(
+            "ALTER TABLE usage_hourly ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+        ))
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -419,6 +466,71 @@ mod tests {
         .unwrap();
     }
 
+    /// 形状是 v9（有 `request_model`、没有 v10 那四列）而版本戳已经是最新的库：
+    /// 迁移整条被跳过，只能靠形状补列 —— 这正是升级到 v10 之后又回退过版本的机器。
+    #[tokio::test]
+    async fn speed_columns_are_added_by_shape_not_by_version_stamp() {
+        use std::str::FromStr;
+
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true)
+            .disable_statement_logging();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+
+        // 先造出 v7 的旧表，再用 v8 的 DDL 重建成 v9 形状（有 request_model、
+        // 没有 v10 那四列），版本戳顶到最新 —— 回退过、或走过修复路径的机器就是这样。
+        for ddl in &MIGRATIONS[..7] {
+            for stmt in split_statements(ddl) {
+                sqlx::query(&stmt).execute(&pool).await.unwrap();
+            }
+        }
+        for stmt in split_statements(USAGE_HOURLY_V8_DDL) {
+            sqlx::query(&stmt).execute(&pool).await.unwrap();
+        }
+        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_hourly (bucket_ts, client, provider_tag, model, request_model, requests)
+             VALUES (0, 'codex', 'deepseek', 'deepseek-flash', 'deepseek-flash', 3)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(usage_hourly)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| sqlx::Row::get::<String, _>(r, "name"))
+            .collect();
+        for c in [
+            "sample_requests",
+            "ttfb_sum_ms",
+            "decode_ms_sum",
+            "decode_tokens_sum",
+        ] {
+            assert!(cols.iter().any(|x| x == c), "缺列 {c}，实际列：{cols:?}");
+        }
+
+        let (requests, samples): (i64, i64) =
+            sqlx::query_as("SELECT requests, sample_requests FROM usage_hourly")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(requests, 3, "老账目不能因为补列而丢");
+        assert_eq!(samples, 0, "补出来的新列是默认值，不编造历史样本");
+    }
+
     /// 版本戳比 `SCHEMA_VERSION` 还大的库，新迁移会被整体跳过 —— 只能靠表的形状补跑。
     ///
     /// 复现的是 v7/v8 那次拆分留下的状态：出事的库 `user_version` 停在 8，而当时
@@ -439,17 +551,24 @@ mod tests {
             .await
             .unwrap();
 
-        // 跑到 v7 为止（v8 是本次新加的），然后**把版本戳顶到 8**。
-        for ddl in &MIGRATIONS[..SCHEMA_VERSION as usize - 1] {
+        // 只跑到 v7（v8 之前 `usage_hourly` 的形状），再把版本戳**顶到当前 schema
+        // 版本**：这样 `current >= SCHEMA_VERSION` 成立，v8 的重建与 v9 / v10 的加列
+        // 一条都轮不上，只能靠形状修复补 —— 正是这条兜底要覆盖的情形。
+        //
+        // 切片写死到 7，不用 `SCHEMA_VERSION - 1`：后者会随新迁移一起推进，把非幂等的
+        // `ALTER TABLE ADD COLUMN` 在测试里再跑一遍（SQLite 的 ADD COLUMN 没有 IF NOT
+        // EXISTS），加一条迁移就炸一条测试。
+        for ddl in &MIGRATIONS[..7] {
             for stmt in split_statements(ddl) {
                 sqlx::query(&stmt).execute(&pool).await.unwrap();
             }
         }
-        sqlx::query("PRAGMA user_version = 8")
+        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
             .execute(&pool)
             .await
             .unwrap();
         // 老账目，重建表不能把它弄丢（这正是修复与"从头再来"的区别）。
+        // 此刻表上还没有 `request_model` —— 那一列是 v8 的重建才加的。
         sqlx::query(
             "INSERT INTO usage_hourly (bucket_ts, client, provider_tag, model, requests, quota)
              VALUES (0, 'codex', 'deepseek', 'deepseek-flash', 3, 900)",
@@ -468,6 +587,16 @@ mod tests {
             .map(|r| sqlx::Row::get::<String, _>(r, "name"))
             .collect();
         assert!(cols.iter().any(|c| c == "request_model"), "实际列：{cols:?}");
+        // v10 那四列必须**在重建之后**补回来：重建用的是 v8 的 DDL，顺序写反了
+        // 的话加过的列会被抹掉，而版本戳已被顶到最新、迁移不会再跑。
+        for c in [
+            "sample_requests",
+            "ttfb_sum_ms",
+            "decode_ms_sum",
+            "decode_tokens_sum",
+        ] {
+            assert!(cols.iter().any(|x| x == c), "缺列 {c}，实际列：{cols:?}");
+        }
 
         let (requests, request_model): (i64, String) = sqlx::query_as(
             "SELECT requests, request_model FROM usage_hourly WHERE client = 'codex'",

@@ -29,6 +29,9 @@ export interface LiveRequest {
   path: string;
   protocol_in: string;
   provider_tag: string;
+  /** 渠道当前名称（改名后自动更新）。 */
+  provider_name?: string | null;
+  upstream_url?: string | null;
   is_stream: boolean;
   frames: StreamFrame[];
   /** 流已结束（正常结束、出错或客户端断连）。 */
@@ -139,12 +142,15 @@ interface Props {
  * **根本没有落库**，查也查不到。
  */
 export function LiveStreamDialog({ live, onOpenChange }: Props) {
+  // 用 null 表示"跟随最新"，用序号表示"固定在某帧"。
+  // 不用 frames[frames.length-1] 作默认值，避免每帧都触发 raw 面板重渲染。
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
   const [follow, setFollow] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const frames = live?.frames ?? [];
   const blocks = useMemo(() => accumulate(frames), [frames]);
+
   // 时间轴吃的是 (时间点, 名字) 两样，与明细那边从库里读出来的形态一致 ——
   // 同一个组件因此能给两种数据源画同一张图。
   const entries = useMemo(
@@ -152,13 +158,29 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
     [frames],
   );
 
+  // 当弹窗打开时重置选择状态，避免上一条请求的选中状态残留。
+  useEffect(() => {
+    if (live) {
+      setSelectedSeq(null);
+      setFollow(true);
+    }
+  }, [live?.request_id]);
+
   // 跟随最新：不这么做的话，长回答滚上去之后就再也看不到新内容了。
   useEffect(() => {
-    if (follow) bottomRef.current?.scrollIntoView({ block: "end" });
+    if (follow && frames.length > 0) {
+      bottomRef.current?.scrollIntoView({ block: "end" });
+    }
   }, [frames.length, follow]);
 
-  const selected =
-    frames.find((f) => f.seq === selectedSeq) ?? frames[frames.length - 1];
+  // 把「选中帧」的计算收进 memo：selectedSeq 为 null 时取最后一帧，
+  // 有值时找匹配，找不到也回落到最后一帧。
+  // 不直接放在渲染里 —— 那样每次父组件 re-render（每帧一次）都会重新找一遍。
+  const selected = useMemo(() => {
+    if (frames.length === 0) return null;
+    if (selectedSeq === null) return frames[frames.length - 1];
+    return frames.find((f) => f.seq === selectedSeq) ?? frames[frames.length - 1];
+  }, [frames, selectedSeq]);
 
   return (
     <Dialog open={!!live} onOpenChange={onOpenChange}>
@@ -211,7 +233,11 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
                 variant="ghost"
                 size="sm"
                 className="h-6 px-2 text-[11px]"
-                onClick={() => setFollow((v) => !v)}
+                onClick={() => {
+                  setFollow((v) => !v);
+                  // 切回跟随时也清掉固定选中，让视图跟着走。
+                  if (!follow) setSelectedSeq(null);
+                }}
               >
                 {follow ? "停止跟随" : "跟随最新"}
               </Button>

@@ -145,6 +145,16 @@ pub enum ContentBlock {
     RedactedThinking {
         data: String,
     },
+    /// 未建模的内容块，整块原样留着。
+    ///
+    /// 客户端与上游总在先用上新类型（Claude Code 带附件时发的 `document`、
+    /// 服务端工具的 `web_search_tool_result`……）。IR 不认识它们，**不等于**
+    /// 这次请求该失败：同协议直通时这些块本来就一个字节都不用改，
+    /// 因为解不出就回 400，等于把用户挡在门外，代价远大于收益。
+    ///
+    /// 存下来之后两头都不占：同协议编码原样写回（保真），
+    /// 跨协议时才降级 —— 见 docs/PROTOCOL_MATRIX.md 的损耗清单。
+    Unmodeled { raw: serde_json::Value },
 }
 
 impl ContentBlock {

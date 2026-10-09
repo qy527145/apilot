@@ -258,10 +258,14 @@ fn decode_block(v: &Value) -> Result<ContentBlock, ConvertError> {
                 .to_string(),
         },
         other => {
-            return Err(ConvertError::decode_request(
-                P,
-                format!("未知的 content block 类型: {other}"),
-            ))
+            // 不认识的类型整块留着，**不再拒收整个请求**。
+            //
+            // 这里踩过坑：Claude Code 带上附件时会发 `document` 块，解不出就回
+            // 400，用户看到的是"发个文件都发不出去"。可这个块对 Apilot 本就不需要
+            // 理解 —— 渠道支持 Anthropic 时请求逐字直通，它一个字节都不用改。
+            // 硬失败挡掉的是那条本来完全没问题的路。
+            tracing::debug!(block_type = other, "未建模的 content block 类型，整块原样保留");
+            ContentBlock::Unmodeled { raw: v.clone() }
         }
     })
 }
@@ -316,6 +320,8 @@ pub fn encode_block(b: &ContentBlock) -> Value {
         ContentBlock::RedactedThinking { data } => {
             json!({ "type": "redacted_thinking", "data": data })
         }
+        // 原样写回 —— 这就是「解不出也要保真」的兑现处。
+        ContentBlock::Unmodeled { raw } => raw.clone(),
     }
 }
 
@@ -588,12 +594,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_content_block_type_is_an_error_not_silent_drop() {
-        // 静默丢弃会让用户以为功能正常但内容莫名消失，宁可显式报错。
-        let e = decode_request(
-            br#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"future_thing"}]}]}"#,
+    fn unknown_content_block_type_is_kept_verbatim_instead_of_rejected() {
+        // 以前这里显式报错，理由是"静默丢弃会让用户以为功能正常但内容莫名消失"。
+        // 理由成立，结论反了：真正的丢弃发生在跨协议转换那一侧，而报错把
+        // **同协议直通**也一起挡掉了 —— Claude Code 带附件时发的 `document`
+        // 就是被这条打回去的（400 未知的 content block 类型）。
+        //
+        // 现在整块原样留着，两头都不占：直通时逐字写回，转码时目标协议装不下才丢。
+        let req = decode_request(
+            br#"{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AAA"},"title":"a.pdf"},{"type":"text","text":"\u770b\u770b\u8fd9\u4e2a"}]}]}"#,
         )
-        .unwrap_err();
-        assert!(e.to_string().contains("future_thing"));
+        .expect("未建模的内容块不该让请求失败");
+
+        assert!(
+            matches!(req.messages[0].content[0], ContentBlock::Unmodeled { .. }),
+            "未知块应整块留下"
+        );
+        assert_eq!(req.messages[0].content.len(), 2, "其余块照常解析");
+
+        let out = encode_request(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let block = &v["messages"][0]["content"][0];
+        assert_eq!(block["type"], "document");
+        assert_eq!(block["source"]["media_type"], "application/pdf");
+        assert_eq!(block["title"], "a.pdf", "块里的字段一个都不能少");
     }
 }

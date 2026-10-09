@@ -1,13 +1,15 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, Loader2, Trash2 } from "lucide-react";
 
 import { CopyButton } from "@/components/common/CopyButton";
+import { JsonViewer, tryParseJson } from "@/components/common/JsonViewer";
 import { RawBody } from "@/components/common/RawBody";
 import { ResponseView, RequestView } from "@/components/traffic/InspectViews";
 import {
   StreamTimeline,
   parseTimings,
+  type TimingEntry,
 } from "@/components/traffic/StreamTimeline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -21,6 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { qk } from "@/hooks/queries";
+import { pairTimingsWithEvents, sseData, sseTextFragment } from "@/lib/sse";
 import {
   api,
   PROTOCOL_LABEL,
@@ -35,6 +38,7 @@ import {
   formatMs,
   formatNumber,
   formatTime,
+  formatTps,
   quotaToUsd,
 } from "@/lib/utils";
 
@@ -134,6 +138,25 @@ export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props
   // 换了一条没有时间轴的请求时，别停在那个已经消失的页签上 —— 那样正文会是空白。
   const activeTab: DetailTab =
     tab === "timeline" && !timeline ? "request" : tab;
+
+  // 选中的是时间轴上第几个事件（从 1 起，与 `StreamTimeline` 给出的序号一致）。
+  const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+
+  // 换一条请求就清掉选中：序号是"第几个"，留着它会正好落在另一条请求的轴上别处。
+  useEffect(() => {
+    setSelectedSeq(null);
+  }, [requestId]);
+
+  // 时间轴只知道"第几个事件什么时候到"，不知道它发了什么。正文得从同一份捕获里的
+  // 原始 SSE 帧按序号取回来 —— 两者是同一次遍历里写下的，序号天然对齐。
+  const events = useMemo(
+    () =>
+      pairTimingsWithEvents(
+        timeline?.entries.length ?? 0,
+        data?.upstream_stream_raw,
+      ),
+    [timeline, data?.upstream_stream_raw],
+  );
 
   return (
     <Dialog open={!!requestId} onOpenChange={onOpenChange}>
@@ -260,11 +283,38 @@ export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props
 
               {timeline && (
                 <TabsContent value="timeline" className="pt-3">
-                  <StreamTimeline
-                    entries={timeline.entries}
-                    truncated={timeline.truncated}
-                    barClassName="w-40"
-                  />
+                  {/* 左耗时、右正文放在同一屏：看到"这一下慢"的时候，
+                      下一件想知道的事就是"它到底发了什么"，不该再切一次页签。
+                      两列各自独立滚动：左边事件多时滚左边，右边内容长时滚右边，互不影响。 */}
+                  <div className="grid h-[56vh] min-h-32 gap-3 md:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
+                    <div className="min-h-0 overflow-y-auto pr-1">
+                      <StreamTimeline
+                        entries={timeline.entries}
+                        truncated={timeline.truncated}
+                        barClassName="w-12"
+                        showAbsolute={false}
+                        selected={selectedSeq}
+                        onSelect={setSelectedSeq}
+                      />
+                    </div>
+                    <div className="min-h-0 overflow-y-auto">
+                      <ChunkView
+                        seq={selectedSeq}
+                        entry={
+                          selectedSeq === null
+                            ? null
+                            : (timeline.entries[selectedSeq - 1] ?? null)
+                        }
+                        block={
+                          selectedSeq === null
+                            ? null
+                            : (events.blocks[selectedSeq - 1] ?? null)
+                        }
+                        mismatch={events.mismatch}
+                        rawTruncated={data.stream_raw_truncated}
+                      />
+                    </div>
+                  </div>
                 </TabsContent>
               )}
             </Tabs>
@@ -293,6 +343,93 @@ export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props
         )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+/**
+ * 时间轴上选中事件的正文。
+ *
+ * 历史请求没有逐帧的 IR 增量（那个只存在于实时视图里），所以这里给两样：
+ * 这一块**原样发出的 SSE 正文**，以及它 `data` 里的 JSON 树。前者用来核对上游
+ * 到底怎么写的（字段顺序、有没有多包一层），后者用来读字段。
+ */
+function ChunkView({
+  seq,
+  entry,
+  block,
+  mismatch,
+  rawTruncated,
+}: {
+  seq: number | null;
+  entry: TimingEntry | null;
+  block: string | null;
+  mismatch: boolean;
+  rawTruncated: boolean;
+}) {
+  if (seq === null || !entry) {
+    return (
+      <div className="rounded-md border border-dashed p-4">
+        <p className="text-muted-foreground text-xs">
+          点左边任意一个事件，这里显示它在流里发的内容。
+        </p>
+      </div>
+    );
+  }
+
+  const data = block ? sseData(block) : null;
+  const fragment = block ? sseTextFragment(block) : null;
+  const parsed = data === null ? undefined : tryParseJson(data);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs font-medium tabular-nums">第 {seq} 个事件</span>
+        <Badge variant="outline" className="font-mono">
+          {entry.name}
+        </Badge>
+        <span className="text-muted-foreground text-[11px] tabular-nums">
+          +{formatMs(entry.at_ms)}
+        </span>
+      </div>
+
+      {!block && (
+        <p className="text-muted-foreground text-xs">
+          {rawTruncated
+            ? "原始 SSE 帧超过存储上限，这个事件的正文没有被保存下来。"
+            : mismatch
+              ? "原始 SSE 帧与时间轴对不上（多半是捕获被截断），因此不显示正文 —— 宁可少看一块，也不能把别的事件的内容安到这个名下。"
+              : "这次请求没有保存原始 SSE 帧（改动前的旧日志），只能看到事件名与时间。"}
+        </p>
+      )}
+
+      {fragment !== null && (
+        <div className="space-y-1">
+          <p className="text-muted-foreground text-[11px]">这一次新增的内容</p>
+          <pre className="bg-muted/30 max-h-64 overflow-auto rounded-md border p-2 font-mono text-xs whitespace-pre-wrap">
+            {fragment}
+          </pre>
+        </div>
+      )}
+
+      {parsed !== undefined && (
+        <div className="space-y-1">
+          <p className="text-muted-foreground text-[11px]">data 解出来的 JSON</p>
+          <JsonViewer value={parsed} defaultDepth={3} />
+        </div>
+      )}
+
+      {block && (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-muted-foreground text-[11px]">原始 SSE 事件块</p>
+            <CopyButton text={block} />
+          </div>
+          <pre className="bg-muted/30 max-h-64 overflow-auto rounded-md border p-2 font-mono text-[11px] whitespace-pre-wrap">
+            {block}
+          </pre>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -522,7 +659,7 @@ function Summary({ data }: { data: RequestDetail }) {
       </Badge>
       <Badge variant="outline">{data.client}</Badge>
       <Badge variant="outline">{data.model}</Badge>
-      {data.provider_tag && <Badge variant="outline">{data.provider_tag}</Badge>}
+      {data.provider_tag && <Badge variant="outline">{data.provider_name ?? data.provider_tag}</Badge>}
       {data.is_stream && <Badge variant="secondary">流式</Badge>}
       {data.cache_hit && <Badge variant="success">缓存命中</Badge>}
     </div>
@@ -563,7 +700,21 @@ function Metrics({ data }: { data: RequestDetail }) {
       <div className="grid grid-cols-2 gap-x-6 gap-y-2 rounded-md border p-3 text-xs sm:grid-cols-3 lg:grid-cols-4">
         <Field label="时间" value={formatTime(data.ts)} />
         <Field label="耗时" value={formatMs(data.latency_ms)} />
-        <Field label="TTFB" value={formatMs(data.ttfb_ms)} />
+        <Field
+          label="TTFT"
+          value={formatMs(data.ttfb_ms)}
+          hint="等到首字节的时间。流式的首字节就是首 token；非流式没有独立的首字节时刻，用整体耗时近似。"
+        />
+        <Field
+          label="ITL"
+          value={formatMs(data.itl_ms)}
+          hint="平均 token 间隔 = 解码窗口 / (输出 token - 1)。只有流式量得出来；非流式与缓存命中显示「—」。"
+        />
+        <Field
+          label="TPS"
+          value={formatTps(data.tps)}
+          hint="输出速度 = 输出 token / 解码窗口。非流式按整体耗时估算；缓存命中不报 —— 重放不是生成。"
+        />
         <Field label="费用" value={quotaToUsd(data.quota)} />
         <Field label="输入 Token" value={formatNumber(data.input_tokens)} />
         <Field label="输出 Token" value={formatNumber(data.output_tokens)} />
@@ -601,14 +752,19 @@ function Field({
   label,
   value,
   highlight,
+  hint,
 }: {
   label: string;
   value: string;
   highlight?: boolean;
+  /** 悬停说明这个数是怎么来的。口径容易被误读的指标都该给一个。 */
+  hint?: string;
 }) {
   return (
     <div className="flex min-w-0 items-center justify-between gap-2">
-      <span className="text-muted-foreground shrink-0">{label}</span>
+      <span className="text-muted-foreground shrink-0" title={hint}>
+        {label}
+      </span>
       <span
         className={
           highlight

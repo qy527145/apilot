@@ -4,13 +4,50 @@
 //! 统计互补：DB 回答"过去一小时花了多少"，这里回答"现在正在跑什么"。
 
 pub mod events;
+pub mod log_filter;
 pub mod stream_events;
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+
+use crate::traffic::stream_events::RequestStarted;
+
+/// 正在进行的请求快照，供「进入监控页时补齐遗漏的进行中请求」用。
+///
+/// 只在内存里活着：进程重启之后请求也就结束了，不需要持久化。
+/// 数据量极小（并发数通常个位数），用简单的 Mutex<HashMap> 而不是更复杂的结构。
+#[derive(Debug, Default)]
+pub struct InflightStore {
+    entries: Mutex<HashMap<String, RequestStarted>>,
+}
+
+impl InflightStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 请求开始时记录。
+    pub fn insert(&self, r: RequestStarted) {
+        self.entries.lock().insert(r.request_id.clone(), r);
+    }
+
+    /// 请求结束时移除。
+    pub fn remove(&self, request_id: &str) {
+        self.entries.lock().remove(request_id);
+    }
+
+    /// 返回当前所有进行中的请求，按开始时间升序。
+    pub fn snapshot(&self) -> Vec<RequestStarted> {
+        let map = self.entries.lock();
+        let mut v: Vec<RequestStarted> = map.values().cloned().collect();
+        v.sort_by_key(|r| r.ts);
+        v
+    }
+}
 use serde::{Deserialize, Serialize};
 
 

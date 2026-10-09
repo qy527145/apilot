@@ -69,7 +69,6 @@ export interface ProtocolEndpoint {
 
 export interface ProviderInput {
   id?: number | null;
-  tag: string;
   name: string;
   kind: ProviderKind;
   base_url: string;
@@ -89,6 +88,7 @@ export interface ProviderInput {
 
 export interface Provider {
   id: number;
+  /** 内部生成的唯一 slug，前端无需展示或编辑。 */
   tag: string;
   name: string;
   kind: ProviderKind;
@@ -105,6 +105,53 @@ export interface Provider {
   proxy: ChannelProxy;
   created_at: number;
   updated_at: number;
+}
+
+/* --------------------------- 协议自动检测 --------------------------- */
+
+/**
+ * 协议探测的判定。与后端 `ProtocolVerdict` 一一对应，用词与能力探测
+ * （`CapabilityVerdict`）保持一致。
+ *
+ * **`inconclusive` 不是凑数的中间态**：鉴权失败、限流、上游 5xx、回包是网页，
+ * 都说明不了"这条路径有没有这个协议的入口"。把它压成 false，用户会以为服务商
+ * 不支持，而真实原因可能只是密钥没填对。
+ */
+export type ProtocolVerdict = "supported" | "unsupported" | "inconclusive";
+
+export const PROTOCOL_VERDICT_LABEL: Record<ProtocolVerdict, string> = {
+  supported: "有入口",
+  unsupported: "无入口",
+  inconclusive: "未知",
+};
+
+/** 一种协议的探测结果。 */
+export interface ProtocolDetection {
+  protocol: Protocol;
+  verdict: ProtocolVerdict;
+  /** 实际探测的出站地址。上游报错时第一个要看的就是它。 */
+  url: string;
+  status?: number | null;
+  latency_ms?: number | null;
+  /** 判定依据。 */
+  note?: string | null;
+}
+
+/**
+ * 协议检测的入参。只描述"怎么连"，不含 tag / name —— 检测发生在保存之前。
+ *
+ * `id` 是给密钥用的：编辑已有渠道时表单不回显密钥，留空表示沿用库里存的那把，
+ * 否则检测会不带鉴权头打过去，三种协议一律 401、结论全成"未知"。
+ */
+export interface ProtocolDetectInput {
+  id?: number | null;
+  base_url: string;
+  api_key?: string | null;
+  auth_style: AuthStyle;
+  extra_headers: Record<string, string>;
+  proxy?: ChannelProxy;
+  /** 每种协议要试的路径；`path` 为空表示用协议默认路径。 */
+  paths: ProtocolEndpoint[];
 }
 
 /* --------------------------- 模型（模型视角） --------------------------- */
@@ -231,11 +278,11 @@ export interface GatewayStatus {
 /**
  * 接管客户端时对它模型配置做什么。
  *
- * - `off`：不碰（默认）。
+ * - `off`：不碰客户端配置。
  * - `rename`：写模型名。绕开 Codex 的 Responses Lite，不依赖网关，代价是没有 apply_patch。
  * - `catalog`：下发模型目录地址。拿到完整元数据（含 apply_patch），代价是要多写两个
  *   Codex 开关、且客户端启动时得够得着网关。
- * - `both`：两个都写 —— 目录取不到时正好轮到名字那条路兜底。
+ * - `both`：两个都写（默认）—— 目录取不到时正好轮到名字那条路兜底。
  */
 export type ClientModelMode = "off" | "rename" | "catalog" | "both";
 
@@ -253,7 +300,7 @@ export interface AppSettings {  listen_host: string;
   /** 模型替换。默认 `mode: "passthrough"`（不改写）。 */
   model_policy: ModelPolicy;
   /**
-   * 接管客户端时怎么让客户端「正确地说话」。默认 `"off"`（不碰客户端配置）。
+   * 接管客户端时怎么让客户端「正确地说话」。默认 `"both"`（两个都写）。
    *
    * 两个手段解决同一件事的两面，详见 `src-tauri/src/codex/mod.rs`。
    */
@@ -374,6 +421,17 @@ export interface BillingBucket {
   /** 命中**本地响应缓存**的请求条数，与上一行不是一回事。 */
   cache_hits: number;
   saved_quota: number;
+  /**
+   * 三个平均值的样本条数：流式、非缓存命中、且量得出解码窗口的请求。
+   * 为 0 时三个平均值都是 null（界面显示「—」）—— 这一桶里没有可比的生成过程。
+   */
+  sample_requests: number;
+  /** 平均首字节耗时（毫秒）。无样本时为 null。 */
+  avg_ttft_ms: number | null;
+  /** 平均 token 间隔（毫秒）。无样本时为 null。 */
+  avg_itl_ms: number | null;
+  /** 平均输出速度（token / 秒，按 token 数加权）。无样本时为 null。 */
+  avg_tps: number | null;
   /** 只有「按模型」维度非空，其余维度恒为空数组。 */
   request_models: RequestModelAlias[];
 }
@@ -430,6 +488,8 @@ export type LogStatus = "ok" | "error";
 export interface LogFilter {
   client?: string | null;
   model?: string | null;
+  /** 客户端请求的模型名精确匹配（下拉筛选用）。 */
+  request_model?: string | null;
   provider_tag?: string | null;
   from?: number | null;
   to?: number | null;
@@ -438,8 +498,13 @@ export interface LogFilter {
   protocol?: Protocol | null;
   status?: LogStatus | null;
   is_stream?: boolean | null;
-  /** 模型名模糊匹配（`model` 是精确匹配）。 */
+  /** 模型名模糊匹配，同时命中实际路由模型（`model`）和客户端请求模型（`request_model`）。 */
   model_like?: string | null;
+  /**
+   * 自定义 JS 表达式筛选。后端对「日志字段 + 捕获报文」求值，命中的才返回。
+   * 内置对象与写法见 `FilterExprPanel`，实现见 `src-tauri/src/traffic/log_filter.rs`。
+   */
+  expr?: string | null;
   limit: number;
   offset: number;
 }
@@ -447,7 +512,10 @@ export interface LogFilter {
 /** 筛选下拉的候选值，来自最近这些请求里实际出现过的内容。 */
 export interface LogFacets {
   clients: string[];
+  /** 客户端请求的模型名（`request_model`）。 */
   models: string[];
+  /** 实际路由到的模型名（`model`）。 */
+  routed_models: string[];
   protocols: string[];
 }
 
@@ -458,6 +526,10 @@ export interface RequestLog {
   protocol_in: string;
   protocol_out: string;
   provider_tag?: string | null;
+  /** 渠道整数 id，用于关联渠道名称。 */
+  provider_id?: number | null;
+  /** 渠道当前名称（JOIN 自 providers，改名后自动更新）。 */
+  provider_name?: string | null;
   model: string;
   request_model: string;
   /** 入站请求路径（客户端打给 Apilot 的）。 */
@@ -484,9 +556,29 @@ export interface RequestLog {
   saved_quota: number;
 }
 
+/** 正在进行的请求（还没结束、尚未落库）。与后端 `RequestStarted` 对应。 */
+export interface InflightRequest {
+  request_id: string;
+  ts: number;
+  client: string;
+  model: string;
+  request_model: string;
+  path: string;
+  protocol_in: string;
+  provider_tag: string;
+  provider_name: string;
+  upstream_url: string;
+  is_stream: boolean;
+}
+
 export interface Page<T> {
   items: T[];
   total: number;
+  /**
+   * 表达式筛选没扫完时为真 —— 此时 `total` 只是**扫过的那部分**里的匹配数。
+   * 普通查询不会带上它。界面必须如实说出来，否则用户会把一个少了的数字当成全部。
+   */
+  truncated?: boolean;
 }
 
 /** 清空日志的结果：各删了多少条。 */
@@ -516,7 +608,15 @@ export type ContentBlock =
       is_error: boolean;
     }
   | { type: "thinking"; text: string; signature?: string | null }
-  | { type: "redacted_thinking"; data: string };
+  | { type: "redacted_thinking"; data: string }
+  /**
+   * 后端没建模的内容块，整个原始 JSON 留在 `raw` 里。
+   *
+   * 出现的场合：客户端先用上了新块类型（Claude Code 带附件时发的 `document`），
+   * 或上游发来的是非标准形状。这一块只要求"能看到原文" —— 它本来就不要求
+   * 语义化渲染。
+   */
+  | { type: "unmodeled"; raw: unknown };
 
 export interface UnifiedMessage {
   role: Role;
@@ -658,6 +758,15 @@ export interface DetailViews {
 }
 
 export interface RequestDetail extends RequestLog {
+  /**
+   * 平均 token 间隔（毫秒）与输出速度（token / 秒），由后端从已落库的标量推出。
+   *
+   * 间隔只在流式且量得出解码窗口时才有；非流式测不出间隔，缓存命中不报速度。
+   * 为 null 时界面显示「—」。
+   */
+  itl_ms?: number | null;
+  tps?: number | null;
+
   /* --- 入站：客户端 → Apilot --- */
   method: string;
   request_headers: Record<string, string>;
@@ -921,6 +1030,18 @@ export const api = {
   /** 拉取上游 `GET {base_url}/v1/models`，返回模型 id 列表。 */
   fetchProviderModels: (id: number) =>
     call<string[]>("fetch_provider_models", { id }),
+  /**
+   * 就地启用 / 停用。只改这一个字段，**不要**用 `upsertProvider` 代替：
+   * 那条路要求把密钥等整套回传，而密钥不回显，改个开关就会把它抹掉。
+   */
+  setProviderEnabled: (id: number, enabled: boolean) =>
+    call<null>("set_provider_enabled", { id, enabled }),
+  /**
+   * 自动检测该地址支持哪些协议：对三种协议的入口各发一次**故意不合法**的请求
+   * （空对象），按回包判定 —— 不消耗 token，也不占配额。结果不落库。
+   */
+  detectProviderProtocols: (input: ProtocolDetectInput) =>
+    call<ProtocolDetection[]>("detect_provider_protocols", { input }),
 
   /* ---- 上游目录：价格与能力共用同一个网络集成 ---- */
   /**
@@ -1003,8 +1124,24 @@ export const api = {
   queryLogs: (filter: LogFilter) => call<Page<RequestLog>>("query_logs", { filter }),
   /** 筛选下拉的候选值。进监控页时取一次即可。 */
   listLogFacets: () => call<LogFacets>("list_log_facets"),
+  /**
+   * 校验筛选表达式能否编译，返回错因（`null` = 通过）。
+   *
+   * 刻意**不走 `call`**：那个失败会弹 toast，而这里每次按键都要调一次 ——
+   * 用户还在打字时不停弹「语法错误」既吵又没意义。错因由编辑框自己显示。
+   */
+  validateLogExpr: async (expr: string): Promise<string | null> => {
+    try {
+      await invoke<void>("validate_log_expr", { expr });
+      return null;
+    } catch (err) {
+      return normalizeError(err).message;
+    }
+  },
   getRequestDetail: (requestId: string) =>
     call<RequestDetail>("get_request_detail", { requestId }),
+  /** 查询当前正在进行的请求。进监控页时调用一次，补齐用户进页前已开始的请求。 */
+  getInflightRequests: () => call<InflightRequest[]>("get_inflight_requests"),
   /** 清空请求明细与原文捕获。计费聚合不受影响。 */
   clearLogs: () => call<ClearResult>("clear_logs"),
   /** 删除单条请求明细及其原文捕获。计费聚合不受影响。 */

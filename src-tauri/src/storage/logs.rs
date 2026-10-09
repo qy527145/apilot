@@ -1,9 +1,14 @@
 //! 请求明细日志与流量捕获的读写。
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, SqlitePool};
 
 use crate::error::AppResult;
+// `Row` 已经被 sqlx 占了，这里给表达式的行另起一个名字，免得读的人以为
+// 「行」是数据库行 —— 它其实是喂给 JS 求值器的一行。
+use crate::traffic::log_filter::{lazy_slot, Payload, Row as ExprRow};
 
 /// 写入一条请求日志所需的全部字段。
 ///
@@ -16,6 +21,8 @@ pub struct RequestLogRecord {
     pub protocol_in: String,
     pub protocol_out: String,
     pub provider_tag: Option<String>,
+    /// 渠道的整数 id，落库后可 JOIN providers.name 获取最新名称。
+    pub provider_id: Option<i64>,
     pub channel_kind: Option<String>,
     pub model: String,
     pub request_model: String,
@@ -56,7 +63,12 @@ pub struct RequestLog {
     pub client: String,
     pub protocol_in: String,
     pub protocol_out: String,
+    /// 渠道的文本 slug（历史兼容，写入时同步写 provider_id）。
     pub provider_tag: Option<String>,
+    /// 渠道整数 id；查询时 LEFT JOIN providers 得到最新名称。
+    pub provider_id: Option<i64>,
+    /// 渠道当前名称（JOIN 自 providers，改名后自动更新）。
+    pub provider_name: Option<String>,
     pub model: String,
     pub request_model: String,
     pub path: String,
@@ -94,8 +106,13 @@ pub struct LogFilter {
     pub status: Option<String>,
     /// 只看流式 / 只看非流式。
     pub is_stream: Option<bool>,
-    /// 模型名模糊匹配。`model` 是精确匹配，这个是给"记不全名字"用的。
+    /// 客户端请求的模型名精确匹配（`request_model` 列）。
+    pub request_model: Option<String>,
+    /// 模型名模糊匹配，同时命中 `model`（实际路由模型）和 `request_model`（客户端请求模型）。
     pub model_like: Option<String>,
+    /// 自定义 JS 表达式筛选。对「日志字段 + 捕获报文」求值，命中的才返回。
+    /// 求值在后端做，见 `traffic::log_filter` 里关于「为什么不能放前端」的说明。
+    pub expr: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -121,7 +138,9 @@ impl Default for LogFilter {
             protocol: None,
             status: None,
             is_stream: None,
+            request_model: None,
             model_like: None,
+            expr: None,
             limit: default_limit(),
             offset: 0,
         }
@@ -155,15 +174,23 @@ impl LogFilter {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        self.expr = self
+            .expr
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         self
     }
 }
 
-const LOG_COLUMNS: &str = "request_id, ts, client, protocol_in, protocol_out, provider_tag, \
-     model, request_model, path, upstream_url, upstream_model, upstream_status, is_stream, \
-     status_code, error_message, input_tokens, output_tokens, \
-     cache_read_tokens, cache_creation_tokens, usage_source, quota, cost_usd, latency_ms, \
-     ttfb_ms, cache_hit, saved_quota";
+const LOG_COLUMNS: &str = "l.request_id, l.ts, l.client, l.protocol_in, l.protocol_out, l.provider_tag, \
+     l.provider_id, p.name AS provider_name, \
+     l.model, l.request_model, l.path, l.upstream_url, l.upstream_model, l.upstream_status, l.is_stream, \
+     l.status_code, l.error_message, l.input_tokens, l.output_tokens, \
+     l.cache_read_tokens, l.cache_creation_tokens, l.usage_source, l.quota, l.cost_usd, l.latency_ms, \
+     l.ttfb_ms, l.cache_hit, l.saved_quota";
+
+const LOG_FROM: &str = "request_logs l LEFT JOIN providers p ON l.provider_id = p.id";
 
 fn row_to_log(r: &sqlx::sqlite::SqliteRow) -> RequestLog {
     RequestLog {
@@ -173,6 +200,8 @@ fn row_to_log(r: &sqlx::sqlite::SqliteRow) -> RequestLog {
         protocol_in: r.get("protocol_in"),
         protocol_out: r.get("protocol_out"),
         provider_tag: r.get("provider_tag"),
+        provider_id: r.get("provider_id"),
+        provider_name: r.get("provider_name"),
         model: r.get("model"),
         request_model: r.get("request_model"),
         path: r.get("path"),
@@ -200,14 +229,14 @@ fn row_to_log(r: &sqlx::sqlite::SqliteRow) -> RequestLog {
 pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> {
     sqlx::query(
         "INSERT OR REPLACE INTO request_logs (
-             request_id, ts, client, protocol_in, protocol_out, provider_tag, channel_kind,
-             model, request_model, path, upstream_url, upstream_model, upstream_status,
-             is_stream, status_code, error_message,
+             request_id, ts, client, protocol_in, protocol_out, provider_tag, provider_id,
+             channel_kind, model, request_model, path, upstream_url, upstream_model,
+             upstream_status, is_stream, status_code, error_message,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              reasoning_tokens, usage_source, quota, cost_usd, latency_ms, ttfb_ms,
              cache_hit, saved_quota, other)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
-                 ?22,?23,?24,?25,?26,?27,?28,?29)",
+                 ?22,?23,?24,?25,?26,?27,?28,?29,?30)",
     )
     .bind(&rec.request_id)
     .bind(rec.ts)
@@ -215,6 +244,7 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
     .bind(&rec.protocol_in)
     .bind(&rec.protocol_out)
     .bind(&rec.provider_tag)
+    .bind(rec.provider_id)
     .bind(&rec.channel_kind)
     .bind(&rec.model)
     .bind(&rec.request_model)
@@ -243,33 +273,336 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
     Ok(())
 }
 
-/// 按条件分页查询。返回 `(本页数据, 满足条件的总数)`。
-pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<(Vec<RequestLog>, i64)> {
+/// 一页日志。
+///
+/// `truncated` 只可能在表达式筛选下为真 —— 见 `query_with_expr`：那时 `total`
+/// 是**扫过的那部分**里的匹配数，不是全库的口径。
+#[derive(Debug, Clone, Serialize)]
+pub struct LogPage {
+    pub items: Vec<RequestLog>,
+    pub total: i64,
+    pub truncated: bool,
+}
+
+/// 按条件分页查询。
+pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<LogPage> {
     let filter = filter.clone().normalized();
+
+    // 表达式筛选走另一条路：它要读捕获报文，没法下推给 SQL 分页。
+    if let Some(expr) = filter.expr.clone() {
+        return query_with_expr(pool, &filter, &expr).await;
+    }
 
     // 计数与取数用同一套 WHERE，避免两者口径漂移。
     let mut count_qb: QueryBuilder<sqlx::Sqlite> =
-        QueryBuilder::new("SELECT COUNT(*) FROM request_logs WHERE 1=1");
+        QueryBuilder::new(format!("SELECT COUNT(*) FROM {LOG_FROM} WHERE 1=1"));
     push_where(&mut count_qb, &filter);
     let total: i64 = count_qb.build_query_scalar().fetch_one(pool).await?;
 
     let mut qb: QueryBuilder<sqlx::Sqlite> =
-        QueryBuilder::new(format!("SELECT {LOG_COLUMNS} FROM request_logs WHERE 1=1"));
+        QueryBuilder::new(format!("SELECT {LOG_COLUMNS} FROM {LOG_FROM} WHERE 1=1"));
     push_where(&mut qb, &filter);
-    qb.push(" ORDER BY ts DESC, id DESC LIMIT ")
+    qb.push(" ORDER BY l.ts DESC, l.id DESC LIMIT ")
         .push_bind(filter.limit)
         .push(" OFFSET ")
         .push_bind(filter.offset);
 
     let rows = qb.build().fetch_all(pool).await?;
-    Ok((rows.iter().map(row_to_log).collect(), total))
+    Ok(LogPage { items: rows.iter().map(row_to_log).collect(), total, truncated: false })
+}
+
+/// 表达式筛选时最多扫多少行。
+///
+/// 表达式没法下推给 SQL —— 它要读捕获报文，那是另一张表的内容。所以只能先把
+/// 候选行捞上来、在内存里逐行求值、再在内存里分页。限制扫描量是为了让最坏情况
+/// 有界：本地库几十万行时全表求值会把界面卡死好几秒。
+///
+/// 代价是**超过这个数的匹配项不会出现在结果里**，因此界面上的「共 N 条」在
+/// 表达式生效时实际是「最近 N 行里的匹配数」。这是刻意的取舍。
+const EXPR_SCAN_CAP: i64 = 5000;
+
+/// 第二趟取的捕获列 —— **一行捕获里除 request_id 之外的全部**。
+///
+/// 第一趟一列都不取，两个理由都是实测出来的：
+///
+/// - body 列是几 MB 的 BLOB，读进来再解析就是 out of memory 那个 bug 的一半；
+/// - 连 `method`、`headers` 这种小字段也不能在第一趟取。它们住在 `captures` 里，
+///   而那张表的行被几 MB 的报文撑得极长 —— 只为读一个小字段 JOIN 上去，
+///   「只看状态码」的表达式就从 15ms 变成 800ms（本机 425 行实测）。
+///
+/// 别名 `c_` 前缀用来和日志列区分 —— 两张表都有 `upstream_url`、`path` 这类
+/// 同名列，不前缀会在 `row.get` 撞上。
+const PAYLOAD_COLUMNS: &str = "method AS c_method, \
+     request_headers AS c_request_headers, response_headers AS c_response_headers, \
+     upstream_headers AS c_upstream_headers, \
+     upstream_response_headers AS c_upstream_response_headers, \
+     request_body AS c_request_body, response_body AS c_response_body, \
+     stream_text AS c_stream_text, upstream_body AS c_upstream_body, \
+     upstream_response_body AS c_upstream_response_body";
+
+/// 第二趟最多把多少字节的捕获读进内存。
+///
+/// 按**字节**而不是行数：行数拦不住「400 行 × 1.7MB」，而按字节算，只读 headers
+/// 的表达式（每行几 KB）能覆盖几千行，读 body 的只剩几十行 —— 两种都恰好落在
+/// 「一次查询几百 MB」这条安全线内。上限本身也只是兜底，真正先撞上的通常是
+/// 求值器那边的时间预算（每行解析上百毫秒）。
+const PAYLOAD_FETCH_BUDGET: usize = 64 * 1024 * 1024;
+
+/// 带表达式的查询：两趟求值 → 在内存里过滤和分页。
+///
+/// **第一趟**只查 `request_logs`，连 `captures` 都不 JOIN：凡是来自捕获的字段
+/// （method、headers、四个方向的 body）在元数据里都是哨兵，表达式读到的是
+/// `null`。于是「只看状态码」这类表达式**一次都不碰**那张几 MB 一行的表，
+/// 5000 行的窗口也就跑得完。
+///
+/// 读过报文的行会被求值器标成 `dirty` —— 包括读到 `null`、以及没写可选链时
+/// 直接抛错（`ctx.request.body.tools`）这两种。它们的结果**不可信**，必须由
+/// **第二趟**带上真报文重算。没被标记的行结果已经定音，不必再碰。
+///
+/// 第二趟按 `PAYLOAD_FETCH_BUDGET` 截住，超出就如实标 `truncated`。
+async fn query_with_expr(pool: &SqlitePool, filter: &LogFilter, expr: &str) -> AppResult<LogPage> {
+    query_with_expr_budgeted(pool, filter, expr, PAYLOAD_FETCH_BUDGET).await
+}
+
+/// 预算可调的版本。测试传小预算，才能不真的造 64MB 报文。
+async fn query_with_expr_budgeted(
+    pool: &SqlitePool,
+    filter: &LogFilter,
+    expr: &str,
+    payload_budget: usize,
+) -> AppResult<LogPage> {
+    let mut qb: QueryBuilder<sqlx::Sqlite> =
+        QueryBuilder::new(format!("SELECT {LOG_COLUMNS} FROM {LOG_FROM} WHERE 1=1"));
+    // 其余筛选条件（客户端、协议、时间…）照常下推给 SQL —— 少求值一行是一行。
+    push_where(&mut qb, filter);
+    qb.push(" ORDER BY l.ts DESC, l.id DESC LIMIT ")
+        .push_bind(EXPR_SCAN_CAP);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let logs: Vec<RequestLog> = rows.iter().map(row_to_log).collect();
+
+    let first = crate::traffic::log_filter::probe(expr, logs.len(), |i| ExprRow {
+        meta: expr_meta(&logs[i]),
+        payload: Payload::default(),
+    })
+    .map_err(expr_err)?;
+
+    let mut mask = first.mask;
+    let mut truncated = first.truncated;
+    let mut dirty = first.dirty;
+
+    if !dirty.is_empty() {
+        let ids: Vec<&str> = dirty.iter().map(|&i| logs[i].request_id.as_str()).collect();
+
+        // 先问一句每行的捕获有多大，再按扫描顺序累加到预算为止：只取前面这些行，
+        // 内存才有上限。`length()` 走的是记录头，不会把 BLOB 内容拖出来。
+        let sizes = fetch_payload_sizes(pool, &ids).await?;
+        let mut left = payload_budget;
+        let mut take = 0usize;
+        for id in &ids {
+            let size = sizes.get(*id).copied().unwrap_or(0);
+            if size > left {
+                break;
+            }
+            left -= size;
+            take += 1;
+        }
+        // 第一行就超预算时也硬着头皮算它一行：一行大报文的成败该由求值器的内存
+        // 上限去判（它会给出「报文过大」的错因），而不是在这里被静默跳过 ——
+        // 那样用户看到的会是「一条都没匹配」，方向完全错。
+        if take == 0 {
+            take = 1;
+        }
+        if take < dirty.len() {
+            dirty.truncate(take);
+            truncated = true;
+        }
+
+        let ids: Vec<&str> = dirty.iter().map(|&i| logs[i].request_id.as_str()).collect();
+        let mut payloads = fetch_payloads(pool, &ids).await?;
+
+        let second = crate::traffic::log_filter::filter(expr, dirty.len(), |j| ExprRow {
+            meta: expr_meta(&logs[dirty[j]]),
+            payload: payloads.remove(&logs[dirty[j]].request_id).unwrap_or_default(),
+        })
+        .map_err(expr_err)?;
+
+        // 第二趟自己也会撞预算。没轮到的行**不能**留着第一趟的结果 ——
+        // 那是拿空报文算出来的，留着就是撒谎。按不命中处理并把 truncated 立起来。
+        let recomputed = second.mask.len();
+        for (j, hit) in second.mask.into_iter().enumerate() {
+            mask[dirty[j]] = hit;
+        }
+        for &i in dirty.iter().skip(recomputed) {
+            mask[i] = false;
+        }
+        if second.truncated || recomputed < dirty.len() {
+            truncated = true;
+        }
+    }
+
+    // 截断时 `mask` 比 `logs` 短：没被求值的行在这里被 zip 丢掉（按不命中处理），
+    // 与「扫描窗口」是同一类取舍 —— 由 `truncated` 如实告诉用户。
+    let matched: Vec<RequestLog> = logs
+        .into_iter()
+        .zip(mask)
+        .filter_map(|(l, hit)| hit.then_some(l))
+        .collect();
+
+    let total = matched.len() as i64;
+    let offset = filter.offset.max(0) as usize;
+    let limit = filter.limit.max(1) as usize;
+    let items = matched.into_iter().skip(offset).take(limit).collect();
+    Ok(LogPage { items, total, truncated })
+}
+
+/// 表达式出错时的统一错因。
+///
+/// 表达式出错（语法错、某一行**自己**跑飞）时**如实报错**，不能静默返回空 ——
+/// 空结果看起来就是「没有匹配的请求」，会把用户引到完全错误的方向。
+/// 「扫到一半停下」不在此列：那不是错误，走 `Outcome::truncated`。
+fn expr_err(e: String) -> crate::error::AppError {
+    crate::error::AppError::msg(format!("筛选表达式出错：{e}"))
+}
+
+/// 只把这几个 request_id 的报文选出来。
+///
+/// **只搬字节、不解析** —— 解析推迟到表达式真的读到它的时候（见 `traffic::log_filter`）。
+async fn fetch_payloads(pool: &SqlitePool, ids: &[&str]) -> AppResult<HashMap<String, Payload>> {
+    let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(format!(
+        "SELECT c.request_id AS c_request_id, {PAYLOAD_COLUMNS} FROM captures c \
+         WHERE c.request_id IN ("
+    ));
+    push_in_list(&mut qb, ids);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<String, _>("c_request_id"), expr_payload(r)))
+        .collect())
+}
+
+/// 这几行的捕获各有多大（字节）。第二趟据此决定能带上多少行。
+///
+/// 只取长度不取内容：`length()` 读的是记录头里的字段宽度，不会把几 MB 的 BLOB
+/// 拖出来 —— 否则这个「先看看有多大」的查询自己就先把内存吃掉了。
+async fn fetch_payload_sizes(pool: &SqlitePool, ids: &[&str]) -> AppResult<HashMap<String, usize>> {
+    let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
+        "SELECT request_id, coalesce(length(request_body), 0) \
+             + coalesce(length(response_body), 0) + coalesce(length(stream_text), 0) \
+             + coalesce(length(upstream_body), 0) \
+             + coalesce(length(upstream_response_body), 0) \
+             + coalesce(length(request_headers), 0) \
+             + coalesce(length(response_headers), 0) \
+             + coalesce(length(upstream_headers), 0) \
+             + coalesce(length(upstream_response_headers), 0) AS bytes \
+         FROM captures WHERE request_id IN (",
+    );
+    push_in_list(&mut qb, ids);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    Ok(rows.iter().map(|r| (r.get::<String, _>("request_id"), r.get::<i64, _>("bytes") as usize)).collect())
+}
+
+/// 给 `IN (...)` 填参数。两个查询共用，免得各写一遍还写歪。
+fn push_in_list(qb: &mut QueryBuilder<'_, sqlx::Sqlite>, ids: &[&str]) {
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind((*id).to_string());
+    }
+    sep.push_unseparated(")");
+}
+
+/// 组装表达式能看到的**元数据** —— 就是界面上「内置对象」那份说明的实现。
+///
+/// 字段名用 camelCase：写表达式的用户面对的是 JS，`latency_ms` 那种下划线
+/// 命名在 JS 里格格不入。**改这里就必须同步改前端的说明面板与
+/// `src/lib/logExpr.ts` 的进行中求值**，否则文档与行为会对不上。
+///
+/// 凡是从捕获来的字段（method、headers、四个方向的 body）只放哨兵，真值由
+/// `expr_payload` 按需给 —— 所以这里**不需要数据库行**，也就不会 JOIN captures。
+fn expr_meta(log: &RequestLog) -> String {
+    use serde_json::json;
+
+    json!({
+        // --- 日志本身的字段 ---
+        "id": log.request_id,
+        "ts": log.ts,
+        "client": log.client,
+        "model": log.model,
+        "requestModel": log.request_model,
+        "upstreamModel": log.upstream_model,
+        "protocolIn": log.protocol_in,
+        "protocolOut": log.protocol_out,
+        "provider": log.provider_name.clone().or_else(|| log.provider_tag.clone()),
+        "path": log.path,
+        "status": log.status_code,
+        "upstreamStatus": log.upstream_status,
+        "isStream": log.is_stream,
+        "error": log.error_message,
+        "latencyMs": log.latency_ms,
+        "ttfbMs": log.ttfb_ms,
+        "inputTokens": log.input_tokens,
+        "outputTokens": log.output_tokens,
+        "cacheReadTokens": log.cache_read_tokens,
+        "cacheCreationTokens": log.cache_creation_tokens,
+        "quota": log.quota,
+        "costUsd": log.cost_usd,
+        "cacheHit": log.cache_hit,
+
+        // --- 客户端 → Apilot ---
+        "request": {
+            "method": lazy_slot("request.method"),
+            "path": log.path,
+            "headers": lazy_slot("request.headers"),
+            "body": lazy_slot("request.body"),
+        },
+        // --- Apilot → 客户端 ---
+        "response": {
+            "headers": lazy_slot("response.headers"),
+            "body": lazy_slot("response.body"),
+        },
+        // --- Apilot → 上游 ---
+        "upstreamRequest": {
+            "url": log.upstream_url,
+            "headers": lazy_slot("upstreamRequest.headers"),
+            "body": lazy_slot("upstreamRequest.body"),
+        },
+        // --- 上游 → Apilot ---
+        "upstreamResponse": {
+            "status": log.upstream_status,
+            "headers": lazy_slot("upstreamResponse.headers"),
+            "body": lazy_slot("upstreamResponse.body"),
+        },
+    })
+    .to_string()
+}
+
+/// 一行里按需取用的捕获内容。构造它只搬字节，**不解析** —— 那正是它能按需的原因。
+fn expr_payload(r: &sqlx::sqlite::SqliteRow) -> Payload {
+    Payload {
+        request_method: r.get::<Option<String>, _>("c_method"),
+        request_headers: r.get::<Option<String>, _>("c_request_headers"),
+        response_headers: r.get::<Option<String>, _>("c_response_headers"),
+        upstream_request_headers: r.get::<Option<String>, _>("c_upstream_headers"),
+        upstream_response_headers: r.get::<Option<String>, _>("c_upstream_response_headers"),
+        request_body: r.get::<Option<Vec<u8>>, _>("c_request_body"),
+        response_body: r.get::<Option<Vec<u8>>, _>("c_response_body"),
+        response_stream_text: r.get::<Option<String>, _>("c_stream_text"),
+        upstream_request_body: r.get::<Option<Vec<u8>>, _>("c_upstream_body"),
+        upstream_response_body: r.get::<Option<Vec<u8>>, _>("c_upstream_response_body"),
+    }
 }
 
 /// 筛选下拉的数据源：最近这些请求里实际出现过的客户端 / 模型 / 协议。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LogFacets {
     pub clients: Vec<String>,
+    /// 客户端请求的模型名（`request_model` 列）。
     pub models: Vec<String>,
+    /// 实际路由到的模型名（`model` 列）。与 `models` 分开，
+    /// 是因为模型策略会把客户端要的名字映射成另一个 —— 两者都要能单选。
+    pub routed_models: Vec<String>,
     pub protocols: Vec<String>,
 }
 
@@ -281,7 +614,7 @@ pub struct LogFacets {
 pub async fn facets(pool: &SqlitePool, scan: i64) -> AppResult<LogFacets> {
     let scan = scan.clamp(1, 10_000);
     let rows = sqlx::query(
-        "SELECT client, model, protocol_in FROM request_logs ORDER BY ts DESC LIMIT ?1",
+        "SELECT client, request_model, model, protocol_in FROM request_logs ORDER BY ts DESC LIMIT ?1",
     )
     .bind(scan)
     .fetch_all(pool)
@@ -289,17 +622,22 @@ pub async fn facets(pool: &SqlitePool, scan: i64) -> AppResult<LogFacets> {
 
     let mut clients = std::collections::BTreeSet::new();
     let mut models = std::collections::BTreeSet::new();
+    let mut routed_models = std::collections::BTreeSet::new();
     let mut protocols = std::collections::BTreeSet::new();
 
     for r in &rows {
         let c: String = r.get("client");
-        let m: String = r.get("model");
+        let m: String = r.get("request_model");
+        let rm: String = r.get("model");
         let p: String = r.get("protocol_in");
         if !c.is_empty() {
             clients.insert(c);
         }
         if !m.is_empty() {
             models.insert(m);
+        }
+        if !rm.is_empty() {
+            routed_models.insert(rm);
         }
         if !p.is_empty() {
             protocols.insert(p);
@@ -309,6 +647,7 @@ pub async fn facets(pool: &SqlitePool, scan: i64) -> AppResult<LogFacets> {
     Ok(LogFacets {
         clients: clients.into_iter().collect(),
         models: models.into_iter().collect(),
+        routed_models: routed_models.into_iter().collect(),
         protocols: protocols.into_iter().collect(),
     })
 }
@@ -347,18 +686,25 @@ fn push_where(qb: &mut QueryBuilder<'_, sqlx::Sqlite>, f: &LogFilter) {
     if let Some(s) = f.is_stream {
         qb.push(" AND is_stream = ").push_bind(s as i64);
     }
+    if let Some(m) = &f.request_model {
+        qb.push(" AND request_model = ").push_bind(m.clone());
+    }
     if let Some(m) = &f.model_like {
         // 转义 LIKE 的通配符：模型名里出现 % 或 _ 时不该被当成通配符。
         let escaped = m.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        qb.push(" AND model LIKE ")
-            .push_bind(format!("%{escaped}%"))
-            .push(" ESCAPE '\\'");
+        let pattern = format!("%{escaped}%");
+        // 同时命中客户端请求的模型名（request_model）和实际路由模型名（model）。
+        qb.push(" AND (model LIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR request_model LIKE ")
+            .push_bind(pattern)
+            .push(" ESCAPE '\\')");
     }
 }
 
 pub async fn get(pool: &SqlitePool, request_id: &str) -> AppResult<Option<RequestLog>> {
     let row = sqlx::query(&format!(
-        "SELECT {LOG_COLUMNS} FROM request_logs WHERE request_id = ?1"
+        "SELECT {LOG_COLUMNS} FROM {LOG_FROM} WHERE l.request_id = ?1"
     ))
     .bind(request_id)
     .fetch_optional(pool)
@@ -378,6 +724,10 @@ pub struct RequestDetail {
     pub protocol_in: String,
     pub protocol_out: String,
     pub provider_tag: Option<String>,
+    /// 渠道整数 id，用于关联渠道名称。
+    pub provider_id: Option<i64>,
+    /// 渠道当前名称（从 providers 表 JOIN 而来，改名后自动更新）。
+    pub provider_name: Option<String>,
     pub model: String,
     pub request_model: String,
     pub is_stream: bool,
@@ -392,6 +742,16 @@ pub struct RequestDetail {
     pub cost_usd: f64,
     pub latency_ms: i64,
     pub ttfb_ms: Option<i64>,
+    /// 平均 token 间隔（毫秒）= 解码窗口 / (输出 token - 1)。
+    ///
+    /// 只对能取出 `speed_sample` 的请求有值 —— 流式、非缓存命中、成功，且首字节
+    /// 早于流结束。非流式的首字节就是全文，没有可分的窗口。测不出给 `None`，
+    /// 界面显示「—」。
+    pub itl_ms: Option<f64>,
+    /// 输出速度（token / 秒）= 输出 token / 解码窗口。
+    ///
+    /// 与 `itl_ms` 同一个样本，见 `speed_sample`。
+    pub tps: Option<f64>,
     pub cache_hit: bool,
     pub saved_quota: i64,
 
@@ -603,6 +963,19 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
     let upstream_status = upstream_status.or(log.upstream_status);
     let upstream_url = upstream_url.or(log.upstream_url);
 
+    // 观感指标由已落库的标量推出来，不在落库时算：口径改了不必迁移数据，老日志
+    // 打开详情也能看到。统计页那边的累加量是另一回事（v10 迁移）。
+    let sample = speed_sample(
+        log.is_stream,
+        log.cache_hit,
+        log.status_code,
+        log.latency_ms,
+        log.ttfb_ms,
+        log.output_tokens,
+    );
+    let itl_ms = sample.and_then(|s| s.itl_ms());
+    let tps = sample.and_then(|s| s.tps());
+
     Ok(Some(RequestDetail {
         request_id: log.request_id,
         ts: log.ts,
@@ -610,6 +983,8 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         protocol_in: log.protocol_in,
         protocol_out: log.protocol_out,
         provider_tag: log.provider_tag,
+        provider_id: log.provider_id,
+        provider_name: log.provider_name,
         model: log.model,
         request_model: log.request_model,
         is_stream: log.is_stream,
@@ -624,6 +999,8 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         cost_usd: log.cost_usd,
         latency_ms: log.latency_ms,
         ttfb_ms: log.ttfb_ms,
+        itl_ms,
+        tps,
         cache_hit: log.cache_hit,
         saved_quota: log.saved_quota,
         method,
@@ -651,6 +1028,68 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         stream_raw_truncated,
         stream_timings,
     }))
+}
+
+/// 一条请求提供的观感样本。
+///
+/// 三个指标里的 TTFT 就是 `ttfb_ms`；ITL 与 TPS 由这里的两个量推出 —— 单条详情
+/// 用它算，聚合表也用它累加，**口径只此一处**：同一个模型在详情弹窗与统计页
+/// 不会给出两个数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeedSample {
+    /// 首字节耗时（毫秒）。
+    pub ttft_ms: i64,
+    /// 解码窗口（毫秒）= 总耗时 - 首字节，恒为正。
+    pub decode_ms: i64,
+    /// 这段窗口里吐出的 token 数。
+    pub output_tokens: u64,
+}
+
+impl SpeedSample {
+    /// 平均 token 间隔（毫秒）。输出不足两个 token 时没有“间隔”可言。
+    pub fn itl_ms(&self) -> Option<f64> {
+        (self.output_tokens >= 2)
+            .then(|| self.decode_ms as f64 / (self.output_tokens - 1) as f64)
+    }
+
+    /// 输出速度（token / 秒）。
+    pub fn tps(&self) -> Option<f64> {
+        (self.output_tokens > 0)
+            .then(|| self.output_tokens as f64 * 1000.0 / self.decode_ms as f64)
+    }
+}
+
+/// 取一条请求的观感样本；取不出来就说明它没有可与别人比较的解码过程。
+///
+/// 条件是**流式 + 非缓存命中 + 成功 + 量得出解码窗口**：
+///
+/// - 非流式那条路把 ttfb 记成整体耗时（上游一次给全文，见 `gateway/pipeline.rs`），
+///   差值恒为 0。拿它算“首 token 耗时”是拿整段耗时冒充，算“吐字速度”则要除零。
+/// - 缓存命中的耗时是重放时间，token 也不是刚生成的 —— 与生成速度无关。
+/// - 失败（≥400）的请求没把 token 吐完，耗时不代表这个模型的能力。
+pub fn speed_sample(
+    is_stream: bool,
+    cache_hit: bool,
+    status_code: i32,
+    latency_ms: i64,
+    ttfb_ms: Option<i64>,
+    output_tokens: u64,
+) -> Option<SpeedSample> {
+    if !is_stream || cache_hit || status_code >= 400 {
+        return None;
+    }
+    // 没等到首字节就没有窗口可言。
+    let ttft_ms = ttfb_ms?.max(0);
+    // 时钟抖动可能让首字节落在总耗时之后，负数窗口不能拿去算速度。
+    let decode_ms = latency_ms.max(0) - ttft_ms;
+    if decode_ms <= 0 {
+        return None;
+    }
+    Some(SpeedSample {
+        ttft_ms,
+        decode_ms,
+        output_tokens,
+    })
 }
 
 fn parse_json(s: Option<String>) -> serde_json::Value {
@@ -749,6 +1188,7 @@ mod tests {
             protocol_in: "anthropic".into(),
             protocol_out: "openai_chat".into(),
             provider_tag: Some("p1".into()),
+            provider_id: None,
             channel_kind: Some("openai_chat".into()),
             model: model.into(),
             request_model: model.into(),
@@ -822,7 +1262,7 @@ mod tests {
         updated.status_code = 500;
         insert(&p, &updated).await.unwrap();
 
-        let (items, total) = query(&p, &LogFilter::default()).await.unwrap();
+        let LogPage { items, total, .. } = query(&p, &LogFilter::default()).await.unwrap();
         assert_eq!(total, 1, "同一 request_id 不应产生两行");
         assert_eq!(items[0].status_code, 500);
     }
@@ -833,7 +1273,7 @@ mod tests {
         insert(&p, &rec("r1", "claude-code", "claude-sonnet-5")).await.unwrap();
         insert(&p, &rec("r2", "codex", "gpt-5")).await.unwrap();
 
-        let (items, total) = query(
+        let LogPage { items, total, .. } = query(
             &p,
             &LogFilter {
                 client: Some("codex".into()),
@@ -845,7 +1285,7 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(items[0].request_id, "r2");
 
-        let (items, _) = query(
+        let LogPage { items, .. } = query(
             &p,
             &LogFilter {
                 model: Some("claude-sonnet-5".into()),
@@ -865,7 +1305,7 @@ mod tests {
         insert(&p, &old).await.unwrap();
         insert(&p, &rec("new", "a", "m")).await.unwrap();
 
-        let (_, total) = query(
+        let LogPage { total, .. } = query(
             &p,
             &LogFilter {
                 from: Some(now_ms() - 1000),
@@ -878,6 +1318,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_filters_by_an_explicit_end_time() {
+        // 监控页「自定义时间范围」的下界就是它。两端都是**闭区间**：只给下界的话，
+        // 用户选「10:00 到 11:00」会把 11:00 之后的一并带出来。
+        let p = pool().await;
+        let at = |id: &str, ts: i64| {
+            let mut r = rec(id, "a", "m");
+            r.ts = ts;
+            r
+        };
+        insert(&p, &at("old", 1_000)).await.unwrap();
+        insert(&p, &at("mid", 2_000)).await.unwrap();
+        insert(&p, &at("new", 3_000)).await.unwrap();
+
+        let ids = query_ids(
+            &p,
+            LogFilter {
+                from: Some(1_500),
+                to: Some(2_500),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ids, vec!["mid"]);
+    }
+
+    #[tokio::test]
     async fn query_filters_cache_hits() {
         let p = pool().await;
         insert(&p, &rec("miss", "a", "m")).await.unwrap();
@@ -887,7 +1353,7 @@ mod tests {
         hit.saved_quota = 300;
         insert(&p, &hit).await.unwrap();
 
-        let (items, total) = query(
+        let LogPage { items, total, .. } = query(
             &p,
             &LogFilter {
                 only_cache_hit: Some(true),
@@ -907,7 +1373,7 @@ mod tests {
             insert(&p, &rec(&format!("r{i}"), "a", "m")).await.unwrap();
         }
 
-        let (page, total) = query(
+        let LogPage { items: page, total, .. } = query(
             &p,
             &LogFilter {
                 limit: 3,
@@ -929,7 +1395,7 @@ mod tests {
             r.ts = ts;
             insert(&p, &r).await.unwrap();
         }
-        let (items, _) = query(&p, &LogFilter::default()).await.unwrap();
+        let LogPage { items, .. } = query(&p, &LogFilter::default()).await.unwrap();
         assert_eq!(items[0].ts, 3_000);
     }
 
@@ -948,6 +1414,76 @@ mod tests {
         }
         .normalized();
         assert_eq!(f.limit, 1);
+    }
+
+    #[test]
+    fn speed_sample_splits_ttft_from_the_decode_window() {
+        // 首字节 1s、总共 3s、吐了 21 个 token → 窗口 2s。
+        let s = speed_sample(true, false, 200, 3000, Some(1000), 21).unwrap();
+        assert_eq!((s.ttft_ms, s.decode_ms, s.output_tokens), (1000, 2000, 21));
+        assert_eq!(s.itl_ms(), Some(100.0)); // 2000 / (21-1)
+        assert_eq!(s.tps(), Some(10.5)); // 21 个 token / 2s
+    }
+
+    #[test]
+    fn non_stream_and_single_chunk_streams_have_no_sample() {
+        // 非流式：ttfb 被记成整体耗时，窗口为 0。
+        assert_eq!(speed_sample(false, false, 200, 2000, Some(2000), 20), None);
+        // 流式但整段正文随首字节一起到（上游无视 stream，由我们重编码）：同样没有窗口。
+        assert_eq!(speed_sample(true, false, 200, 2000, Some(2000), 20), None);
+        assert_eq!(
+            speed_sample(true, false, 200, 2000, None, 20),
+            None,
+            "没等到首字节"
+        );
+    }
+
+    #[test]
+    fn cache_hits_and_failures_have_no_sample() {
+        // 缓存命中：耗时是重放时间，token 也不是刚生成的。
+        assert_eq!(speed_sample(true, true, 200, 5, Some(0), 100), None);
+        // 失败的流没吐完，耗时不代表这个模型的能力。
+        assert_eq!(speed_sample(true, false, 502, 3000, Some(1000), 10), None);
+        assert_eq!(speed_sample(true, false, 200, 0, Some(0), 10), None, "零耗时");
+    }
+
+    #[test]
+    fn ttfb_later_than_total_yields_no_window() {
+        // 时钟抖动可能让首字节晚于总耗时；负数窗口不能拿去算速度。
+        assert_eq!(speed_sample(true, false, 200, 1000, Some(1200), 10), None);
+    }
+
+    #[test]
+    fn one_output_token_has_speed_but_no_interval() {
+        let s = speed_sample(true, false, 200, 1500, Some(500), 1).unwrap();
+        assert_eq!(s.itl_ms(), None);
+        assert_eq!(s.tps(), Some(1.0));
+    }
+
+    #[test]
+    fn zero_output_tokens_still_yield_a_ttft() {
+        // 一个 token 都没吐（只回了个终止帧之类）：速度无意义，但首字节是量到了的 ——
+        // 统计页的平均 TTFT 得把它算进去，所以样本不按输出 token 数筛。
+        let s = speed_sample(true, false, 200, 1500, Some(500), 0).unwrap();
+        assert_eq!(s.ttft_ms, 500);
+        assert_eq!(s.tps(), None);
+        assert_eq!(s.itl_ms(), None);
+    }
+
+    #[tokio::test]
+    async fn detail_reports_speeds_from_stored_scalars() {
+        // 详情里的 ITL / TPS 是读的时候推出来的，不在落库时算 —— 加这两个指标
+        // 不需要迁移，老日志一样能显示。
+        let p = pool().await;
+        let mut r = rec("r1", "claude-code", "m");
+        r.latency_ms = 3000;
+        r.ttfb_ms = Some(1000);
+        r.output_tokens = 21;
+        insert(&p, &r).await.unwrap();
+
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(d.itl_ms, Some(100.0));
+        assert_eq!(d.tps, Some(10.5));
     }
 
     #[tokio::test]
@@ -1247,7 +1783,7 @@ mod tests {
         assert_eq!(logs, 2);
         assert_eq!(captures, 1);
 
-        let (items, total) = query(&p, &LogFilter::default()).await.unwrap();
+        let LogPage { items, total, .. } = query(&p, &LogFilter::default()).await.unwrap();
         assert!(items.is_empty());
         assert_eq!(total, 0);
         assert!(get_detail(&p, "r1").await.unwrap().is_none());
@@ -1364,7 +1900,7 @@ mod tests {
     }
 
     async fn query_ids(p: &SqlitePool, f: LogFilter) -> Vec<String> {
-        let (items, _) = query(p, &f).await.unwrap();
+        let LogPage { items, .. } = query(p, &f).await.unwrap();
         items.into_iter().map(|r| r.request_id).collect()
     }
 
@@ -1503,9 +2039,137 @@ mod tests {
         insert(&p, &rec("a", "c", "m1")).await.unwrap();
         insert(&p, &rec("b", "c", "m2")).await.unwrap();
 
-        let (items, total) = query(&p, &LogFilter::default()).await.unwrap();
+        let LogPage { items, total, .. } = query(&p, &LogFilter::default()).await.unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn expr_filter_reads_the_body_via_the_second_pass() {
+        // 第一趟不带报文（读到的永远是 null），所以「按 body 筛」必须靠第二趟补上 ——
+        // 少了第二趟，这条会一条都不命中。
+        let p = pool().await;
+        insert(&p, &rec("r1", "claude-code", "m")).await.unwrap();
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r1".into(),
+                request_body: Some(br#"{"tools":[{"name":"bash"}]}"#.to_vec()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let page = query(
+            &p,
+            &LogFilter {
+                expr: Some(r#"ctx.request.body.tools.length === 1"#.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn expr_filter_keeps_metadata_only_results_intact() {
+        // 不读报文的表达式在第一趟就定音了：结果该是对的，也不该被标成截断。
+        let p = pool().await;
+        insert(&p, &rec("ok", "a", "m")).await.unwrap();
+        let mut bad = rec("bad", "a", "m");
+        bad.status_code = 500;
+        insert(&p, &bad).await.unwrap();
+
+        let page = query(
+            &p,
+            &LogFilter {
+                expr: Some("ctx.status >= 400".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].request_id, "bad");
+        assert!(!page.truncated);
+    }
+
+    /// 造一行：日志 + 捕获，捕获带指定大小的 body。
+    async fn row_with_body(p: &SqlitePool, id: &str, body: Vec<u8>) {
+        insert(p, &rec(id, "a", "m")).await.unwrap();
+        save_capture(
+            p,
+            &CaptureRecord { request_id: id.into(), request_body: Some(body), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expr_filter_reports_a_truncated_scan() {
+        // 第二趟的字节预算用尽时必须如实标 truncated：没重算的行不能拿「读到空
+        // 报文」的第一趟结果冒充结论 —— 那样用户会看到一个少了的匹配数，
+        // 却以为已经扫完了。
+        let p = pool().await;
+        for i in 0..6 {
+            let id = format!("r{i}");
+            let mut body = br#"{"hit":true,"pad":""#.to_vec();
+            body.extend(vec![b'x'; 1024]);
+            body.extend(br#""}"#);
+            row_with_body(&p, &id, body).await;
+        }
+
+        let page = query_with_expr_budgeted(
+            &p,
+            &LogFilter { expr: Some("ctx.request.body.hit === true".into()), limit: 1000, ..Default::default() },
+            "ctx.request.body.hit === true",
+            3 * 1024,
+        )
+        .await
+        .unwrap();
+
+        assert!(page.truncated, "预算用尽必须报出来");
+        assert_eq!(page.total, 2, "只有重算过的两行才算数");
+    }
+
+    #[tokio::test]
+    async fn expr_filter_widens_its_window_when_payloads_are_small() {
+        // 按字节算预算的好处：只读 headers 的表达式每行才几 KB，于是 60 行
+        // 全都算得上 —— 换成一个固定行数上限就会白白丢掉一半。
+        let p = pool().await;
+        for i in 0..60 {
+            let id = format!("r{i}");
+            row_with_body(&p, &id, br#"{"hit":true}"#.to_vec()).await;
+            save_capture(
+                &p,
+                &CaptureRecord {
+                    request_id: id,
+                    request_headers: serde_json::json!({ "x-hit": "1" }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let page = query(
+            &p,
+            &LogFilter {
+                expr: Some(r#"ctx.request.headers["x-hit"] === "1""#.into()),
+                limit: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!page.truncated, "几十行小 headers 远在预算之内");
+        assert_eq!(page.total, 60, "每一行都该被算过");
     }
 
     // -----------------------------------------------------------------------

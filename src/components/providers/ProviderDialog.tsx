@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Loader2, Wand2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { KeyValueEditor } from "@/components/common/KeyValueEditor";
@@ -24,19 +25,28 @@ import {
 import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { qk } from "@/hooks/queries";
 import {
   ALL_PROTOCOLS,
   api,
   PROTOCOL_DEFAULT_PATH,
   PROTOCOL_LABEL,
+  PROTOCOL_VERDICT_LABEL,
   type AuthStyle,
   type ChannelProxyMode,
   type Protocol,
+  type ProtocolDetection,
+  type ProtocolVerdict,
   type Provider,
   type ProviderInput,
   type ProviderKind,
 } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { PROVIDER_PRESETS, type ProviderPreset } from "./presets";
 
 const AUTH_LABELS: Record<AuthStyle, string> = {
@@ -46,7 +56,6 @@ const AUTH_LABELS: Record<AuthStyle, string> = {
 };
 
 interface FormState {
-  tag: string;
   name: string;
   kind: ProviderKind;
   base_url: string;
@@ -67,7 +76,6 @@ interface FormState {
 }
 
 const EMPTY: FormState = {
-  tag: "",
   name: "",
   kind: "anthropic",
   base_url: "",
@@ -91,6 +99,18 @@ const PROXY_MODE_LABEL: Record<ChannelProxyMode, string> = {
   inherit: "跟随全局设置",
   direct: "直连（不走代理）",
   manual: "使用指定代理",
+};
+
+/**
+ * 检测结论的配色。
+ *
+ * 「未知」用琥珀而不是红：那多半是密钥/网络/限流的问题，与"服务商没有这个入口"
+ * 是两回事，混成一个颜色会让人去改错东西（比如把一条好渠道的勾去掉）。
+ */
+const VERDICT_CLASS: Record<ProtocolVerdict, string> = {
+  supported: "bg-emerald-500/15 text-emerald-500",
+  unsupported: "bg-destructive/15 text-destructive",
+  inconclusive: "bg-amber-500/15 text-amber-500",
 };
 
 /** 某协议当前生效的路径：覆盖过就用覆盖值，否则用协议默认值。 */
@@ -139,7 +159,6 @@ function toForm(p: Provider): FormState {
   }
 
   return {
-    tag: p.tag,
     name: p.name,
     kind: p.kind,
     base_url: p.base_url,
@@ -171,11 +190,19 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
   const qc = useQueryClient();
   const [form, setForm] = useState<FormState>(EMPTY);
   const [error, setError] = useState<string | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  /** 上一次自动检测的结果，按协议索引；没测过的不在这里。 */
+  const [detections, setDetections] = useState<
+    Partial<Record<Protocol, ProtocolDetection>> | null
+  >(null);
 
   useEffect(() => {
     if (open) {
       setForm(provider ? toForm(provider) : EMPTY);
       setError(null);
+      // 关了再打开时旧结论必须清掉：base_url / 密钥可能已经换了，
+      // 留着上一轮的徽标会让人以为那就是当前这个地址的检测结果。
+      setDetections(null);
     }
   }, [open, provider]);
 
@@ -220,6 +247,72 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
     }
   };
 
+  /**
+   * 自动检测这个地址支持哪些协议。
+   *
+   * 只**补**勾、不取消已勾的：一次网络探测会误判（中转对未知路径回 200 的兜底页、
+   * 网关在路由之前就做鉴权），拿它去删用户的配置等于把一个可能错的结论当成用户的
+   * 决定。否定结论只标在对应那一行，改不改由用户定。
+   */
+  const runDetect = async () => {
+    if (!form.base_url.trim()) return setError("先填好 base_url 再检测");
+    setError(null);
+    setDetecting(true);
+    try {
+      const results = await api.detectProviderProtocols({
+        // 带上 id：密钥不回显，留空时后端沿用它库里存的那把 ——
+        // 否则编辑老渠道时这次检测会不带鉴权头，三种协议一律 401。
+        id: provider?.id ?? null,
+        base_url: form.base_url.trim(),
+        api_key: form.api_key.trim() ? form.api_key.trim() : null,
+        auth_style: form.auth_style,
+        extra_headers: form.extra_headers,
+        proxy: {
+          mode: form.proxy_mode,
+          url: form.proxy_url.trim() ? form.proxy_url.trim() : null,
+        },
+        // 与保存时同一套规则：等于默认值的路径回退成 null，走协议默认路径的拼接。
+        paths: ALL_PROTOCOLS.map((p) => {
+          const path = effectivePath(form.paths, p);
+          return {
+            protocol: p,
+            path: path === PROTOCOL_DEFAULT_PATH[p] ? null : path,
+          };
+        }),
+      });
+
+      const byProtocol: Partial<Record<Protocol, ProtocolDetection>> = {};
+      for (const r of results) byProtocol[r.protocol] = r;
+      setDetections(byProtocol);
+
+      const found = results
+        .filter((r) => r.verdict === "supported")
+        .map((r) => r.protocol);
+
+      if (found.length === 0) {
+        toast.warning("没检测到可用的协议入口", {
+          description: results.some((r) => r.verdict === "inconclusive")
+            ? "上游有响应但说明不了问题 —— 原因标在每一行右侧。"
+            : "三种协议的入口都是 404：检查 base_url 是不是少了路径前缀。",
+        });
+        return;
+      }
+
+      setForm((f) => {
+        const protocols = [...f.protocols];
+        for (const p of found) if (!protocols.includes(p)) protocols.push(p);
+        return { ...f, protocols };
+      });
+      toast.success(`检测到 ${found.length} 种协议`, {
+        description: "已勾上还没勾的那几种；检测不会取消你已勾选的协议。",
+      });
+    } catch {
+      /* 错误 toast 已在 api 层弹出 */
+    } finally {
+      setDetecting(false);
+    }
+  };
+
   const mutation = useMutation({
     mutationFn: (input: ProviderInput) => api.upsertProvider(input),
     onSuccess: (saved) => {
@@ -257,7 +350,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
       return {
         ...f,
         name: p.name,
-        tag: p.tag,
         kind: p.kind,
         base_url: p.base_url,
         auth_style: p.auth_style,
@@ -267,7 +359,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
     });
 
   const submit = () => {
-    if (!form.tag.trim()) return setError("请填写渠道 tag");
     if (!form.name.trim()) return setError("请填写渠道名称");
     if (!form.base_url.trim()) return setError("请填写 base_url");
     if (form.protocols.length === 0)
@@ -284,7 +375,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
 
     const input: ProviderInput = {
       id: provider?.id ?? null,
-      tag: form.tag.trim(),
       name: form.name.trim(),
       kind: form.kind,
       base_url: form.base_url.trim(),
@@ -334,7 +424,7 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
           <div className="space-y-2">
             <Label className="text-muted-foreground text-xs">
               {provider
-                ? "套用预设（会覆盖名称、tag、base url、鉴权与协议声明）"
+                ? "套用预设（会覆盖名称、base url、鉴权与协议声明）"
                 : "快速填充常用服务商"}
             </Label>
             <div className="flex flex-wrap gap-2">
@@ -359,14 +449,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
                 value={form.name}
                 onChange={(e) => set("name", e.target.value)}
                 placeholder="例如：Anthropic 官方"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>Tag（唯一标识）</Label>
-              <Input
-                value={form.tag}
-                onChange={(e) => set("tag", e.target.value)}
-                placeholder="例如：anthropic-official"
               />
             </div>
           </div>
@@ -424,17 +506,40 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
           {/* 协议声明：勾上的就是 Apilot 会直接对上游说的协议。
               入站协议命中勾选集合时原样转发（直通，不重编码）；没命中才转换。 */}
           <div className="space-y-2 rounded-md border p-3">
-            <Label className="text-sm">支持的协议</Label>
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-sm">支持的协议</Label>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={runDetect}
+                disabled={detecting}
+              >
+                {detecting ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Wand2 className="size-3.5" />
+                )}
+                {detecting ? "检测中…" : "自动检测"}
+              </Button>
+            </div>
             <p className="text-muted-foreground text-xs">
               Apilot 会用这里勾选的协议直接对上游说话。客户端说什么协议，命中哪一项就
               用哪一项，<span className="text-foreground">不重编码</span>
               （直通）；都没命中才做协议转换。
+            </p>
+            <p className="text-muted-foreground text-xs">
+              「自动检测」按当前的 base url / 密钥 / 路径各探一次（请求体是空的，
+              不消耗 token）：探到的会帮你勾上，
+              <span className="text-foreground">但不会取消</span>
+              你已经勾好的。
             </p>
             <div className="mt-1 space-y-2">
               {ALL_PROTOCOLS.map((p) => {
                 const checked = form.protocols.includes(p);
                 const value = effectivePath(form.paths, p);
                 const isDefault = value === PROTOCOL_DEFAULT_PATH[p];
+                const det = detections?.[p];
                 return (
                   <div key={p} className="space-y-1">
                     <div className="flex items-center gap-3">
@@ -463,6 +568,32 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
                         {form.kind === p && (
                           <span className="text-muted-foreground">（首选）</span>
                         )}
+                        {det && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span
+                                className={cn(
+                                  "ml-1.5 cursor-help rounded px-1 py-px text-[10px] whitespace-nowrap",
+                                  VERDICT_CLASS[det.verdict],
+                                )}
+                              >
+                                {PROTOCOL_VERDICT_LABEL[det.verdict]}
+                                {det.latency_ms != null
+                                  ? ` ${det.latency_ms}ms`
+                                  : ""}
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              <div className="max-w-72 space-y-0.5 text-xs">
+                                <div>上游返回 {det.status ?? "—"}</div>
+                                <div className="font-mono break-all">
+                                  {det.url}
+                                </div>
+                                {det.note && <div>{det.note}</div>}
+                              </div>
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
                       </span>
                       <Input
                         className="h-8 flex-1 font-mono text-xs"
@@ -484,6 +615,14 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
                         {isDefault && (
                           <span className="font-sans">（默认路径）</span>
                         )}
+                      </p>
+                    )}
+                    {/* 勾了、但探测说这个路径没有入口。只提醒，不替你取消勾选 ——
+                        一次网络探测不该悄悄删掉配置。 */}
+                    {checked && det?.verdict === "unsupported" && (
+                      <p className="text-destructive pl-[3.75rem] text-[11px]">
+                        检测到该路径没有入口（HTTP {det.status}
+                        ）—— 用这个协议的客户端会拿到 404。取消勾选，或改上面的路径。
                       </p>
                     )}
                   </div>

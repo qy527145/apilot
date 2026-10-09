@@ -40,7 +40,7 @@ import {
   type Protocol,
   type Provider,
 } from "@/lib/api";
-import { formatNumber } from "@/lib/utils";
+import { cn, formatNumber } from "@/lib/utils";
 
 const KIND_LABEL: Record<string, string> = {
   anthropic: "Anthropic",
@@ -76,6 +76,39 @@ export default function ProvidersPage() {
       qc.invalidateQueries({ queryKey: qk.providers });
       qc.invalidateQueries({ queryKey: qk.modelCatalog });
       toast.success("渠道已删除");
+    },
+  });
+
+  /**
+   * 就地启用 / 停用。
+   *
+   * 乐观更新：拨动开关要有立刻的反馈，而后端还要写库 + 重载注册表。
+   * 失败时回滚到拨动前的快照 —— 不回滚的话开关会停在用户以为的状态上，
+   * 而路由那边其实没变。
+   */
+  const toggle = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      api.setProviderEnabled(id, enabled),
+    onMutate: async ({ id, enabled }) => {
+      await qc.cancelQueries({ queryKey: qk.providers });
+      const prev = qc.getQueryData<Provider[]>(qk.providers);
+      qc.setQueryData<Provider[]>(qk.providers, (old) =>
+        old?.map((p) => (p.id === id ? { ...p, enabled } : p)),
+      );
+      return { prev };
+    },
+    onError: (_e, _vars, ctx) => {
+      if (ctx?.prev) qc.setQueryData(qk.providers, ctx.prev);
+    },
+    onSuccess: (_d, { enabled }) => {
+      toast.success(enabled ? "渠道已启用" : "渠道已停用", {
+        description: enabled ? undefined : "路由不会再选择它。",
+      });
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: qk.providers });
+      // 渠道的启用状态会改变模型页的候选列表。
+      qc.invalidateQueries({ queryKey: qk.modelCatalog });
     },
   });
 
@@ -146,7 +179,6 @@ export default function ProvidersPage() {
                 <TableRow>
                   <TableHead className="w-8" />
                   <TableHead>名称</TableHead>
-                  <TableHead>Tag</TableHead>
                   <TableHead>类型</TableHead>
                   <TableHead className="w-full min-w-[112px] max-w-0">
                     Base URL
@@ -179,11 +211,6 @@ export default function ProvidersPage() {
                           </Button>
                         </TableCell>
                         <TableCell className="font-medium">{p.name}</TableCell>
-                        <TableCell>
-                          <code className="text-muted-foreground text-xs">
-                            {p.tag}
-                          </code>
-                        </TableCell>
                         <TableCell>
                           <div className="space-y-1">
                             <Badge variant="outline">
@@ -235,9 +262,15 @@ export default function ProvidersPage() {
                           </div>
                         </TableCell>
                         <TableCell className="text-center">
-                          <Badge variant={p.enabled ? "success" : "secondary"}>
-                            {p.enabled ? "启用" : "停用"}
-                          </Badge>
+                          <StatusToggle
+                            provider={p}
+                            pending={
+                              toggle.isPending && toggle.variables?.id === p.id
+                            }
+                            onToggle={(enabled) =>
+                              toggle.mutate({ id: p.id, enabled })
+                            }
+                          />
                         </TableCell>
                         <TableCell className="text-right tabular-nums">
                           {formatNumber(p.priority)}
@@ -353,6 +386,55 @@ function ProbeButton({
         </Button>
       </TooltipTrigger>
       <TooltipContent>测试连通</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * 「状态」那一列的药丸开关。
+ *
+ * 用按钮而不是 `Switch`：这一列原先是个只读徽标，换成开关轨之后宽度、点击热区
+ * 都变了，而同桌还有优先级 / 权重两列数字挤在右边。药丸保持原来的视觉分量
+ * （绿=启用、灰=停用），点一下就切，且带明确的 hover 反馈。
+ */
+function StatusToggle({
+  provider,
+  pending,
+  onToggle,
+}: {
+  provider: Provider;
+  pending: boolean;
+  onToggle: (enabled: boolean) => void;
+}) {
+  const on = provider.enabled;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          disabled={pending}
+          aria-pressed={on}
+          aria-label={on ? "停用该渠道" : "启用该渠道"}
+          onClick={() => onToggle(!on)}
+          className={cn(
+            "inline-flex cursor-pointer items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium whitespace-nowrap transition-colors disabled:opacity-50",
+            on
+              ? "border-emerald-500/30 bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25"
+              : "border-transparent bg-secondary text-secondary-foreground hover:bg-secondary/80",
+          )}
+        >
+          <span
+            className={cn(
+              "size-1.5 rounded-full",
+              on ? "bg-emerald-500" : "bg-muted-foreground",
+            )}
+          />
+          {on ? "启用" : "停用"}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>
+        {on ? "点击停用 —— 路由不再选择它" : "点击启用"}
+      </TooltipContent>
     </Tooltip>
   );
 }

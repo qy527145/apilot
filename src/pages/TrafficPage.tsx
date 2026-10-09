@@ -1,11 +1,13 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, Pause, Play, RefreshCw, Trash2, X } from "lucide-react";
+import { Activity, Clock, Pause, Play, RefreshCw, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
 import { PageShell } from "@/components/layout/PageShell";
+import { FilterExprPanel } from "@/components/traffic/FilterExprPanel";
+import { TimeRangePicker } from "@/components/traffic/TimeRangePicker";
 import { LiveStreamDialog, MAX_LIVE_FRAMES, type LiveRequest } from "@/components/traffic/LiveStreamDialog";
 import { RequestDetailDialog } from "@/components/traffic/RequestDetailDialog";
 import { Badge } from "@/components/ui/badge";
@@ -19,7 +21,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -27,6 +28,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
 import {
   Table,
   TableBody,
@@ -46,6 +48,7 @@ import {
   type Protocol,
 } from "@/lib/api";
 import { useApilotEvent, type TrafficSnapshot } from "@/lib/events";
+import { buildInflightContext, compileExpr, inflightMatches } from "@/lib/logExpr";
 import {
   cn,
   formatMs,
@@ -66,9 +69,10 @@ const MAX_LIMIT = 1000;
 /** 流结束后，实时条目在内存里再留多久。够用户看完最后几帧，又不至于一直占着。 */
 const DONE_TTL_MS = 120_000;
 
-/** 时间范围快捷项。**只给下界** —— 给上界会把窗口冻在打开页面的那一刻，
- *  之后新来的请求永远不出现，而这正是监控页最不该有的行为。 */
-type RangePreset = "all" | "5m" | "1h" | "24h" | "today";
+type RangePreset = "all" | "5m" | "1h" | "24h" | "today" | "custom";
+
+/** 页签只列预设 —— 自定义是旁边那个独立控件，见 `TimeRangePicker`。 */
+const PRESETS: RangePreset[] = ["all", "5m", "1h", "24h", "today"];
 
 const RANGE_LABEL: Record<RangePreset, string> = {
   all: "不限",
@@ -76,12 +80,16 @@ const RANGE_LABEL: Record<RangePreset, string> = {
   "1h": "1 小时",
   "24h": "24 小时",
   today: "今天",
+  custom: "自定义",
 };
 
+/** 预设范围 → 起点（毫秒）。`null` = 不限。
+ *  自定义的两端由输入框给，见 `rangeBounds`。 */
 function rangeFrom(preset: RangePreset): number | null {
   const now = Date.now();
   switch (preset) {
     case "all":
+    case "custom":
       return null;
     case "5m":
       return now - 5 * 60_000;
@@ -97,7 +105,26 @@ function rangeFrom(preset: RangePreset): number | null {
   }
 }
 
-/** 去掉 URL 的 scheme，表格里一行放得下，完整值走 title。 */
+/** `datetime-local` 的值（本地时间、不带时区）→ 毫秒时间戳。
+ *  空值或非法值都当作「不设这一端」，而不是当成 0（那会筛掉一切）。 */
+function localToMs(value: string): number | null {
+  if (!value) return null;
+  const t = new Date(value).getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+/** 时间条件的最终两端：预设只给起点，自定义两端都能给。 */
+function rangeBounds(
+  preset: RangePreset,
+  customFrom: string,
+  customTo: string,
+): { from: number | null; to: number | null } {
+  if (preset === "custom") {
+    return { from: localToMs(customFrom), to: localToMs(customTo) };
+  }
+  return { from: rangeFrom(preset), to: null };
+}
+
 const hostOf = (url: string) => url.replace(/^https?:\/\//, "");
 
 export default function TrafficPage() {
@@ -111,35 +138,49 @@ export default function TrafficPage() {
   const [snapshot, setSnapshot] = useState<TrafficSnapshot | null>(null);
 
   // --- 筛选条件 ---
+  // 时间单独控（见下方的时间行）；其余是高频条件，平铺在筛选卡第一行。
   const [range, setRange] = useState<RangePreset>("all");
+  /** 自定义范围的起止，`datetime-local` 的原始值（本地时间）。 */
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
   const [client, setClient] = useState<string>(ANY);
+  /** 客户端请求时写的模型名（`request_model`）。 */
+  const [requestModel, setRequestModel] = useState<string>(ANY);
+  /** 实际路由到的模型名（`model`）。与上面是两个轴，别合并。 */
+  const [routedModel, setRoutedModel] = useState<string>(ANY);
   const [protocol, setProtocol] = useState<string>(ANY);
   const [status, setStatus] = useState<string>(ANY);
-  const [modelLike, setModelLike] = useState("");
   const [onlyStream, setOnlyStream] = useState(false);
+  /** 自定义 JS 表达式。空 = 不筛。 */
+  const [expr, setExpr] = useState("");
   const [limit, setLimit] = useState(PAGE_SIZE);
 
-  // 算一次下界，随 range 变化即可 —— 不放进每次渲染，否则 queryKey 每帧都变。
-  const from = useMemo(() => rangeFrom(range), [range]);
+  const { from, to } = useMemo(
+    () => rangeBounds(range, customFrom, customTo),
+    [range, customFrom, customTo],
+  );
 
   const filter: LogFilter = useMemo(
     () => ({
       limit,
       offset: 0,
       from,
+      to,
       client: client === ANY ? null : client,
+      request_model: requestModel === ANY ? null : requestModel,
+      model: routedModel === ANY ? null : routedModel,
       protocol: protocol === ANY ? null : (protocol as Protocol),
       status: status === ANY ? null : (status as LogStatus),
       is_stream: onlyStream ? true : null,
-      model_like: modelLike.trim() || null,
+      expr: expr.trim() || null,
     }),
-    [limit, from, client, protocol, status, onlyStream, modelLike],
+    [limit, from, to, client, requestModel, routedModel, protocol, status, onlyStream, expr],
   );
 
   // 提出来是因为删除后要按同一把键失效 —— 筛选条件在键里，写死前缀匹配不上。
   const logsKey = qk.logs(`${LOGS_QUERY_KEY}-${JSON.stringify(filter)}`);
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: logsKey,
     queryFn: () => api.queryLogs(filter),
     refetchInterval: live ? 1000 : false,
@@ -156,12 +197,46 @@ export default function TrafficPage() {
   useApilotEvent("apilot://traffic", setSnapshot);
 
   // --- 进行中的请求 ---
-  //
-  // 流式请求在整条流结束前不落库，所以这份表只能靠事件攒。
-  //
-  // 流结束后**不立刻删**，只标 `done`：用户大多正开着实时流弹窗盯着看，
-  // 一结束就把它抽走等于把看到一半的内容抢掉。由下面的过期清理负责回收。
   const [inflight, setInflight] = useState<Map<string, LiveRequest>>(new Map());
+
+  // 进入页面时查询当前正在进行的请求，补齐用户进入前已开始的请求。
+  // 这些请求不会触发 apilot://request-start（那个已经在进页面前发出去了）。
+  const inflightQuery = useQuery({
+    queryKey: ["inflight_seed"],
+    queryFn: api.getInflightRequests,
+    // 只在挂载时取一次；之后靠事件驱动维护。
+    staleTime: Infinity,
+    retry: 1,
+  });
+
+  useEffect(() => {
+    if (!inflightQuery.data) return;
+    setInflight((prev) => {
+      const next = new Map(prev);
+      for (const r of inflightQuery.data) {
+        // 只补齐之前没有的；事件已经处理过的不覆盖（那些可能有帧数据了）。
+        if (!next.has(r.request_id)) {
+          next.set(r.request_id, {
+            request_id: r.request_id,
+            ts: r.ts,
+            client: r.client,
+            model: r.model,
+            request_model: r.request_model,
+            path: r.path,
+            protocol_in: r.protocol_in,
+            provider_tag: r.provider_tag,
+            provider_name: r.provider_name,
+            upstream_url: r.upstream_url,
+            is_stream: r.is_stream,
+            frames: [],
+            done: false,
+            truncated: false,
+          });
+        }
+      }
+      return next;
+    });
+  }, [inflightQuery.data]);
 
   const markDone = (cur: LiveRequest, error?: string | null): LiveRequest => ({
     ...cur,
@@ -170,7 +245,6 @@ export default function TrafficPage() {
     error: error ?? cur.error,
   });
 
-  /** 回收看完了的条目，免得长驻进程里越攒越多。 */
   const pruneDone = (m: Map<string, LiveRequest>, now: number) => {
     for (const [id, r] of m) {
       if (r.done && now - (r.done_at ?? now) > DONE_TTL_MS) m.delete(id);
@@ -190,6 +264,8 @@ export default function TrafficPage() {
         path: p.path,
         protocol_in: p.protocol_in,
         provider_tag: p.provider_tag,
+        provider_name: p.provider_name,
+        upstream_url: p.upstream_url,
         is_stream: p.is_stream,
         frames: [],
         done: false,
@@ -202,7 +278,6 @@ export default function TrafficPage() {
   useApilotEvent("apilot://stream", (batch) => {
     setInflight((prev) => {
       const cur = prev.get(batch.request_id);
-      // 没有对应条目：缓存重放的流（不发 start）或早已过期的，忽略即可。
       if (!cur) return prev;
 
       const next = new Map(prev);
@@ -211,7 +286,6 @@ export default function TrafficPage() {
         return next;
       }
 
-      // 只留最近若干帧：前端是长驻进程，开着监控页过夜不该把内存吃光。
       next.set(batch.request_id, {
         ...cur,
         frames: [...cur.frames, ...batch.frames].slice(-MAX_LIVE_FRAMES),
@@ -226,25 +300,52 @@ export default function TrafficPage() {
       const cur = prev.get(p.request_id);
       if (!cur) return prev;
       const next = new Map(prev);
-      // 非流式请求没有逐帧内容可看，直接移走；流式的标结束、留在弹窗里。
       if (cur.is_stream) next.set(p.request_id, markDone(cur, p.error));
       else next.delete(p.request_id);
       return next;
     });
   });
 
+  // 表达式编译一次复用。空表达式编译为 null，`inflightMatches` 对 null 一律放行。
+  const compiledExpr = useMemo(() => compileExpr(expr), [expr]);
+
+  // 进行中且未结束的请求，按时间倒序（最新的在最上方）。
+  // 同时应用与历史日志相同的筛选条件 —— 筛选器对进行中请求同样生效。
+  //
+  // 表达式这边走的是前端求值（`lib/logExpr.ts`）：进行中的请求没有捕获报文、
+  // 也不分页，本地算就够了。响应侧字段一律为 null，所以只读请求侧的表达式
+  // 才能在这几行上命中。
   const inflightList = useMemo(
     () =>
       [...inflight.values()]
-        .filter((r) => !r.done)
+        .filter((r) => {
+          if (r.done) return false;
+          if (from !== null && r.ts < from) return false;
+          if (to !== null && r.ts > to) return false;
+          if (client !== ANY && r.client !== client) return false;
+          if (requestModel !== ANY && r.request_model !== requestModel) return false;
+          if (routedModel !== ANY && r.model !== routedModel) return false;
+          if (protocol !== ANY && r.protocol_in !== protocol) return false;
+          if (onlyStream && !r.is_stream) return false;
+          return inflightMatches(compiledExpr, buildInflightContext(r));
+        })
         .sort((a, b) => b.ts - a.ts),
-    [inflight],
+    [
+      inflight,
+      from,
+      to,
+      client,
+      requestModel,
+      routedModel,
+      protocol,
+      onlyStream,
+      compiledExpr,
+    ],
   );
 
   const clear = useMutation({
     mutationFn: api.clearLogs,
     onSuccess: (res) => {
-      // 详情弹窗可能正开着一条已被删掉的记录，一起关掉免得看着像卡住。
       setSelected(null);
       qc.invalidateQueries({ queryKey: logsKey });
       toast.success(`已清空 ${res.logs} 条请求日志、${res.captures} 条原文捕获`);
@@ -268,25 +369,38 @@ export default function TrafficPage() {
   const items = data?.items ?? [];
   const total = data?.total ?? 0;
 
+  // 时间这条件看**算出来的两端**而不是看选了哪个页签：自定义范围两端都空着时
+  // 其实没筛任何东西，那时不该让「清除筛选」冒出来。
   const hasFilter =
-    range !== "all" ||
+    from !== null ||
+    to !== null ||
     client !== ANY ||
+    requestModel !== ANY ||
+    routedModel !== ANY ||
     protocol !== ANY ||
     status !== ANY ||
     onlyStream ||
-    modelLike.trim() !== "";
+    expr.trim() !== "";
 
   const resetFilters = () => {
     setRange("all");
+    setCustomFrom("");
+    setCustomTo("");
     setClient(ANY);
+    setRequestModel(ANY);
+    setRoutedModel(ANY);
     setProtocol(ANY);
     setStatus(ANY);
     setOnlyStream(false);
-    setModelLike("");
+    setExpr("");
     setLimit(PAGE_SIZE);
   };
 
   const openLive = liveStream ? inflight.get(liveStream) ?? null : null;
+
+  // 表达式在后端执行，其错因（语法错、执行超时）只有查询失败时才拿得到，
+  // 顺手显示出来 —— 否则用户只能看到一个笼统的「加载失败」。
+  const errorMessage = error instanceof Error ? error.message : null;
 
   return (
     <PageShell
@@ -330,138 +444,143 @@ export default function TrafficPage() {
     >
       <div className="space-y-6">
         <Card className="py-0">
-          <CardContent className="flex flex-wrap items-center gap-3 p-3">
-            <Tabs value={range} onValueChange={(v) => setRange(v as RangePreset)}>
-              <TabsList>
-                {(Object.keys(RANGE_LABEL) as RangePreset[]).map((r) => (
-                  <TabsTrigger key={r} value={r}>
-                    {RANGE_LABEL[r]}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
+          <CardContent className="space-y-3 p-3">
+            {/* 高频筛选条件 */}
+            <div className="flex flex-wrap items-center gap-3">
+              <Select value={client} onValueChange={setClient}>
+                <SelectTrigger size="sm" className="h-8 w-36">
+                  <SelectValue placeholder="客户端" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部客户端</SelectItem>
+                  {(facets.data?.clients ?? []).map((c) => (
+                    <SelectItem key={c} value={c}>
+                      {c}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <Select value={client} onValueChange={setClient}>
-              <SelectTrigger size="sm" className="h-8 w-36">
-                <SelectValue placeholder="客户端" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>全部客户端</SelectItem>
-                {(facets.data?.clients ?? []).map((c) => (
-                  <SelectItem key={c} value={c}>
-                    {c}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              <Select value={requestModel} onValueChange={setRequestModel}>
+                <SelectTrigger size="sm" className="h-8 w-44">
+                  <SelectValue placeholder="请求模型" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部请求模型</SelectItem>
+                  {(facets.data?.models ?? []).map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {m}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <Select value={protocol} onValueChange={setProtocol}>
-              <SelectTrigger size="sm" className="h-8 w-44">
-                <SelectValue placeholder="协议" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>全部协议</SelectItem>
-                {ALL_PROTOCOLS.map((p) => (
-                  <SelectItem key={p} value={p}>
-                    {PROTOCOL_LABEL[p]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              <Select value={routedModel} onValueChange={setRoutedModel}>
+                <SelectTrigger size="sm" className="h-8 w-44">
+                  <SelectValue placeholder="实际模型" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部实际模型</SelectItem>
+                  {(facets.data?.routed_models ?? []).map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {m}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <Select value={status} onValueChange={setStatus}>
-              <SelectTrigger size="sm" className="h-8 w-32">
-                <SelectValue placeholder="状态" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY}>全部状态</SelectItem>
-                <SelectItem value="ok">只看成功</SelectItem>
-                <SelectItem value="error">只看失败</SelectItem>
-              </SelectContent>
-            </Select>
+              <Select value={protocol} onValueChange={setProtocol}>
+                <SelectTrigger size="sm" className="h-8 w-40">
+                  <SelectValue placeholder="协议" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部协议</SelectItem>
+                  {ALL_PROTOCOLS.map((p) => (
+                    <SelectItem key={p} value={p}>
+                      {PROTOCOL_LABEL[p]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <Input
-              className="h-8 w-44"
-              placeholder="模型名包含…"
-              value={modelLike}
-              onChange={(e) => setModelLike(e.target.value)}
-            />
+              <Select value={status} onValueChange={setStatus}>
+                <SelectTrigger size="sm" className="h-8 w-32">
+                  <SelectValue placeholder="状态" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ANY}>全部状态</SelectItem>
+                  <SelectItem value="ok">只看成功</SelectItem>
+                  <SelectItem value="error">只看失败</SelectItem>
+                </SelectContent>
+              </Select>
 
-            <Button
-              variant={onlyStream ? "default" : "outline"}
-              size="sm"
-              onClick={() => setOnlyStream((v) => !v)}
-            >
-              只看流式
-            </Button>
-
-            {hasFilter && (
-              <Button variant="ghost" size="sm" onClick={resetFilters}>
-                <X className="size-4" />
-                清除筛选
+              <Button
+                variant={onlyStream ? "default" : "outline"}
+                size="sm"
+                onClick={() => setOnlyStream((v) => !v)}
+              >
+                只看流式
               </Button>
-            )}
 
-            <span className="text-muted-foreground ml-auto text-xs tabular-nums">
-              共 {formatNumber(total)} 条
-            </span>
+              <FilterExprPanel value={expr} onChange={setExpr} />
+
+              {hasFilter && (
+                <Button variant="ghost" size="sm" onClick={resetFilters}>
+                  <X className="size-4" />
+                  清除筛选
+                </Button>
+              )}
+
+              <span className="text-muted-foreground ml-auto flex items-center gap-2 text-xs tabular-nums">
+                {data?.truncated && (
+                  <span
+                    className="text-amber-600 dark:text-amber-500"
+                    title="表达式会先扫最近一批日志；涉及报文内容（body / headers）的条件还受扫描预算限制，所以可能没覆盖到全部日志。缩小时间范围可以让它扫得更全。"
+                  >
+                    仅覆盖部分日志
+                  </span>
+                )}
+                共 {formatNumber(total)} 条
+              </span>
+            </div>
+
+            <Separator />
+
+            {/* 时间：单独一组，不与高频条件混在一行。 */}
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-muted-foreground flex items-center gap-1.5 text-xs">
+                <Clock className="size-3.5" />
+                时间范围
+              </span>
+              <Tabs value={range} onValueChange={(v) => setRange(v as RangePreset)}>
+                <TabsList>
+                  {PRESETS.map((r) => (
+                    <TabsTrigger key={r} value={r}>
+                      {RANGE_LABEL[r]}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+              </Tabs>
+
+              {/* 自定义与预设互斥：选中它时页签那边没有高亮的那一个。 */}
+              <TimeRangePicker
+                active={range === "custom"}
+                from={customFrom}
+                to={customTo}
+                onChange={({ from: f, to: t }) => {
+                  setCustomFrom(f);
+                  setCustomTo(t);
+                  setRange("custom");
+                }}
+                onClear={() => {
+                  setCustomFrom("");
+                  setCustomTo("");
+                  if (range === "custom") setRange("all");
+                }}
+              />
+            </div>
           </CardContent>
         </Card>
-
-        {inflightList.length > 0 && (
-          <Card className="border-emerald-500/40 py-0">
-            <CardContent className="space-y-2 p-3">
-              <p className="flex items-center gap-2 text-xs font-medium">
-                <Activity className="size-3.5 animate-pulse text-emerald-500" />
-                进行中（{inflightList.length}）
-                <span className="text-muted-foreground font-normal">
-                  这些请求还没结束，所以还不在下面的列表里
-                </span>
-              </p>
-              <div className="space-y-1">
-                {inflightList.map((r) => (
-                  <div
-                    key={r.request_id}
-                    className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border px-2 py-1.5 text-xs"
-                  >
-                    <span className="text-muted-foreground tabular-nums">
-                      {formatTime(r.ts)}
-                    </span>
-                    <span>{truncate(r.client, 14)}</span>
-                    <span className="font-mono">{r.model}</span>
-                    {r.request_model && r.request_model !== r.model && (
-                      <span
-                        className="text-muted-foreground text-[11px]"
-                        title={`客户端请求的模型：${r.request_model}`}
-                      >
-                        ← {r.request_model}
-                      </span>
-                    )}
-                    <span className="text-muted-foreground">{r.provider_tag}</span>
-                    <span className="text-muted-foreground tabular-nums">
-                      {r.frames.length} 帧
-                    </span>
-                    {r.is_stream ? (
-                      <Badge variant="success">流式</Badge>
-                    ) : (
-                      <Badge variant="secondary">非流式</Badge>
-                    )}
-                    {r.is_stream && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="ml-auto h-6 px-2 text-[11px]"
-                        onClick={() => setLiveStream(r.request_id)}
-                      >
-                        查看实时流
-                      </Button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        )}
 
         <Card className="py-0">
           <CardContent className="overflow-x-auto p-0">
@@ -470,10 +589,15 @@ export default function TrafficPage() {
                 <TableSkeleton rows={8} cols={8} />
               </div>
             ) : isError ? (
-              <div className="p-4">
+              <div className="space-y-2 p-4">
                 <ErrorState onRetry={() => refetch()} />
+                {errorMessage && (
+                  <p className="text-muted-foreground text-center text-xs">
+                    {errorMessage}
+                  </p>
+                )}
               </div>
-            ) : items.length === 0 ? (
+            ) : inflightList.length === 0 && items.length === 0 ? (
               <div className="p-6">
                 <EmptyState
                   icon={Activity}
@@ -496,7 +620,7 @@ export default function TrafficPage() {
                     <TableHead>上游</TableHead>
                     <TableHead>协议</TableHead>
                     <TableHead>渠道</TableHead>
-                    <TableHead className="text-center">状态码</TableHead>
+                    <TableHead className="text-center">状态</TableHead>
                     <TableHead className="text-right">耗时</TableHead>
                     <TableHead className="text-right">TTFB</TableHead>
                     <TableHead className="text-right">Token</TableHead>
@@ -506,25 +630,24 @@ export default function TrafficPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {items.map((r) => (
+                  {/* 进行中的请求：置顶显示，带脉冲指示器。 */}
+                  {inflightList.map((r) => (
                     <TableRow
                       key={r.request_id}
-                      className="cursor-pointer"
-                      onClick={() => setSelected(r.request_id)}
+                      className="cursor-pointer hover:bg-emerald-500/5"
+                      onClick={() => {
+                        if (r.is_stream) setLiveStream(r.request_id);
+                      }}
                     >
-                      <TableCell className="text-muted-foreground">
+                      <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
+                        <span className="mr-1.5 inline-block size-1.5 rounded-full bg-emerald-500 align-middle animate-pulse" />
                         {formatTime(r.ts)}
                       </TableCell>
-                      <TableCell>{truncate(r.client, 14)}</TableCell>
-                      <TableCell className="max-w-[180px]">
-                        <div className="truncate" title={r.model}>
-                          {r.model}
-                        </div>
-                        {/*
-                          被改写时把客户端**原本要的**露出来。少了它，"我明明发的 A，
-                          怎么按 B 计费 / 缓存"在列表上永远看不出来 —— 数据是记着的
-                          （`request_model`），只是此前只有详情弹窗里才显示。
-                        */}
+                      <TableCell className="max-w-[120px] truncate text-xs">
+                        {truncate(r.client, 14)}
+                      </TableCell>
+                      <TableCell className="max-w-[160px] text-xs">
+                        <div className="truncate font-mono">{r.model}</div>
                         {r.request_model && r.request_model !== r.model && (
                           <div
                             className="text-muted-foreground truncate text-[11px]"
@@ -533,7 +656,64 @@ export default function TrafficPage() {
                             ← {r.request_model}
                           </div>
                         )}
-                        {/* 映射改过名字时露出来 —— 上游说"模型不存在"多半是这里。 */}
+                      </TableCell>
+                      <TableCell
+                        className="text-muted-foreground max-w-[150px] truncate font-mono text-xs"
+                        title={r.path}
+                      >
+                        {r.path || "—"}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground text-xs">
+                        {r.upstream_url ? hostOf(r.upstream_url) : "—"}
+                      </TableCell>
+                      <TableCell className="text-xs whitespace-nowrap">
+                        {r.is_stream ? (
+                          <Badge variant="success">流式</Badge>
+                        ) : (
+                          <Badge variant="secondary">非流式</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell
+                        className="max-w-[140px] truncate text-xs"
+                        title={r.provider_tag ?? ""}
+                      >
+                        {r.provider_name || r.provider_tag || "—"}
+                      </TableCell>
+                      {/* 进行中的请求没有最终状态，用「进行中」占位。 */}
+                      <TableCell className="text-center">
+                        <Badge variant="secondary">进行中</Badge>
+                      </TableCell>
+                      <TableCell className="text-right text-xs">—</TableCell>
+                      <TableCell className="text-right text-xs">—</TableCell>
+                      <TableCell className="text-right text-xs">—</TableCell>
+                      <TableCell className="text-right text-xs">—</TableCell>
+                      <TableCell className="text-center text-xs">—</TableCell>
+                    </TableRow>
+                  ))}
+
+                  {/* 已完成的请求：来自数据库。 */}
+                  {items.map((r) => (
+                    <TableRow
+                      key={r.request_id}
+                      className="cursor-pointer"
+                      onClick={() => setSelected(r.request_id)}
+                    >
+                      <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
+                        {formatTime(r.ts)}
+                      </TableCell>
+                      <TableCell className="max-w-[120px] truncate text-xs">
+                        {truncate(r.client, 14)}
+                      </TableCell>
+                      <TableCell className="max-w-[160px] text-xs">
+                        <div className="truncate font-mono">{r.model}</div>
+                        {r.request_model && r.request_model !== r.model && (
+                          <div
+                            className="text-muted-foreground truncate text-[11px]"
+                            title={`客户端请求的模型：${r.request_model}`}
+                          >
+                            ← {r.request_model}
+                          </div>
+                        )}
                         {r.upstream_model && r.upstream_model !== r.model && (
                           <div
                             className="text-muted-foreground truncate text-[11px]"
@@ -568,14 +748,12 @@ export default function TrafficPage() {
                         className="max-w-[140px] truncate"
                         title={r.provider_tag ?? ""}
                       >
-                        {r.provider_tag || "—"}
+                        {r.provider_name || r.provider_tag || "—"}
                       </TableCell>
                       <TableCell className="text-center">
                         <Badge variant={r.status_code < 400 ? "success" : "destructive"}>
                           {r.status_code}
                         </Badge>
-                        {/* 上游原始状态码与返回给客户端的不同时（如上游 404 → 客户端 502），
-                            两个都摆出来，否则看着对不上会以为日志记错了。 */}
                         {r.upstream_status != null &&
                           r.upstream_status !== r.status_code && (
                             <div

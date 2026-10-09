@@ -76,6 +76,12 @@ struct Recorder {
     session: BillingSession,
     capture: Option<CaptureRecord>,
     finished: bool,
+    /// 收尾已经交给了流式那条路（`finalize_stream` + `StreamEmitter`）。
+    ///
+    /// 必须与 `finished` 分开：`handle` 把响应体交出去之后自己就返回了，
+    /// `Recorder` 随即被丢弃 —— 可那时**流才刚开始跑**。少了这个标记，
+    /// 下面 `Drop` 里的兜底清理会把一条还活着的请求当成夭折处理。
+    handed_off: bool,
 }
 
 impl Recorder {
@@ -129,6 +135,7 @@ impl Recorder {
         //
         // 流式请求不走这里 —— 它们的结束由 `StreamEmitter` 负责（流真正跑完
         // 才算结束，而 `Recorder` 早就返回了）；这里是失败路径与缓存的兜底。
+        shell.inflight.remove(&rec.request_id);
         shell
             .events
             .request_finished(&crate::traffic::stream_events::RequestFinished {
@@ -168,6 +175,31 @@ impl Recorder {
         let _ = self.session.refund();
         self.record.error_message = Some(message.into());
         self.finish(status, UnifiedUsage::default(), None);
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        if self.finished || self.handed_off {
+            return;
+        }
+
+        // 走到这里说明请求**夭折**了：客户端在网关拿到上游响应之前就断开，
+        // axum 于是把整个 handler future 丢掉 —— `finish` / `fail` 一个都轮不上。
+        //
+        // 不在这里兜一把，后果不是"少写一条日志"，而是监控页的「进行中」里从此
+        // 多一个幽灵：前端重新挂载时会用 `get_inflight_requests` 把这条拉回来，
+        // 而此后再也没有事件能把它移走（请求早就不存在了）。
+        let request_id = self.record.request_id.clone();
+        self.shell.inflight.remove(&request_id);
+        self.shell
+            .events
+            .request_finished(&crate::traffic::stream_events::RequestFinished {
+                request_id,
+                // 499 是 nginx 给"客户端关闭请求"定的码，语义与这里一致。
+                status_code: 499,
+                error: Some("请求未完成：客户端提前断开".into()),
+            });
     }
 }
 
@@ -227,6 +259,7 @@ pub async fn handle(
             ..Default::default()
         }),
         finished: false,
+        handed_off: false,
     };
 
     // ---- 1.5 全局模型替换 ----
@@ -348,19 +381,26 @@ pub async fn handle(
     // 此刻才既有生效模型、又有选定的渠道，而用户在意的正是"这一条在跑哪条路"。
     // 缓存命中在上面就返回了，所以它不会出现在「进行中」—— 那是对的，
     // 缓存命中没有过程可看。
-    shell
-        .events
-        .request_started(&crate::traffic::stream_events::RequestStarted {
-            request_id: recorder.record.request_id.clone(),
-            ts: recorder.record.ts,
-            client: recorder.record.client.clone(),
-            model: recorder.record.model.clone(),
-            request_model: recorder.record.request_model.clone(),
-            path: recorder.record.path.clone(),
-            protocol_in: protocol.as_str().to_string(),
-            provider_tag: primary.tag().to_string(),
-            is_stream: req.stream,
-        });
+    // 进行中条目要描述"这条请求真正走的那条路"，得用第一个候选，而不是 selector
+    // 选的 primary：模型策略 / 模型声明渠道会把别的渠道排到 primary 前面（primary
+    // 那时只作兜底），照 primary 填会让渠道名和上游 URL 都指向一条根本不会走的路。
+    let first = &candidates[0];
+    let started_payload = crate::traffic::stream_events::RequestStarted {
+        request_id: recorder.record.request_id.clone(),
+        ts: recorder.record.ts,
+        client: recorder.record.client.clone(),
+        model: recorder.record.model.clone(),
+        request_model: recorder.record.request_model.clone(),
+        path: recorder.record.path.clone(),
+        protocol_in: protocol.as_str().to_string(),
+        provider_tag: first.tag().to_string(),
+        provider_name: first.provider().name.clone(),
+        upstream_url: first.provider().endpoint_for(first.wire_for(protocol)),
+        is_stream: req.stream,
+    };
+    // 先写进行中快照，再广播事件：顺序保证前端任何时刻查询都不会漏掉刚进来的请求。
+    shell.inflight.insert(started_payload.clone());
+    shell.events.request_started(&started_payload);
 
     let mut last_error: Option<UpstreamError> = None;
 
@@ -469,6 +509,7 @@ pub async fn handle_raw(
             ..Default::default()
         }),
         finished: false,
+        handed_off: false,
     };
 
     // ---- 模型替换 ----
@@ -598,6 +639,7 @@ async fn forward_raw(
     let wire = outbound.wire_for(Protocol::AnthropicMessages);
     recorder.record.protocol_out = wire.as_str().to_string();
     recorder.record.provider_tag = Some(outbound.tag().to_string());
+    recorder.record.provider_id = Some(outbound.provider().id);
     recorder.record.channel_kind = Some(outbound.provider().kind.as_str().to_string());
 
     // 渠道级模型映射照样生效：客户端问的是 A，上游只认 B，那也得按 B 去问。
@@ -732,15 +774,49 @@ async fn build_candidates(
             }
         }
         None => {
-            let mut cs = vec![primary.clone()];
-            for c in &channels {
-                if c.provider.tag != primary.tag() {
+            // 没有模型策略时：如果 candidate_channels 返回了声明支持该模型的渠道，
+            // 优先用那些渠道 —— selector 的 primary 是按路由规则选的，可能根本不服务
+            // 这个模型（用户配了 A 渠道服务模型 a、B 渠道服务模型 b，请求模型 b 时
+            // selector 仍选 A，就会打到不认识 b 的渠道）。
+            //
+            // 逻辑：
+            //   - channels 里有 primary → 和原来一样，primary 排第一（稳定）。
+            //   - channels 非空但不含 primary → channels 里第一个是主渠道，
+            //     selector primary 追加到末尾作兜底（万一 channels 全挂掉）。
+            //   - channels 为空（通吃渠道 / 没有任何声明） → 原来的兜底逻辑不变。
+            let primary_in_channels = channels.iter().any(|c| c.provider.tag == primary.tag());
+
+            if !channels.is_empty() && !primary_in_channels {
+                // 有明确的模型候选，但 selector primary 不在其中：按模型候选排，
+                // selector primary 只作最后的兜底。
+                let mut cs: Vec<Arc<dyn Outbound>> = Vec::new();
+                for c in &channels {
                     if let Some(o) = shell.registry.get(&c.provider.tag) {
                         cs.push(o);
                     }
                 }
+                if cs.is_empty() {
+                    // 渠道全挂或全停用，才落回 selector。
+                    vec![primary.clone()]
+                } else {
+                    // 追加 selector primary 作兜底：模型候选全部失败时还有退路。
+                    if let Some(o) = shell.registry.get(primary.tag()) {
+                        cs.push(o);
+                    }
+                    cs
+                }
+            } else {
+                // channels 为空（通吃渠道）或 primary 本身就在 channels 里：原逻辑。
+                let mut cs = vec![primary.clone()];
+                for c in &channels {
+                    if c.provider.tag != primary.tag() {
+                        if let Some(o) = shell.registry.get(&c.provider.tag) {
+                            cs.push(o);
+                        }
+                    }
+                }
+                cs
             }
-            cs
         }
     };
 
@@ -802,6 +878,7 @@ async fn try_outbound(
     let wire = outbound.wire_for(protocol_in);
     recorder.record.protocol_out = wire.as_str().to_string();
     recorder.record.provider_tag = Some(outbound.tag().to_string());
+    recorder.record.provider_id = Some(outbound.provider().id);
     recorder.record.channel_kind = Some(outbound.provider().kind.as_str().to_string());
 
     // 渠道级模型映射：入站模型名 → 上游真实模型名。
@@ -934,6 +1011,7 @@ async fn try_outbound(
             // `finalize_stream` 再想拿，原始值已经不存在了。
             request_model: recorder.record.request_model.clone(),
             provider_tag: outbound.tag().to_string(),
+            provider_id: Some(outbound.provider().id),
             protocol_in,
             protocol_out: wire,
             channel_kind: Some(outbound.provider().kind.as_str().to_string()),
@@ -954,6 +1032,7 @@ async fn try_outbound(
         let observer = Box::new(crate::traffic::stream_events::StreamEmitter::new(
             shell.events.clone(),
             recorder.record.request_id.clone(),
+            shell.inflight.clone(),
         ));
 
         let body = translate_stream_observed(
@@ -964,6 +1043,9 @@ async fn try_outbound(
             Some(observer),
             move |outcome| finalize_stream(ctx, outcome),
         );
+
+        // 交棒给流：这行之后 `Recorder` 会被丢掉，但请求还活着。
+        recorder.handed_off = true;
 
         return Ok((status, response_headers, body).into_response());
     }
@@ -1174,6 +1256,8 @@ struct StreamContext {
     /// 少了它，监控页就只剩生效模型一个名字，"我发的 A 怎么按 B 计费"查不出来。
     request_model: String,
     provider_tag: String,
+    /// 渠道整数 id，用于日志里关联渠道名称。
+    provider_id: Option<i64>,
     protocol_in: Protocol,
     protocol_out: Protocol,
     channel_kind: Option<String>,
@@ -1201,6 +1285,7 @@ fn finalize_stream(
         model,
         request_model,
         provider_tag,
+        provider_id,
         protocol_in,
         protocol_out,
         channel_kind,
@@ -1264,6 +1349,7 @@ fn finalize_stream(
             protocol_in: protocol_in.as_str().to_string(),
             protocol_out: protocol_out.as_str().to_string(),
             provider_tag: Some(provider_tag),
+            provider_id,
             channel_kind,
             model: model.clone(),
             request_model,
@@ -1455,6 +1541,7 @@ async fn serve_from_cache(
             r.ts = crate::util::now_ms();
             // 缓存重放不走 `Recorder::finish`（它早就被丢下了），所以这里的
             // 结束事件得自己补 —— 否则前端那条「进行中」会一直挂着。
+            shell_cb.inflight.remove(&r.request_id);
             shell_cb
                 .events
                 .request_finished(&crate::traffic::stream_events::RequestFinished {
@@ -1487,13 +1574,20 @@ async fn serve_from_cache(
             c.response_headers = headers_to_json(&headers);
         }
 
+        // 与真实流式一样交棒：这条响应体的收尾由上面的回调负责。
+        recorder.handed_off = true;
+
         return (http::StatusCode::OK, headers, body).into_response();
     }
 
     let body = match shell.codecs.codec(protocol).encode_response(&response, &usage) {
         Ok(b) => Bytes::from(b),
         Err(e) => {
-            return error_response(protocol, 500, "缓存响应编码失败", &e.to_string())
+            // 这条以前直接返回、不记任何账，于是它既不在日志里，又只能靠
+            // `Recorder::drop` 兜底 —— 而兜出来的理由是"客户端断开"，与事实不符。
+            // 按其余错误路径的规矩记一笔，理由才对得上。
+            recorder.fail(500, "缓存响应编码失败");
+            return error_response(protocol, 500, "缓存响应编码失败", &e.to_string());
         }
     };
 

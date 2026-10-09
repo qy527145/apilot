@@ -139,9 +139,10 @@ impl AnthropicStreamDecoder {
                     .to_string(),
                 input: cb.get("input").cloned().unwrap_or_else(|| json!({})),
             },
-            BlockKind::Other => ContentBlock::Text {
-                text: String::new(),
-            },
+            // 未建模的块整块留着。以前退化成空文本块，那既凭空多出一个块，
+            // 又让原始内容（服务端工具的 `web_search_tool_result` 之类）在捕获里
+            // 再也看不到 —— 而流式恰恰是监控里唯一能看到这些块的地方。
+            BlockKind::Other => ContentBlock::Unmodeled { raw: cb.clone() },
         };
 
         vec![UnifiedDelta::BlockStart { index, block }]
@@ -439,7 +440,10 @@ impl StreamEncoder for AnthropicStreamEncoder {
                         self.tool_blocks.insert(*index, true);
                         json!({ "type": "tool_use", "id": id, "name": name, "input": {} })
                     }
-                    // Anthropic 没有对应的空块形态，退化成文本块。
+                    // 未建模的块原样重发：它本来就是 Anthropic 的形状，
+                    // "我们没建模"不是改它的理由。
+                    ContentBlock::Unmodeled { raw } => raw.clone(),
+                    // 其余块没有对应的空块形态，退化成文本块。
                     _ => json!({ "type": "text", "text": "" }),
                 };
 

@@ -312,6 +312,19 @@ impl StreamDecoder for ResponsesStreamDecoder {
 // 编码器
 // ---------------------------------------------------------------------------
 
+/// 一个 output_item 的种类与已累积内容。
+///
+/// 必须攒着：Codex 的 `output_item.done` 要求带**完整** item（见
+/// `codex-api/src/sse/responses.rs::process_responses_event`），
+/// 它只从 done 的 item 里取工具调用，delta 事件纯粹用于界面回显。
+#[derive(Clone)]
+enum ItemKind {
+    Message { text: String },
+    Reasoning { text: String },
+    /// `(call_id, name, arguments)`
+    Tool(String, String, String),
+}
+
 pub struct ResponsesStreamEncoder {
     id: String,
     model: String,
@@ -320,8 +333,10 @@ pub struct ResponsesStreamEncoder {
     /// IR block index → Responses output_index。
     output_index: HashMap<u32, u64>,
     next_output_index: u64,
-    /// 每个 output_index 是否已发过 output_item.added。
-    item_added: HashMap<u64, bool>,
+    /// 每个 output_index 已发过 output_item.added，且攒着它的内容。
+    items: HashMap<u64, ItemKind>,
+    /// 已经发过 done 的 output_index，避免 finish 收尾时重复发。
+    item_done: HashMap<u64, bool>,
     tool_meta: HashMap<u32, (String, String)>,
     usage: UnifiedUsage,
     finish_reason: Option<FinishReason>,
@@ -336,7 +351,8 @@ impl ResponsesStreamEncoder {
             finished: false,
             output_index: HashMap::new(),
             next_output_index: 0,
-            item_added: HashMap::new(),
+            items: HashMap::new(),
+            item_done: HashMap::new(),
             tool_meta: HashMap::new(),
             usage: UnifiedUsage::default(),
             finish_reason: None,
@@ -380,6 +396,54 @@ impl ResponsesStreamEncoder {
         self.output_index.insert(block_index, i);
         i
     }
+
+    /// 把攒下来的内容还原成 Responses 的 item 对象。
+    ///
+    /// 字段形状对齐 Codex 的 `ResponseItem`：工具调用的 `arguments` 是**字符串**而非对象，
+    /// reasoning 的 `summary` 用 `summary_text`、`encrypted_content` 即便为空也要出现
+    /// （那个字段没有 `#[serde(default)]`，缺了整个 item 反序列化就失败，Codex 只会
+    /// debug 一行日志然后把这一项丢掉）。
+    fn item_json(&self, oi: u64, kind: &ItemKind) -> Value {
+        match kind {
+            ItemKind::Message { text } => json!({
+                "type": "message",
+                "id": format!("msg_{oi}"),
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": text }],
+            }),
+            ItemKind::Reasoning { text } => json!({
+                "type": "reasoning",
+                "id": format!("rs_{oi}"),
+                "summary": [{ "type": "summary_text", "text": text }],
+                "encrypted_content": Value::Null,
+            }),
+            ItemKind::Tool(call_id, name, args) => json!({
+                "type": "function_call",
+                "id": format!("fc_{oi}"),
+                "call_id": call_id,
+                "name": name,
+                // 空参数要给 "{}"：Codex 会把它 parse 成 JSON，空串会报错。
+                "arguments": if args.is_empty() { "{}" } else { args.as_str() },
+                "status": "completed",
+            }),
+        }
+    }
+
+    fn emit_done(&mut self, oi: u64, out: &mut Vec<SseEvent>) {
+        if self.item_done.contains_key(&oi) {
+            return;
+        }
+        let Some(kind) = self.items.get(&oi).cloned() else {
+            return;
+        };
+        self.item_done.insert(oi, true);
+        let item = self.item_json(oi, &kind);
+        out.push(self.ev(
+            "response.output_item.done",
+            json!({ "output_index": oi, "item": item }),
+        ));
+    }
 }
 
 impl Default for ResponsesStreamEncoder {
@@ -404,7 +468,10 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 let oi = self.idx(*index);
                 if let ContentBlock::ToolUse { id, name, .. } = block {
                     self.tool_meta.insert(*index, (id.clone(), name.clone()));
-                    self.item_added.insert(oi, true);
+                    self.items.insert(
+                        oi,
+                        ItemKind::Tool(id.clone(), name.clone(), String::new()),
+                    );
                     out.push(self.ev(
                         "response.output_item.added",
                         json!({
@@ -424,8 +491,13 @@ impl StreamEncoder for ResponsesStreamEncoder {
             UnifiedDelta::TextDelta { index, text } => {
                 self.ensure_started(&mut out);
                 let oi = self.idx(*index);
-                if !self.item_added.contains_key(&oi) {
-                    self.item_added.insert(oi, true);
+                if !self.items.contains_key(&oi) {
+                    self.items.insert(
+                        oi,
+                        ItemKind::Message {
+                            text: String::new(),
+                        },
+                    );
                     out.push(self.ev(
                         "response.output_item.added",
                         json!({
@@ -440,6 +512,9 @@ impl StreamEncoder for ResponsesStreamEncoder {
                         }),
                     ));
                 }
+                if let Some(ItemKind::Message { text: acc }) = self.items.get_mut(&oi) {
+                    acc.push_str(text);
+                }
                 if !text.is_empty() {
                     out.push(self.ev(
                         "response.output_text.delta",
@@ -451,10 +526,36 @@ impl StreamEncoder for ResponsesStreamEncoder {
             UnifiedDelta::ThinkingDelta { index, text } => {
                 self.ensure_started(&mut out);
                 let oi = self.idx(*index);
+                // reasoning 也得先 added：Codex 收到 summary delta 时若没有 active item，
+                // 走的是 error_or_panic —— debug 构建直接 panic。
+                if !self.items.contains_key(&oi) {
+                    self.items.insert(
+                        oi,
+                        ItemKind::Reasoning {
+                            text: String::new(),
+                        },
+                    );
+                    out.push(self.ev(
+                        "response.output_item.added",
+                        json!({
+                            "output_index": oi,
+                            "item": {
+                                "type": "reasoning",
+                                "id": format!("rs_{oi}"),
+                                "summary": [],
+                                "encrypted_content": Value::Null,
+                            }
+                        }),
+                    ));
+                }
+                if let Some(ItemKind::Reasoning { text: acc }) = self.items.get_mut(&oi) {
+                    acc.push_str(text);
+                }
                 if !text.is_empty() {
                     out.push(self.ev(
                         "response.reasoning_summary_text.delta",
-                        json!({ "output_index": oi, "delta": text }),
+                        // summary_index 是必填：缺了 Codex 直接忽略这个事件。
+                        json!({ "output_index": oi, "summary_index": 0, "delta": text }),
                     ));
                 }
             }
@@ -466,13 +567,14 @@ impl StreamEncoder for ResponsesStreamEncoder {
                 self.ensure_started(&mut out);
                 let oi = self.idx(*index);
                 // 没有 BlockStart 时补一个，否则下游拿不到 call_id。
-                if !self.item_added.contains_key(&oi) {
-                    self.item_added.insert(oi, true);
+                if !self.items.contains_key(&oi) {
                     let (id, name) = self
                         .tool_meta
                         .get(index)
                         .cloned()
                         .unwrap_or_else(|| (format!("call_{oi}"), String::new()));
+                    self.items
+                        .insert(oi, ItemKind::Tool(id.clone(), name.clone(), String::new()));
                     out.push(self.ev(
                         "response.output_item.added",
                         json!({
@@ -487,20 +589,25 @@ impl StreamEncoder for ResponsesStreamEncoder {
                         }),
                     ));
                 }
+                if let Some(ItemKind::Tool(_, _, args)) = self.items.get_mut(&oi) {
+                    args.push_str(partial_json);
+                }
                 if !partial_json.is_empty() {
                     out.push(self.ev(
                         "response.function_call_arguments.delta",
-                        json!({ "output_index": oi, "delta": partial_json }),
+                        json!({
+                            "output_index": oi,
+                            "item_id": format!("fc_{oi}"),
+                            "delta": partial_json,
+                        }),
                     ));
                 }
             }
 
             UnifiedDelta::BlockStop { index } => {
-                let oi = self.output_index.get(index).copied().unwrap_or(0);
-                out.push(self.ev(
-                    "response.output_item.done",
-                    json!({ "output_index": oi }),
-                ));
+                if let Some(oi) = self.output_index.get(index).copied() {
+                    self.emit_done(oi, &mut out);
+                }
             }
 
             UnifiedDelta::Usage(u) => u.apply(&mut self.usage),
@@ -529,6 +636,20 @@ impl StreamEncoder for ResponsesStreamEncoder {
 
         let mut out = Vec::new();
         self.ensure_started(&mut out);
+
+        // 收尾补 done：Chat 协议的解码器根本不产 BlockStop（它只有 finish_reason），
+        // 跨协议过来时若不在这里兜一把，Codex 永远收不到完整 item —— 表现就是
+        // 「文字出来了、工具不执行」。按 output_index 升序，保持与上游一致的顺序。
+        let mut pending: Vec<u64> = self
+            .items
+            .keys()
+            .copied()
+            .filter(|oi| !self.item_done.contains_key(oi))
+            .collect();
+        pending.sort_unstable();
+        for oi in pending {
+            self.emit_done(oi, &mut out);
+        }
 
         let prompt_total = self
             .usage
@@ -833,5 +954,224 @@ mod tests {
             names(&events).last().unwrap(),
             "response.completed"
         );
+    }
+
+    /// Codex 只从 `output_item.done` 的 item 里取工具调用，delta 事件纯回显。
+    /// 少了 item，客户端就是「文字正常、工具不动」。
+    #[test]
+    fn output_item_done_carries_the_complete_function_call() {
+        let mut enc = ResponsesStreamEncoder::new();
+        let events = encode_all(
+            &mut enc,
+            &[
+                UnifiedDelta::BlockStart {
+                    index: 0,
+                    block: ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "exec_command".into(),
+                        input: json!({}),
+                    },
+                },
+                UnifiedDelta::ToolInputDelta {
+                    index: 0,
+                    partial_json: r#"{"cmd":"#.into(),
+                },
+                UnifiedDelta::ToolInputDelta {
+                    index: 0,
+                    partial_json: r#""ls"}"#.into(),
+                },
+                UnifiedDelta::BlockStop { index: 0 },
+            ],
+        );
+
+        let done = events
+            .iter()
+            .find(|e| e.event.as_deref() == Some("response.output_item.done"))
+            .expect("必须发 output_item.done");
+        let v: Value = done.json().unwrap();
+        assert_eq!(v["item"]["type"], "function_call");
+        assert_eq!(v["item"]["call_id"], "call_1");
+        assert_eq!(v["item"]["name"], "exec_command");
+        // arguments 必须是拼全的字符串，不是对象、不是分片。
+        assert_eq!(v["item"]["arguments"], r#"{"cmd":"ls"}"#);
+    }
+
+    /// Chat 协议的解码器不产 BlockStop（它只有 finish_reason），
+    /// 跨协议到 Responses 时必须由 `finish()` 兜底补齐 done。
+    #[test]
+    fn finish_flushes_items_that_never_got_a_block_stop() {
+        let mut enc = ResponsesStreamEncoder::new();
+        // 刻意不发 BlockStop，模拟 oai_chat → responses 的真实序列。
+        let events = encode_all(
+            &mut enc,
+            &[
+                UnifiedDelta::BlockStart {
+                    index: 2,
+                    block: ContentBlock::ToolUse {
+                        id: "call_9".into(),
+                        name: "shell".into(),
+                        input: json!({}),
+                    },
+                },
+                UnifiedDelta::ToolInputDelta {
+                    index: 2,
+                    partial_json: r#"{"a":1}"#.into(),
+                },
+                UnifiedDelta::Finish(FinishReason::ToolUse),
+            ],
+        );
+
+        let done: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.event.as_deref() == Some("response.output_item.done"))
+            .collect();
+        assert_eq!(done.len(), 1, "收尾必须补且只补一次 done");
+        let v: Value = done[0].json().unwrap();
+        assert_eq!(v["item"]["call_id"], "call_9");
+        assert_eq!(v["item"]["arguments"], r#"{"a":1}"#);
+
+        // done 必须排在 response.completed 之前，否则客户端已经收尾了。
+        let order = names(&events);
+        let di = order
+            .iter()
+            .position(|n| n == "response.output_item.done")
+            .unwrap();
+        let ci = order
+            .iter()
+            .position(|n| n == "response.completed")
+            .unwrap();
+        assert!(di < ci);
+    }
+
+    /// 空参数要给 `"{}"`：Codex 会把 arguments 当 JSON 解析，空串直接报错。
+    #[test]
+    fn empty_tool_arguments_become_an_empty_object() {
+        let mut enc = ResponsesStreamEncoder::new();
+        let events = encode_all(
+            &mut enc,
+            &[
+                UnifiedDelta::BlockStart {
+                    index: 0,
+                    block: ContentBlock::ToolUse {
+                        id: "c".into(),
+                        name: "now".into(),
+                        input: json!({}),
+                    },
+                },
+                UnifiedDelta::BlockStop { index: 0 },
+            ],
+        );
+        let v: Value = events
+            .iter()
+            .find(|e| e.event.as_deref() == Some("response.output_item.done"))
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(v["item"]["arguments"], "{}");
+    }
+
+    /// 文本也要收尾成 message item：Codex 的历史是从 done 的 item 攒的。
+    #[test]
+    fn text_item_done_carries_output_text() {
+        let mut enc = ResponsesStreamEncoder::new();
+        let events = encode_all(
+            &mut enc,
+            &[
+                UnifiedDelta::text(0, "你好"),
+                UnifiedDelta::text(0, "世界"),
+                UnifiedDelta::BlockStop { index: 0 },
+            ],
+        );
+        let v: Value = events
+            .iter()
+            .find(|e| e.event.as_deref() == Some("response.output_item.done"))
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(v["item"]["type"], "message");
+        assert_eq!(v["item"]["content"][0]["type"], "output_text");
+        assert_eq!(v["item"]["content"][0]["text"], "你好世界");
+    }
+
+    /// reasoning delta 必须带 summary_index，且前面要有 output_item.added ——
+    /// Codex 收到没有 active item 的 summary delta 会走 error_or_panic。
+    #[test]
+    fn reasoning_delta_has_summary_index_and_an_added_item() {
+        let mut enc = ResponsesStreamEncoder::new();
+        let events = encode_all(
+            &mut enc,
+            &[
+                UnifiedDelta::ThinkingDelta {
+                    index: 0,
+                    text: "想一下".into(),
+                },
+                UnifiedDelta::BlockStop { index: 0 },
+            ],
+        );
+
+        let order = names(&events);
+        let ai = order
+            .iter()
+            .position(|n| n == "response.output_item.added")
+            .expect("reasoning 也要先 added");
+        let di = order
+            .iter()
+            .position(|n| n == "response.reasoning_summary_text.delta")
+            .unwrap();
+        assert!(ai < di, "added 必须早于 summary delta");
+
+        let added: Value = events[ai].json().unwrap();
+        assert_eq!(added["item"]["type"], "reasoning");
+
+        let delta: Value = events[di].json().unwrap();
+        assert_eq!(delta["summary_index"], 0);
+
+        let done: Value = events
+            .iter()
+            .find(|e| e.event.as_deref() == Some("response.output_item.done"))
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(done["item"]["summary"][0]["type"], "summary_text");
+        assert_eq!(done["item"]["summary"][0]["text"], "想一下");
+        // encrypted_content 字段没有 serde default，缺了 Codex 整个 item 解不出来。
+        assert!(done["item"].get("encrypted_content").is_some());
+    }
+
+    /// 工具的 done 里带回 item 后，解码器应能把它还原成同样的 IR。
+    #[test]
+    fn encoded_tool_call_decodes_back_to_the_same_ir() {
+        let mut enc = ResponsesStreamEncoder::new();
+        let events = encode_all(
+            &mut enc,
+            &[
+                UnifiedDelta::BlockStart {
+                    index: 0,
+                    block: ContentBlock::ToolUse {
+                        id: "call_7".into(),
+                        name: "grep".into(),
+                        input: json!({}),
+                    },
+                },
+                UnifiedDelta::ToolInputDelta {
+                    index: 0,
+                    partial_json: r#"{"q":"x"}"#.into(),
+                },
+                UnifiedDelta::BlockStop { index: 0 },
+            ],
+        );
+
+        let mut dec = ResponsesStreamDecoder::new();
+        let deltas = decode_all(&mut dec, &events);
+        let started = deltas.iter().any(|d| {
+            matches!(
+                d,
+                UnifiedDelta::BlockStart {
+                    block: ContentBlock::ToolUse { id, name, .. },
+                    ..
+                } if id == "call_7" && name == "grep"
+            )
+        });
+        assert!(started, "应还原出同样的工具调用");
     }
 }

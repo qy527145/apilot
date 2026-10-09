@@ -116,6 +116,10 @@ fn block_text(block: &crate::protocol::dto::ContentBlock) -> String {
             let inner: String = content.iter().map(block_text).collect();
             format!("<tool_result:{tool_use_id}:{is_error}>{inner}")
         }
+        // 未建模的块也要进键。两个只差一份附件的请求绝不能命中同一条缓存 ——
+        // 这正是"键必须覆盖所有影响输出的因素"要防的事。
+        // `Value` 的对象是 BTreeMap，序列化结果对同一份内容稳定，可以直接入哈希。
+        ContentBlock::Unmodeled { raw } => format!("<unmodeled>{raw}"),
     }
 }
 
@@ -155,6 +159,26 @@ mod tests {
         assert_ne!(
             cache_key(Protocol::AnthropicMessages, &base()),
             cache_key(Protocol::AnthropicMessages, &r)
+        );
+    }
+
+    #[test]
+    fn unmodeled_blocks_are_folded_into_the_key() {
+        // 未建模的块（附件 `document` 之类）同样影响输出，必须计入 ——
+        // 两个只差一份附件的请求共用缓存会答非所问。
+        let with = |title: &str| {
+            let mut r = base();
+            r.messages[0].content.push(ContentBlock::Unmodeled {
+                raw: json!({ "type": "document", "title": title }),
+            });
+            cache_key(Protocol::AnthropicMessages, &r)
+        };
+
+        assert_ne!(with("a.pdf"), with("b.pdf"), "附件不同就是不同的请求");
+        assert_ne!(
+            with("a.pdf"),
+            cache_key(Protocol::AnthropicMessages, &base()),
+            "有没有这个块也是不同的请求"
         );
     }
 

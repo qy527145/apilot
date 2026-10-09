@@ -222,10 +222,11 @@ fn decode_part(v: &Value) -> Result<ContentBlock, ConvertError> {
         "refusal" => Ok(ContentBlock::text(
             v.get("refusal").and_then(|r| r.as_str()).unwrap_or_default(),
         )),
-        other => Err(ConvertError::decode_request(
-            P,
-            format!("未知的 content part 类型: {other}"),
-        )),
+        // 同 anthropic 那侧：不认识的 part 整块留着，不拒收整个请求。
+        other => {
+            tracing::debug!(part_type = other, "未建模的 content part 类型，整块原样保留");
+            Ok(ContentBlock::Unmodeled { raw: v.clone() })
+        }
     }
 }
 
@@ -427,6 +428,9 @@ fn encode_block(b: &ContentBlock) -> Value {
             json!({ "type": "text", "text": text })
         }
         ContentBlock::RedactedThinking { .. } => json!({ "type": "text", "text": "" }),
+        // Chat 没有能装下它的位置，只能丢 —— 与加密思考同一个处置。
+        // 直通时走不到这里，所以"没建模"不等于"内容一定会丢"。
+        ContentBlock::Unmodeled { .. } => json!({ "type": "text", "text": "" }),
     }
 }
 

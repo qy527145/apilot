@@ -77,6 +77,23 @@ impl ClientId {
         }
     }
 
+    /// [`ClientId::stored_base_url`] 的逆运算：把配置里记着的那份取回成 base_url。
+    ///
+    /// 只在「网关没在跑」时用（见 [`reapply_taken_over`]）：那时没有真实地址可写，
+    /// 而地址这一项本来就不该在策略变更里变，拿配置里现有的值回写等于保持原样。
+    /// 两边必须成对维护 —— 有往返测试钉着。
+    pub fn base_url_from_stored(&self, stored: &str) -> String {
+        match self {
+            // 那个 `/v1` 后缀是 `stored_base_url` 加上去的，取回来时要去掉。
+            Self::Codex => match stored.trim_end_matches('/').strip_suffix("/v1") {
+                Some(rest) => rest.to_string(),
+                None => stored.to_string(),
+            },
+            // 另外两个存的就是 base_url 本身。
+            Self::ClaudeCode | Self::GeminiCli => stored.to_string(),
+        }
+    }
+
     /// 该客户端是否已安装（配置文件存在即认为装了）。
     pub fn detect(&self) -> bool {
         self.config_paths().iter().any(|p| p.exists())
@@ -105,6 +122,15 @@ impl ClientId {
     /// 该客户端是否处于被接管状态（有首次写入备份）。
     pub fn is_taken_over(&self, engine: &TakeoverEngine) -> bool {
         self.config_paths().iter().any(|p| engine.is_taken_over(p))
+    }
+
+    /// 该客户端会不会消费 [`ClientPlan`]（模型名 / 目录）。
+    ///
+    /// 目前只有 Codex —— 另外两个的 `plan_*` 压根不接这个参数（Claude 那边我们反而
+    /// 在**清掉**模型覆盖键）。策略变更后的重写据此过滤：少了它，改一次 Codex 的策略
+    /// 会顺带把 Claude 配置里用户手加的 `ANTHROPIC_DEFAULT_*` 清掉一遍。
+    pub fn consumes_client_plan(&self) -> bool {
+        matches!(self, Self::Codex)
     }
 }
 
@@ -187,8 +213,8 @@ pub fn describe_all(engine: &TakeoverEngine) -> Vec<ClientInfo> {
 /// 太脆。
 ///
 /// `settings` 用来取每个客户端各自要写的模型名（`AppSettings::client_model` 是按客户端
-/// 算的 —— 模型策略允许给单个客户端单独指定）。判据只看地址，所以改开关本身不会触发
-/// 写入：改完开关要重新接管一次才生效。
+/// 算的 —— 模型策略允许给单个客户端单独指定）。判据**只看地址**：策略变了而地址没变
+/// 时这里不动 —— 那是 [`reapply_taken_over`] 的活。
 pub fn repoint_taken_over(
     base_url: &str,
     settings: &crate::config::AppSettings,
@@ -220,6 +246,89 @@ pub fn repoint_taken_over(
         // 走 commit 而不是直接写：备份是「还原」的唯一依据，这里必须和接管同一条路径，
         // 否则重新指向之后再点还原就找不到原始文件了。已备份过时 commit 不会覆盖备份。
         engine.commit(&plan, &patches)?;
+        changed.push(id);
+    }
+
+    Ok(changed)
+}
+
+// ---------------------------------------------------------------------------
+// 策略变更后重写
+// ---------------------------------------------------------------------------
+
+/// 这次设置改动会不会改变「往客户端写什么」。
+///
+/// 只看 [`ClientPlan`] 真正读的那两样：接管模式，以及每个客户端的模型名
+/// （`AppSettings::client_model`）。不看整份设置 —— 改端口、超时、缓存都不该
+/// 触发客户端配置重写。
+pub fn plan_inputs_differ(
+    before: &crate::config::AppSettings,
+    after: &crate::config::AppSettings,
+) -> bool {
+    before.client_model_mode != after.client_model_mode
+        || all_clients()
+            .iter()
+            .any(|c| before.client_model(c.as_str()) != after.client_model(c.as_str()))
+}
+
+/// 策略变更后，把**已接管**的客户端按新策略重写一遍。
+///
+/// 与 [`repoint_taken_over`] 的分工：那个是"网关换地址了"，判据只看地址；这个是
+/// "用户改了接管策略 / 模型替换策略" —— 必须在改完那一刻落地。否则用户看到的是
+/// 「我选了两个都写，客户端一点变化都没有」，而界面上并没有第二个「接管」按钮
+/// （已接管的行显示的是「还原」），等于没有补救手段。
+///
+/// 只碰**会消费 `ClientPlan`** 的客户端（见 [`ClientId::consumes_client_plan`]），
+/// 且产出与现状一致时一个字节都不写 —— 策略开关可能被来回拨，每次都重写一遍会让
+/// "这文件是谁改的"变得没法解释。
+///
+/// `base_url` 是网关**真正在跑**的地址；传 `None`（网关没起）时退回客户端配置里
+/// 现存的那个 —— 地址本来就不该在这次改动里变，拿它回写等于保持原样，总好过让
+/// 整次改动落空。
+pub fn reapply_taken_over(
+    base_url: Option<&str>,
+    settings: &crate::config::AppSettings,
+) -> AppResult<Vec<ClientId>> {
+    let engine = TakeoverEngine::new();
+    let mut changed = Vec::new();
+
+    for id in all_clients() {
+        if !id.consumes_client_plan() || !id.is_taken_over(&engine) {
+            continue;
+        }
+
+        let target = match base_url {
+            Some(url) => url.to_string(),
+            None => match id.current_base_url() {
+                Some(stored) => id.base_url_from_stored(&stored),
+                // 接管过却读不出地址：配置文件被改坏了。不猜地址，跳过。
+                None => continue,
+            },
+        };
+
+        let plan = ClientPlan::from_settings(settings, id.as_str());
+        let patches = id.plan_apply(&target, plan)?;
+
+        // 逐字节比：`plan_*` 是**按我们拥有的键**打补丁（其余内容原样保留），所以
+        // "产出 ≠ 现状"等价于"我们写进去的某个值不对"，不会把用户自己加的东西
+        // 误判成需要重写。
+        let mut stale = false;
+        for p in &patches {
+            if patch::read_optional(&p.path)?.as_deref() != p.content.as_deref() {
+                stale = true;
+                break;
+            }
+        }
+        if !stale {
+            continue;
+        }
+
+        let commit_plan = TakeoverPlan {
+            client: id.display_name().to_string(),
+            files: Vec::new(),
+        };
+        // 与接管走同一条 commit：备份是「还原」的唯一依据，已备份过时不会覆盖。
+        engine.commit(&commit_plan, &patches)?;
         changed.push(id);
     }
 
@@ -773,5 +882,119 @@ keep_me = true
         let p = &ClientId::Codex.config_paths()[0];
         assert!(p.to_string_lossy().contains(".codex"));
         assert!(p.to_string_lossy().ends_with("config.toml"));
+    }
+
+    // --- 策略变更后的自动重写 ---
+
+    use crate::config::settings::{ClientModelMode, ModelPolicyMode};
+
+    /// 造一份只关心「往客户端写什么」的设置。
+    fn plan_settings(
+        model: Option<&str>,
+        mode: ModelPolicyMode,
+        client_mode: ClientModelMode,
+    ) -> crate::config::AppSettings {
+        crate::config::AppSettings {
+            client_model_mode: client_mode,
+            model_policy: crate::config::settings::ModelPolicy {
+                mode,
+                active_model: model.map(str::to_string),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn base_url_survives_the_stored_round_trip() {
+        // 网关没在跑时 `reapply_taken_over` 靠它把配置里那份取回来当 base_url 用。
+        // 取回来的值与原值不一致 = 一次策略变更会把客户端指向错地址。
+        // 网关的 base_url 由 host:port 拼成，不带尾斜杠。
+        let url = "http://127.0.0.1:8787";
+        for id in [ClientId::ClaudeCode, ClientId::Codex, ClientId::GeminiCli] {
+            let stored = id.stored_base_url(url);
+            assert_eq!(id.base_url_from_stored(&stored), url, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn only_codex_consumes_the_client_plan() {
+        // 策略（模型名 / 目录）只写进 Codex 的配置。钉住"策略变更只重写 Codex"，
+        // 免得以后给 Claude 注入模型时忘了同时改 `plan_claude` 与这里。
+        assert!(ClientId::Codex.consumes_client_plan());
+        assert!(!ClientId::ClaudeCode.consumes_client_plan());
+        assert!(!ClientId::GeminiCli.consumes_client_plan());
+    }
+
+    #[test]
+    fn plan_inputs_only_differ_on_what_actually_gets_written() {
+        let base = plan_settings(
+            Some("deepseek-chat"),
+            ModelPolicyMode::Fallback,
+            ClientModelMode::Both,
+        );
+
+        // 与客户端配置无关的改动：不触发重写。
+        let mut unrelated = base.clone();
+        unrelated.listen_port = 9999;
+        unrelated.cache_enabled = !base.cache_enabled;
+        assert!(!plan_inputs_differ(&base, &unrelated));
+
+        // 接管模式变了 → 重写。
+        let mut mode = base.clone();
+        mode.client_model_mode = ClientModelMode::Off;
+        assert!(plan_inputs_differ(&base, &mode));
+
+        // 模型名变了 → 重写（它写进 Codex 的 `model` 键）。
+        let mut renamed = base.clone();
+        renamed.model_policy.active_model = Some("deepseek-reasoner".into());
+        assert!(plan_inputs_differ(&base, &renamed));
+    }
+
+    #[test]
+    fn a_model_that_is_never_written_does_not_count_as_a_change() {
+        // passthrough 下没有"Apilot 指定的模型名"可写（`client_model` 返回 None），
+        // 改 active_model 不该触发重写 —— 否则在模型页随便动一下都会重写客户端配置。
+        let before = plan_settings(Some("a"), ModelPolicyMode::Passthrough, ClientModelMode::Both);
+        let mut after = before.clone();
+        after.model_policy.active_model = Some("b".into());
+        assert!(!plan_inputs_differ(&before, &after));
+    }
+
+    #[test]
+    fn reapplying_the_same_plan_is_a_no_op() {
+        // 「产出与现状一致就不写」靠的是计划幂等：不幂等的话，改一次策略之后每次
+        // 保存设置都会重写一遍客户端配置，而文件里看不出是谁改的。
+        let plan = ClientPlan {
+            model: Some("m"),
+            catalog: true,
+        };
+        let once = codex_config(b"", "http://127.0.0.1:8787", plan).unwrap();
+        let twice = codex_config(&once, "http://127.0.0.1:8787", plan).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn switching_the_strategy_changes_the_bytes() {
+        // 反过来：换策略必须产出不同的字节，否则自动重写就是空转。
+        let on = codex_config(
+            b"",
+            "http://127.0.0.1:8787",
+            ClientPlan {
+                model: Some("m"),
+                catalog: true,
+            },
+        )
+        .unwrap();
+        let off = codex_config(
+            &on,
+            "http://127.0.0.1:8787",
+            ClientPlan {
+                model: Some("m"),
+                catalog: false,
+            },
+        )
+        .unwrap();
+        assert_ne!(on, off, "关掉目录必须改文件");
     }
 }

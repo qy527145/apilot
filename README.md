@@ -118,6 +118,83 @@ cargo build           # 构建二进制
 
 测试覆盖到了协议转换的字段等价性、SSE 跨 chunk 的 UTF-8 边界、规则链求值顺序、计费公式、接管补丁的解析失败拒绝写入，以及**真实 HTTP 的端到端链路**（起一个假上游，跑通出站 → 流式转码 → 下游）。
 
+### 打包安装包
+
+命令名指的是**目标平台**，不是「必须在哪个系统上跑」—— 同一个 `build:win`，在 Windows 上是本机编译，
+在 macOS / Linux 上走交叉编译：
+
+```bash
+bun run build          # 按当前操作系统自动选择
+bun run build:win      # Windows 安装包
+bun run build:mac      # macOS 安装包
+bun run build:linux    # Linux 安装包
+bun run build:web      # 只构建前端（tsc && vite build）
+```
+
+| 目标 | 本机构建 | 交叉编译 |
+|---|---|---|
+| Windows | msi + nsis(`.exe`) | **macOS / Linux 可出 nsis**；msi 不行，WiX 是 Windows 独占的 |
+| macOS | app + dmg | 不行 —— hdiutil / codesign / iconutil 只有 macOS 有 |
+| Linux | deb + rpm + AppImage | 不行 —— 打包工具链是 Linux 独占的 |
+
+产物在 `src-tauri/target/release/bundle/`，交叉编译的在 `src-tauri/target/<三元组>/release/bundle/`；
+脚本跑完会把安装包路径与大小列出来。
+
+从 macOS 交叉编 Windows 安装包需要这几样：
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin
+brew install llvm makensis     # clang-cl / llvm-rc / lld-link 与 NSIS 的 makensis
+```
+
+`scripts/build.mjs` 会自动把 brew 的 LLVM 目录补进 PATH —— `clang-cl` 与 `llvm-rc` 不在默认 PATH 上，
+而 cargo-xwin 是按名字找它们的。编译用的 MSVC 运行库与 Windows SDK 由 cargo-xwin 从 nuget 拉，
+缓存在 `~/Library/Caches/cargo-xwin`（首次约 1 GB，之后复用）。
+
+这条路由 Tauri 官方标注为**实验性**：链接走 lld-link，最后一步交给 makensis，产物只有一个 nsis 的 `.exe`。
+从 Windows 本机构建时若用 Git Bash，先 `source scripts/msvc-env.sh`，否则会在链接阶段失败。
+
+平台判定、交叉工具链预检与参数透传都在 [scripts/build.mjs](scripts/build.mjs)：
+`bun run build -- --debug` 这类额外参数原样转给 `tauri build`。
+
+### CI 打包
+
+推一个 `v*` 标签（或在 Actions 页面手动触发）会让 GitHub 上的三个 runner 各自**本机**出一份安装包：
+
+| 触发方式 | 结果 |
+|---|---|
+| 推 tag `v0.2.0` | macOS dmg / Linux deb+rpm+AppImage / Windows msi+nsis，挂到一个**草稿** Release，需手动点一下发布 |
+| 手动 dispatch | 只作为 workflow artifact，供下载自取 |
+
+版本号必须四处一致（tag、`tauri.conf.json`、`Cargo.toml`、`package.json`），不一致会在编译前就失败 ——
+安装包文件名取自 `tauri.conf.json`，对不上就会得到一个「标签与文件名互相矛盾」的 Release。
+
+四处一起改用 [scripts/upgrade.mjs](scripts/upgrade.mjs)：
+
+```bash
+bun run upgrade                # 只诊断：列出四处当前版本号，不一致时点出来
+bun run upgrade patch          # 0.1.1 → 0.1.2，顺带提交并打标签 v0.1.2
+bun run upgrade minor          # 0.1.1 → 0.2.0（major 同理）
+bun run upgrade 0.2.0          # 直接指定，也可以用来把四处重新对齐
+bun run upgrade patch --push   # 连提交带标签推到远端，直接触发上面这套 CI
+```
+
+`Cargo.lock` 里根包的版本也由它一并改掉 —— 漏掉它不会当场报错，但下次 `cargo build` 会顺手改一遍
+这个文件，于是「没动代码工作区却是脏的」，事后很难归因。
+
+默认会提交（只提交这四处，不会卷进你预暂存的其他文件）并打标签，**不会推远端**；推之前可以先看看。
+
+目前不签名：macOS 的 dmg 未公证、Windows 的 exe 无代码签名，用户首次打开会看到系统的「未知开发者」提示。
+
+配置在 [.github/workflows/build-installers.yml](.github/workflows/build-installers.yml)。
+
+挂载在一个独立的 `publish` job 里：等三个平台都构建成功，再按 tag 找到（或创建）那个 Release，
+逐个上传安装包 —— 不在三个构建 job 里各挂一次，那样谁先构建完谁建 Release，失败也会散在三处。
+
+想重跑同一个版本：把四处版本号改成新号码再推新标签（推荐），或删掉远程标签重推 ——
+`publish` 会复用同名 Release 并把同名资产换成新的。
+
 ### 环境说明
 
 本机有两处特殊配置，已在仓库里处理好：

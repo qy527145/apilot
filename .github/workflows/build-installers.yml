@@ -1,0 +1,189 @@
+name: 构建安装包
+
+# 只在「人主动发起」时跑：推 v* 标签，或在 Actions 页面手动触发。
+# 不挂 push/PR —— 三平台全量构建要几十分钟，日常提交不值得付这个成本。
+#
+#   推 tag v0.2.0  → 三平台打包，安装包挂到一个**草稿** Release（要人点一下才对外可见）
+#   手动 dispatch  → 三平台打包，产物作为 workflow artifact 供下载自取
+#
+# 三个平台各在自己的 runner 上**本机**编译，所以 scripts/build.mjs 的交叉编译分支在这里
+# 用不上（那是给「在 macOS 上出 Windows 包」准备的），CI 与本地走的是同一条 `tauri build`。
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+# 建 Release、传资产要写权限，其余一律不给。
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: 校验版本号
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # 版本号散在四处：tag、tauri.conf.json（决定安装包文件名）、Cargo.toml（进二进制）、
+      # package.json。对不上就会产出「标签写 v0.2.0、文件名叫 0.1.0」的 Release，事后极难解释，
+      # 所以宁可在这里失败 —— 校验只花十几秒，排在几十分钟的编译之前。
+      #
+      # 条件写在 step 上而不是 job 上：job 被 skip 会让 needs 它的 build 一起被 skip
+      # （依赖被跳过时依赖方也跳过），那样手动触发就一个包都不会出。
+      - name: tag 与三处版本号必须一致
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cargo=$(awk -F'"' '/^version *=/{print $2; exit}' src-tauri/Cargo.toml)
+          pkg=$(node -p "require('./package.json').version")
+          echo "tag=v$tag  tauri.conf.json=$conf  Cargo.toml=$cargo  package.json=$pkg"
+
+          bad=""
+          [ "$conf"  = "$tag" ] || bad="$bad  src-tauri/tauri.conf.json($conf)"
+          [ "$cargo" = "$tag" ] || bad="$bad  src-tauri/Cargo.toml($cargo)"
+          [ "$pkg"   = "$tag" ] || bad="$bad  package.json($pkg)"
+          if [ -n "$bad" ]; then
+            echo "::error::tag v$tag 与仓库里的版本号不一致：$bad 。先统一版本号再重打标签。"
+            exit 1
+          fi
+
+  build:
+    name: 打包 ${{ matrix.label }}
+    needs: verify
+    strategy:
+      # 一个平台失败不该顺手取消其余平台 —— 一次跑完看到全部结果，比失败即停省事。
+      fail-fast: false
+      matrix:
+        include:
+          # 只出 Apple Silicon 的包。要连 Intel Mac 一起支持，见下面 tauri-action 那步的注释。
+          - platform: macos-latest
+            label: macOS (arm64)
+          # 固定 24.04 而不是 ubuntu-latest：apt 包名会随 Ubuntu 版本变（libappindicator3-dev
+          # 在 24.04 已被 libayatana-appindicator3-dev 取代），跟着 latest 漂会某天突然构建失败。
+          - platform: ubuntu-24.04
+            label: Linux (x86_64)
+          - platform: windows-latest
+            label: Windows (x64)
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      # Tauri 在 Linux 上动态链接 webkit2gtk，这些库 runner 镜像里没有，缺一个都会在编译中途报错。
+      - name: 装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: 装前端依赖
+        run: bun install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 只缓存 src-tauri 的 target：仓库根目录没有 Cargo 工程，缓存整个仓库是白费。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # 打包交给 tauri-action 而不是 `bun run build`：
+      #   - 每个 runner 都是目标平台本机，build.mjs 里「本机还是交叉」的分支在这里是恒等变换；
+      #   - 动作知道产物落在哪（bundle/macos/*.dmg、bundle/nsis/*-setup.exe …），能直接传成制品。
+      # 不写 tauriScript：动作自己认 bun.lock（utils.ts 里 bun.lockb / bun.lock 都查）→ 跑 `bun tauri`。
+      # 它还会替我们置 TAURI_BUNDLER_DMG_IGNORE_CI，免得 dmg 打包在 CI 里去找 Finder。
+      - name: 打包
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 目前没有签名：macOS 的 dmg 未公证、Windows 的 exe 无代码签名，用户首次打开会看到
+          # 「未知开发者」提示（macOS 上右键 → 打开可绕过）。要签名就往仓库 secrets 里加
+          # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY / APPLE_ID /
+          # APPLE_PASSWORD / APPLE_TEAM_ID，Tauri 见到这些环境变量会自动签名 + 公证。
+        with:
+          # 只构建 + 上传 workflow artifact，**Release 由下面的 publish job 挂**。
+          # 不用这个动作自带的 Release 那套（tagName/releaseName/releaseDraft）：它的 tagName 为空时
+          # 只打一行 "skipping all uploads" 就正常结束，步骤仍然是绿的 —— 出问题没有任何信号。
+          # 换成显式步骤后，每一步都留在日志里，失败即红。
+          uploadWorkflowArtifacts: true
+          # 想要 Intel Mac 的包：给 macOS 那行加 `args: --target universal-apple-darwin`，
+          # 并给上面 rust-toolchain 那步加 `targets: aarch64-apple-darwin,x86_64-apple-darwin`。
+
+  # 单开一个 job 而不是让三个平台各自往 Release 里塞：谁先构建完谁建 Release 会打架，
+  # 而且失败会散落在三个 job 里。这里等三个平台全部成功再一次性挂上去，日志只有一份。
+  publish:
+    name: 挂到草稿 Release
+    needs: build
+    # 只有推标签才发版；手动触发只出 artifact，不碰 Release。
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: 取回三个平台刚上传的制品
+        uses: actions/download-artifact@v8
+        with:
+          path: bundles
+
+      # 这一步刻意**不用** ${{ github.ref_name }} 之类的表达式取值，而是读 runner 注入的
+      # GITHUB_REF_NAME / GITHUB_REPOSITORY：同样是取 tag，shell 变量这条路有本次运行的证据
+      # （verify 那个 step 就是靠 ${GITHUB_REF_NAME#v} 取到 0.1.0 并通过的）。
+      - name: 建/更新草稿 Release 并挂上安装包
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          tag="$GITHUB_REF_NAME"
+
+          # 不用 `gh release upload <tag>`：草稿用 tag 查不到（REST 的 getReleaseByTag 对草稿
+          # 返回 404，gh 于是报 release not found），所以先按 tag 在 Release 列表里找 id，
+          # 之后一律按 id 操作。列表只查第一页 —— 这个仓库远到不了 100 个 Release。
+          id=$(gh api "repos/$repo/releases?per_page=100" \
+                 -q "[.[] | select(.tag_name == \"$tag\") | .id] | first // empty")
+
+          if [ -z "$id" ]; then
+            echo "没有 tag=$tag 的 Release，建一个草稿。"
+            # 草稿：推完标签还要人去 Release 页面点「发布」。想推完就公开，把 draft 改成 false。
+            id=$(gh api -X POST "repos/$repo/releases" \
+                   -f tag_name="$tag" -f name="Apilot $tag" \
+                   -F draft=true -F generate_release_notes=true -q .id)
+          else
+            echo "复用已有 Release id=$id。"
+          fi
+
+          # 只挑安装包本体：darwin 的 app 制品是整棵 .app 目录树，全传上去会变成几千个资产。
+          mapfile -t files < <(find bundles -type f \
+            \( -iname '*.dmg' -o -iname '*.msi' -o -iname '*.exe' \
+               -o -iname '*.deb' -o -iname '*.rpm' -o -iname '*.appimage' \) | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::bundles/ 里一个安装包都没找到，不建空 Release。"
+            exit 1
+          fi
+          printf '找到 %d 个安装包：\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+
+          for file in "${files[@]}"; do
+            name=$(basename "$file")
+            # 同名资产先删后传：同一个标签重跑时，GitHub 对重名资产返回 422。
+            old=$(gh api "repos/$repo/releases/$id/assets?per_page=100" \
+                    -q "[.[] | select(.name == \"$name\") | .id] | first // empty")
+            [ -z "$old" ] || gh api -X DELETE "repos/$repo/releases/assets/$old" >/dev/null
+            # 上传走 uploads.github.com 这个专用域名：gh api 在这条路径上会把 body 当 JSON 处理。
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$file" \
+              "https://uploads.github.com/repos/$repo/releases/$id/assets?name=$name" >/dev/null
+            echo "已挂上 $name（$(du -m "$file" | cut -f1) MB）"
+          done
+
+          echo "=== Release 现状 ==="
+          gh api "repos/$repo/releases/$id" -q '"tag=\(.tag_name)  draft=\(.draft)  资产 \(.assets | length) 个"'
+          gh api "repos/$repo/releases/$id/assets?per_page=100" -q '.[] | "  \(.name)  \(.size/1048576|floor) MB"'
+          echo "草稿要点「发布」才对用户可见：https://github.com/$repo/releases"

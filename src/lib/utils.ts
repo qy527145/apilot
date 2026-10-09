@@ -27,6 +27,14 @@ export function formatMs(n: number | null | undefined): string {
   return `${(n / 1000).toFixed(2)} s`;
 }
 
+/**
+ * 输出速度。算不出来时给「—」而不是 0 —— 0 会被读成“慢到没有”，而不是“测不出”。
+ */
+export function formatTps(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+  return `${n.toFixed(1)} tok/s`;
+}
+
 export function formatTime(ts: number | null | undefined): string {
   if (!ts) return "—";
   const d = new Date(ts);

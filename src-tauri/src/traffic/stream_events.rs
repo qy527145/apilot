@@ -156,6 +156,10 @@ pub struct RequestStarted {
     pub protocol_in: String,
     /// 主渠道 tag。
     pub provider_tag: String,
+    /// 渠道显示名称，供进行中列表直接渲染用，不依赖前端再查一次。
+    pub provider_name: String,
+    /// 请求将发往的上游 URL（endpoint_for 的结果），进行中列表用。
+    pub upstream_url: String,
     pub is_stream: bool,
 }
 
@@ -239,22 +243,34 @@ fn truncate_raw(raw: &str, limit: usize) -> (String, bool) {
 }
 
 /// 观察者实现：攒批后推 `apilot://stream`，并在收尾/断连时补一个 `done`。
+///
+/// 它同时负责把这条请求从后端的 [`InflightStore`] 里摘掉。两件事必须由同一个
+/// 对象在同一时刻做：前端那份「进行中」只是副本，底账在 [`InflightStore`] ——
+/// 只清副本、或者只发 `done` 不摘底账的话，监控页一旦重新挂载就会用
+/// `get_inflight_requests` 把这条请求原样拉回来，而此后再也没有事件能移走它。
 pub struct StreamEmitter {
     sink: Arc<dyn StreamEventSink>,
     request_id: String,
     batcher: StreamBatcher,
     finished: bool,
+    /// 后端的「进行中」表。
+    inflight: Arc<super::InflightStore>,
 }
 
 impl StreamEmitter {
-    pub fn new(sink: Arc<dyn StreamEventSink>, request_id: String) -> Self {
-        Self::with_caps(sink, request_id, BatchCaps::default())
+    pub fn new(
+        sink: Arc<dyn StreamEventSink>,
+        request_id: String,
+        inflight: Arc<super::InflightStore>,
+    ) -> Self {
+        Self::with_caps(sink, request_id, inflight, BatchCaps::default())
     }
 
     /// 自定义上限。生产用默认值，测试用它把批次缩到一两条。
     pub fn with_caps(
         sink: Arc<dyn StreamEventSink>,
         request_id: String,
+        inflight: Arc<super::InflightStore>,
         caps: BatchCaps,
     ) -> Self {
         Self {
@@ -262,7 +278,16 @@ impl StreamEmitter {
             request_id,
             batcher: StreamBatcher::new(caps),
             finished: false,
+            inflight,
         }
+    }
+
+    /// 从后端的「进行中」表里摘掉这条请求。
+    ///
+    /// `finished` 已经替我们保证了"只做一次"，所以正常收尾与断连丢弃两条路
+    /// 都调它也不会重复 —— 幂等的 `remove` 本来就允许重复调用。
+    fn retire(&self) {
+        self.inflight.remove(&self.request_id);
     }
 
     fn send(&self, frames: Vec<StreamFrame>, done: bool, error: Option<String>) {
@@ -292,6 +317,7 @@ impl StreamObserver for StreamEmitter {
             return;
         }
         self.finished = true;
+        self.retire();
         let frames = self.batcher.flush();
         self.send(frames, true, error.map(str::to_string));
     }
@@ -305,6 +331,7 @@ impl Drop for StreamEmitter {
         self.finished = true;
         // 走到这里说明流是被丢弃的：客户端断连、或者请求被取消。
         // 补一个 done 是让前端把这条从「进行中」移走的唯一可靠手段。
+        self.retire();
         let frames = self.batcher.flush();
         self.send(frames, true, Some("客户端提前断开".into()));
     }
@@ -319,6 +346,88 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<StreamEvent>>,
+    }
+
+    /// 一次性的「进行中」表。多数用例不关心它，需要断言它被摘空的用例
+    /// 会自己建一个并留住句柄。
+    fn store() -> Arc<crate::traffic::InflightStore> {
+        Arc::new(crate::traffic::InflightStore::new())
+    }
+
+    /// 往表里塞一条，模拟"请求刚开始、`RequestStarted` 已经发出去"。
+    fn started(request_id: &str) -> RequestStarted {
+        RequestStarted {
+            request_id: request_id.into(),
+            ts: 0,
+            client: "claude-code".into(),
+            model: "m".into(),
+            request_model: "m".into(),
+            path: "/v1/messages".into(),
+            protocol_in: "anthropic".into(),
+            provider_tag: "t".into(),
+            provider_name: "test".into(),
+            upstream_url: "https://api.example.com".into(),
+            is_stream: true,
+        }
+    }
+
+    #[test]
+    fn a_finished_stream_retires_the_request_from_the_inflight_store() {
+        // 正常跑完的流同样要摘。漏掉这一步的话，前端重新挂载时会从后端把这条
+        // 拉回来当成「进行中」，而它其实早就结束了。
+        let inflight = store();
+        inflight.insert(started("r1"));
+        let mut e = StreamEmitter::with_caps(
+            Arc::new(RecordingSink::default()),
+            "r1".into(),
+            inflight.clone(),
+            caps(),
+        );
+        e.on_finish(None);
+
+        assert!(inflight.snapshot().is_empty(), "收尾后底账里不该还有这条");
+    }
+
+    #[test]
+    fn a_dropped_stream_retires_the_request_from_the_inflight_store() {
+        // 客户端断连时生成器被直接丢弃，`on_finish` 不会跑 —— 这条是唯一的兜底。
+        let inflight = store();
+        inflight.insert(started("r1"));
+        {
+            let mut e = StreamEmitter::with_caps(
+                Arc::new(RecordingSink::default()),
+                "r1".into(),
+                inflight.clone(),
+                caps(),
+            );
+            e.on_event("e", &[]);
+        }
+
+        assert!(
+            inflight.snapshot().is_empty(),
+            "断连也要摘，否则这条会永远挂在监控页的「进行中」里"
+        );
+    }
+
+    #[test]
+    fn retiring_only_happens_once() {
+        // `on_finish` 之后 Drop 还会跑一次，两次 remove 不能把别的请求也带走。
+        let inflight = store();
+        inflight.insert(started("r1"));
+        inflight.insert(started("other"));
+        {
+            let mut e = StreamEmitter::with_caps(
+                Arc::new(RecordingSink::default()),
+                "r1".into(),
+                inflight.clone(),
+                caps(),
+            );
+            e.on_finish(None);
+        }
+
+        let left = inflight.snapshot();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].request_id, "other", "只摘自己那条");
     }
 
     impl RecordingSink {
@@ -429,7 +538,7 @@ mod tests {
     #[test]
     fn the_emitter_reports_every_frame_across_batches() {
         let sink = Arc::new(RecordingSink::default());
-        let mut e = StreamEmitter::with_caps(sink.clone(), "r1".into(), caps());
+        let mut e = StreamEmitter::with_caps(sink.clone(), "r1".into(), store(), caps());
         for i in 0..7 {
             e.on_event(&format!("e{i}"), &text("x"));
         }
@@ -445,7 +554,7 @@ mod tests {
     #[test]
     fn only_the_last_batch_is_marked_done() {
         let sink = Arc::new(RecordingSink::default());
-        let mut e = StreamEmitter::with_caps(sink.clone(), "r1".into(), caps());
+        let mut e = StreamEmitter::with_caps(sink.clone(), "r1".into(), store(), caps());
         for i in 0..4 {
             e.on_event(&format!("e{i}"), &[]);
         }
@@ -462,7 +571,7 @@ mod tests {
         // 客户端断连时生成器被直接丢弃，on_finish 不会跑 —— 这是唯一的兜底。
         let sink = Arc::new(RecordingSink::default());
         {
-            let mut e = StreamEmitter::with_caps(sink.clone(), "r1".into(), caps());
+            let mut e = StreamEmitter::with_caps(sink.clone(), "r1".into(), store(), caps());
             e.on_event("e", &[]);
         }
         let events = sink.snapshot();
@@ -475,7 +584,7 @@ mod tests {
     fn finishing_then_dropping_does_not_report_done_twice() {
         let sink = Arc::new(RecordingSink::default());
         {
-            let mut e = StreamEmitter::with_caps(sink.clone(), "r1".into(), caps());
+            let mut e = StreamEmitter::with_caps(sink.clone(), "r1".into(), store(), caps());
             e.on_event("e", &[]);
             e.on_finish(None);
         }
@@ -486,7 +595,7 @@ mod tests {
     #[test]
     fn a_finished_stream_carries_the_error_message() {
         let sink = Arc::new(RecordingSink::default());
-        let mut e = StreamEmitter::new(sink.clone(), "r1".into());
+        let mut e = StreamEmitter::new(sink.clone(), "r1".into(), store());
         e.on_finish(Some("上游流空闲超时"));
         let events = sink.snapshot();
         assert_eq!(events[0].error.as_deref(), Some("上游流空闲超时"));
@@ -586,7 +695,7 @@ mod tests {
     #[test]
     fn an_idle_stream_emits_nothing_until_it_ends() {
         let sink = Arc::new(RecordingSink::default());
-        let e = StreamEmitter::new(sink.clone(), "r1".into());
+        let e = StreamEmitter::new(sink.clone(), "r1".into(), store());
         drop(e);
         // 没有收到任何帧时不必发空批次，但结束了就得说一声。
         let events = sink.snapshot();
@@ -597,7 +706,7 @@ mod tests {
 
     #[test]
     fn the_buffer_stays_bounded_under_a_flood_of_frames() {        let sink = Arc::new(RecordingSink::default());
-        let mut e = StreamEmitter::new(sink.clone(), "r1".into());
+        let mut e = StreamEmitter::new(sink.clone(), "r1".into(), store());
         for _ in 0..100_000 {
             e.on_event("x", &[]);
         }
