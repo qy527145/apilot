@@ -547,6 +547,8 @@ export interface InflightRequest {
   path: string;
   protocol_in: string;
   provider_tag: string;
+  provider_name: string;
+  upstream_url: string;
   is_stream: boolean;
 }
 

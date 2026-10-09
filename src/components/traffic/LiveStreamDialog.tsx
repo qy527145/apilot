@@ -31,6 +31,7 @@ export interface LiveRequest {
   provider_tag: string;
   /** 渠道当前名称（改名后自动更新）。 */
   provider_name?: string | null;
+  upstream_url?: string | null;
   is_stream: boolean;
   frames: StreamFrame[];
   /** 流已结束（正常结束、出错或客户端断连）。 */

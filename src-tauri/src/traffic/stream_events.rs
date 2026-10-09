@@ -156,6 +156,10 @@ pub struct RequestStarted {
     pub protocol_in: String,
     /// 主渠道 tag。
     pub provider_tag: String,
+    /// 渠道显示名称，供进行中列表直接渲染用，不依赖前端再查一次。
+    pub provider_name: String,
+    /// 请求将发往的上游 URL（endpoint_for 的结果），进行中列表用。
+    pub upstream_url: String,
     pub is_stream: bool,
 }
 
@@ -361,6 +365,8 @@ mod tests {
             path: "/v1/messages".into(),
             protocol_in: "anthropic".into(),
             provider_tag: "t".into(),
+            provider_name: "test".into(),
+            upstream_url: "https://api.example.com".into(),
             is_stream: true,
         }
     }

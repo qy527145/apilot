@@ -175,6 +175,8 @@ export default function TrafficPage() {
             path: r.path,
             protocol_in: r.protocol_in,
             provider_tag: r.provider_tag,
+            provider_name: r.provider_name,
+            upstream_url: r.upstream_url,
             is_stream: r.is_stream,
             frames: [],
             done: false,
@@ -212,6 +214,8 @@ export default function TrafficPage() {
         path: p.path,
         protocol_in: p.protocol_in,
         provider_tag: p.provider_tag,
+        provider_name: p.provider_name,
+        upstream_url: p.upstream_url,
         is_stream: p.is_stream,
         frames: [],
         done: false,
@@ -489,7 +493,9 @@ export default function TrafficPage() {
                       >
                         {r.path || "—"}
                       </TableCell>
-                      <TableCell className="text-muted-foreground text-xs">—</TableCell>
+                      <TableCell className="text-muted-foreground text-xs">
+                        {r.upstream_url ? hostOf(r.upstream_url) : "—"}
+                      </TableCell>
                       <TableCell className="text-xs whitespace-nowrap">
                         {r.is_stream ? (
                           <Badge variant="success">流式</Badge>

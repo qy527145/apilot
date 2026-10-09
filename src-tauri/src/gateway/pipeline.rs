@@ -390,6 +390,8 @@ pub async fn handle(
         path: recorder.record.path.clone(),
         protocol_in: protocol.as_str().to_string(),
         provider_tag: primary.tag().to_string(),
+        provider_name: primary.provider().name.clone(),
+        upstream_url: primary.provider().endpoint_for(primary.wire_for(protocol)),
         is_stream: req.stream,
     };
     // 先写进行中快照，再广播事件：顺序保证前端任何时刻查询都不会漏掉刚进来的请求。
