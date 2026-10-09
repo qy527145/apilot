@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Pause, Play, RefreshCw, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
@@ -66,8 +66,6 @@ const MAX_LIMIT = 1000;
 /** 流结束后，实时条目在内存里再留多久。够用户看完最后几帧，又不至于一直占着。 */
 const DONE_TTL_MS = 120_000;
 
-/** 时间范围快捷项。**只给下界** —— 给上界会把窗口冻在打开页面的那一刻，
- *  之后新来的请求永远不出现，而这正是监控页最不该有的行为。 */
 type RangePreset = "all" | "5m" | "1h" | "24h" | "today";
 
 const RANGE_LABEL: Record<RangePreset, string> = {
@@ -97,7 +95,6 @@ function rangeFrom(preset: RangePreset): number | null {
   }
 }
 
-/** 去掉 URL 的 scheme，表格里一行放得下，完整值走 title。 */
 const hostOf = (url: string) => url.replace(/^https?:\/\//, "");
 
 export default function TrafficPage() {
@@ -117,7 +114,6 @@ export default function TrafficPage() {
   const [onlyStream, setOnlyStream] = useState(false);
   const [limit, setLimit] = useState(PAGE_SIZE);
 
-  // 算一次下界，随 range 变化即可 —— 不放进每次渲染，否则 queryKey 每帧都变。
   const from = useMemo(() => rangeFrom(range), [range]);
 
   const filter: LogFilter = useMemo(
@@ -151,12 +147,44 @@ export default function TrafficPage() {
   useApilotEvent("apilot://traffic", setSnapshot);
 
   // --- 进行中的请求 ---
-  //
-  // 流式请求在整条流结束前不落库，所以这份表只能靠事件攒。
-  //
-  // 流结束后**不立刻删**，只标 `done`：用户大多正开着实时流弹窗盯着看，
-  // 一结束就把它抽走等于把看到一半的内容抢掉。由下面的过期清理负责回收。
   const [inflight, setInflight] = useState<Map<string, LiveRequest>>(new Map());
+
+  // 进入页面时查询当前正在进行的请求，补齐用户进入前已开始的请求。
+  // 这些请求不会触发 apilot://request-start（那个已经在进页面前发出去了）。
+  const inflightQuery = useQuery({
+    queryKey: ["inflight_seed"],
+    queryFn: api.getInflightRequests,
+    // 只在挂载时取一次；之后靠事件驱动维护。
+    staleTime: Infinity,
+    retry: 1,
+  });
+
+  useEffect(() => {
+    if (!inflightQuery.data) return;
+    setInflight((prev) => {
+      const next = new Map(prev);
+      for (const r of inflightQuery.data) {
+        // 只补齐之前没有的；事件已经处理过的不覆盖（那些可能有帧数据了）。
+        if (!next.has(r.request_id)) {
+          next.set(r.request_id, {
+            request_id: r.request_id,
+            ts: r.ts,
+            client: r.client,
+            model: r.model,
+            request_model: r.request_model,
+            path: r.path,
+            protocol_in: r.protocol_in,
+            provider_tag: r.provider_tag,
+            is_stream: r.is_stream,
+            frames: [],
+            done: false,
+            truncated: false,
+          });
+        }
+      }
+      return next;
+    });
+  }, [inflightQuery.data]);
 
   const markDone = (cur: LiveRequest, error?: string | null): LiveRequest => ({
     ...cur,
@@ -165,7 +193,6 @@ export default function TrafficPage() {
     error: error ?? cur.error,
   });
 
-  /** 回收看完了的条目，免得长驻进程里越攒越多。 */
   const pruneDone = (m: Map<string, LiveRequest>, now: number) => {
     for (const [id, r] of m) {
       if (r.done && now - (r.done_at ?? now) > DONE_TTL_MS) m.delete(id);
@@ -197,7 +224,6 @@ export default function TrafficPage() {
   useApilotEvent("apilot://stream", (batch) => {
     setInflight((prev) => {
       const cur = prev.get(batch.request_id);
-      // 没有对应条目：缓存重放的流（不发 start）或早已过期的，忽略即可。
       if (!cur) return prev;
 
       const next = new Map(prev);
@@ -206,7 +232,6 @@ export default function TrafficPage() {
         return next;
       }
 
-      // 只留最近若干帧：前端是长驻进程，开着监控页过夜不该把内存吃光。
       next.set(batch.request_id, {
         ...cur,
         frames: [...cur.frames, ...batch.frames].slice(-MAX_LIVE_FRAMES),
@@ -221,13 +246,13 @@ export default function TrafficPage() {
       const cur = prev.get(p.request_id);
       if (!cur) return prev;
       const next = new Map(prev);
-      // 非流式请求没有逐帧内容可看，直接移走；流式的标结束、留在弹窗里。
       if (cur.is_stream) next.set(p.request_id, markDone(cur, p.error));
       else next.delete(p.request_id);
       return next;
     });
   });
 
+  // 进行中且未结束的请求，按时间倒序（最新的在最上方）。
   const inflightList = useMemo(
     () =>
       [...inflight.values()]
@@ -239,7 +264,6 @@ export default function TrafficPage() {
   const clear = useMutation({
     mutationFn: api.clearLogs,
     onSuccess: (res) => {
-      // 详情弹窗可能正开着一条已被删掉的记录，一起关掉免得看着像卡住。
       setSelected(null);
       qc.invalidateQueries({ queryKey: qk.logs(LOGS_QUERY_KEY) });
       toast.success(`已清空 ${res.logs} 条请求日志、${res.captures} 条原文捕获`);
@@ -390,61 +414,6 @@ export default function TrafficPage() {
           </CardContent>
         </Card>
 
-        {inflightList.length > 0 && (
-          <Card className="border-emerald-500/40 py-0">
-            <CardContent className="space-y-2 p-3">
-              <p className="flex items-center gap-2 text-xs font-medium">
-                <Activity className="size-3.5 animate-pulse text-emerald-500" />
-                进行中（{inflightList.length}）
-                <span className="text-muted-foreground font-normal">
-                  这些请求还没结束，所以还不在下面的列表里
-                </span>
-              </p>
-              <div className="space-y-1">
-                {inflightList.map((r) => (
-                  <div
-                    key={r.request_id}
-                    className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border px-2 py-1.5 text-xs"
-                  >
-                    <span className="text-muted-foreground tabular-nums">
-                      {formatTime(r.ts)}
-                    </span>
-                    <span>{truncate(r.client, 14)}</span>
-                    <span className="font-mono">{r.model}</span>
-                    {r.request_model && r.request_model !== r.model && (
-                      <span
-                        className="text-muted-foreground text-[11px]"
-                        title={`客户端请求的模型：${r.request_model}`}
-                      >
-                        ← {r.request_model}
-                      </span>
-                    )}
-                    <span className="text-muted-foreground">{r.provider_tag}</span>
-                    <span className="text-muted-foreground tabular-nums">
-                      {r.frames.length} 帧
-                    </span>
-                    {r.is_stream ? (
-                      <Badge variant="success">流式</Badge>
-                    ) : (
-                      <Badge variant="secondary">非流式</Badge>
-                    )}
-                    {r.is_stream && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="ml-auto h-6 px-2 text-[11px]"
-                        onClick={() => setLiveStream(r.request_id)}
-                      >
-                        查看实时流
-                      </Button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
         <Card className="py-0">
           <CardContent className="overflow-x-auto p-0">
             {isLoading ? (
@@ -455,7 +424,7 @@ export default function TrafficPage() {
               <div className="p-4">
                 <ErrorState onRetry={() => refetch()} />
               </div>
-            ) : items.length === 0 ? (
+            ) : inflightList.length === 0 && items.length === 0 ? (
               <div className="p-6">
                 <EmptyState
                   icon={Activity}
@@ -478,7 +447,7 @@ export default function TrafficPage() {
                     <TableHead>上游</TableHead>
                     <TableHead>协议</TableHead>
                     <TableHead>渠道</TableHead>
-                    <TableHead className="text-center">状态码</TableHead>
+                    <TableHead className="text-center">状态</TableHead>
                     <TableHead className="text-right">耗时</TableHead>
                     <TableHead className="text-right">TTFB</TableHead>
                     <TableHead className="text-right">Token</TableHead>
@@ -487,25 +456,24 @@ export default function TrafficPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {items.map((r) => (
+                  {/* 进行中的请求：置顶显示，带脉冲指示器。 */}
+                  {inflightList.map((r) => (
                     <TableRow
                       key={r.request_id}
-                      className="cursor-pointer"
-                      onClick={() => setSelected(r.request_id)}
+                      className="cursor-pointer hover:bg-emerald-500/5"
+                      onClick={() => {
+                        if (r.is_stream) setLiveStream(r.request_id);
+                      }}
                     >
-                      <TableCell className="text-muted-foreground">
+                      <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
+                        <span className="mr-1.5 inline-block size-1.5 rounded-full bg-emerald-500 align-middle animate-pulse" />
                         {formatTime(r.ts)}
                       </TableCell>
-                      <TableCell>{truncate(r.client, 14)}</TableCell>
-                      <TableCell className="max-w-[180px]">
-                        <div className="truncate" title={r.model}>
-                          {r.model}
-                        </div>
-                        {/*
-                          被改写时把客户端**原本要的**露出来。少了它，"我明明发的 A，
-                          怎么按 B 计费 / 缓存"在列表上永远看不出来 —— 数据是记着的
-                          （`request_model`），只是此前只有详情弹窗里才显示。
-                        */}
+                      <TableCell className="max-w-[120px] truncate text-xs">
+                        {truncate(r.client, 14)}
+                      </TableCell>
+                      <TableCell className="max-w-[160px] text-xs">
+                        <div className="truncate font-mono">{r.model}</div>
                         {r.request_model && r.request_model !== r.model && (
                           <div
                             className="text-muted-foreground truncate text-[11px]"
@@ -514,7 +482,62 @@ export default function TrafficPage() {
                             ← {r.request_model}
                           </div>
                         )}
-                        {/* 映射改过名字时露出来 —— 上游说"模型不存在"多半是这里。 */}
+                      </TableCell>
+                      <TableCell
+                        className="text-muted-foreground max-w-[150px] truncate font-mono text-xs"
+                        title={r.path}
+                      >
+                        {r.path || "—"}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground text-xs">—</TableCell>
+                      <TableCell className="text-xs whitespace-nowrap">
+                        {r.is_stream ? (
+                          <Badge variant="success">流式</Badge>
+                        ) : (
+                          <Badge variant="secondary">非流式</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell
+                        className="max-w-[140px] truncate text-xs"
+                        title={r.provider_tag}
+                      >
+                        {r.provider_tag || "—"}
+                      </TableCell>
+                      {/* 进行中的请求没有最终状态，用「进行中」占位。 */}
+                      <TableCell className="text-center">
+                        <Badge variant="secondary">进行中</Badge>
+                      </TableCell>
+                      <TableCell className="text-right text-xs">—</TableCell>
+                      <TableCell className="text-right text-xs">—</TableCell>
+                      <TableCell className="text-right text-xs">—</TableCell>
+                      <TableCell className="text-right text-xs">—</TableCell>
+                      <TableCell className="text-center text-xs">—</TableCell>
+                    </TableRow>
+                  ))}
+
+                  {/* 已完成的请求：来自数据库。 */}
+                  {items.map((r) => (
+                    <TableRow
+                      key={r.request_id}
+                      className="cursor-pointer"
+                      onClick={() => setSelected(r.request_id)}
+                    >
+                      <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
+                        {formatTime(r.ts)}
+                      </TableCell>
+                      <TableCell className="max-w-[120px] truncate text-xs">
+                        {truncate(r.client, 14)}
+                      </TableCell>
+                      <TableCell className="max-w-[160px] text-xs">
+                        <div className="truncate font-mono">{r.model}</div>
+                        {r.request_model && r.request_model !== r.model && (
+                          <div
+                            className="text-muted-foreground truncate text-[11px]"
+                            title={`客户端请求的模型：${r.request_model}`}
+                          >
+                            ← {r.request_model}
+                          </div>
+                        )}
                         {r.upstream_model && r.upstream_model !== r.model && (
                           <div
                             className="text-muted-foreground truncate text-[11px]"
@@ -555,8 +578,6 @@ export default function TrafficPage() {
                         <Badge variant={r.status_code < 400 ? "success" : "destructive"}>
                           {r.status_code}
                         </Badge>
-                        {/* 上游原始状态码与返回给客户端的不同时（如上游 404 → 客户端 502），
-                            两个都摆出来，否则看着对不上会以为日志记错了。 */}
                         {r.upstream_status != null &&
                           r.upstream_status !== r.status_code && (
                             <div

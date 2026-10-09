@@ -127,6 +127,7 @@ pub fn run() {
             commands::logs::query_logs,
             commands::logs::list_log_facets,
             commands::logs::get_request_detail,
+            commands::logs::get_inflight_requests,
             commands::logs::clear_logs,
         ])
         .build(tauri::generate_context!())

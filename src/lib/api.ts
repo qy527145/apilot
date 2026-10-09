@@ -531,6 +531,19 @@ export interface RequestLog {
   saved_quota: number;
 }
 
+/** 正在进行的请求（还没结束、尚未落库）。与后端 `RequestStarted` 对应。 */
+export interface InflightRequest {
+  request_id: string;
+  ts: number;
+  client: string;
+  model: string;
+  request_model: string;
+  path: string;
+  protocol_in: string;
+  provider_tag: string;
+  is_stream: boolean;
+}
+
 export interface Page<T> {
   items: T[];
   total: number;
@@ -1064,6 +1077,8 @@ export const api = {
   listLogFacets: () => call<LogFacets>("list_log_facets"),
   getRequestDetail: (requestId: string) =>
     call<RequestDetail>("get_request_detail", { requestId }),
+  /** 查询当前正在进行的请求。进监控页时调用一次，补齐用户进页前已开始的请求。 */
+  getInflightRequests: () => call<InflightRequest[]>("get_inflight_requests"),
   /** 清空请求明细与原文捕获。计费聚合不受影响。 */
   clearLogs: () => call<ClearResult>("clear_logs"),
 

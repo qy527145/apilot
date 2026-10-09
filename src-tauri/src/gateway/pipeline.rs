@@ -129,6 +129,7 @@ impl Recorder {
         //
         // 流式请求不走这里 —— 它们的结束由 `StreamEmitter` 负责（流真正跑完
         // 才算结束，而 `Recorder` 早就返回了）；这里是失败路径与缓存的兜底。
+        shell.inflight.remove(&rec.request_id);
         shell
             .events
             .request_finished(&crate::traffic::stream_events::RequestFinished {
@@ -348,19 +349,20 @@ pub async fn handle(
     // 此刻才既有生效模型、又有选定的渠道，而用户在意的正是"这一条在跑哪条路"。
     // 缓存命中在上面就返回了，所以它不会出现在「进行中」—— 那是对的，
     // 缓存命中没有过程可看。
-    shell
-        .events
-        .request_started(&crate::traffic::stream_events::RequestStarted {
-            request_id: recorder.record.request_id.clone(),
-            ts: recorder.record.ts,
-            client: recorder.record.client.clone(),
-            model: recorder.record.model.clone(),
-            request_model: recorder.record.request_model.clone(),
-            path: recorder.record.path.clone(),
-            protocol_in: protocol.as_str().to_string(),
-            provider_tag: primary.tag().to_string(),
-            is_stream: req.stream,
-        });
+    let started_payload = crate::traffic::stream_events::RequestStarted {
+        request_id: recorder.record.request_id.clone(),
+        ts: recorder.record.ts,
+        client: recorder.record.client.clone(),
+        model: recorder.record.model.clone(),
+        request_model: recorder.record.request_model.clone(),
+        path: recorder.record.path.clone(),
+        protocol_in: protocol.as_str().to_string(),
+        provider_tag: primary.tag().to_string(),
+        is_stream: req.stream,
+    };
+    // 先写进行中快照，再广播事件：顺序保证前端任何时刻查询都不会漏掉刚进来的请求。
+    shell.inflight.insert(started_payload.clone());
+    shell.events.request_started(&started_payload);
 
     let mut last_error: Option<UpstreamError> = None;
 
@@ -732,15 +734,49 @@ async fn build_candidates(
             }
         }
         None => {
-            let mut cs = vec![primary.clone()];
-            for c in &channels {
-                if c.provider.tag != primary.tag() {
+            // 没有模型策略时：如果 candidate_channels 返回了声明支持该模型的渠道，
+            // 优先用那些渠道 —— selector 的 primary 是按路由规则选的，可能根本不服务
+            // 这个模型（用户配了 A 渠道服务模型 a、B 渠道服务模型 b，请求模型 b 时
+            // selector 仍选 A，就会打到不认识 b 的渠道）。
+            //
+            // 逻辑：
+            //   - channels 里有 primary → 和原来一样，primary 排第一（稳定）。
+            //   - channels 非空但不含 primary → channels 里第一个是主渠道，
+            //     selector primary 追加到末尾作兜底（万一 channels 全挂掉）。
+            //   - channels 为空（通吃渠道 / 没有任何声明） → 原来的兜底逻辑不变。
+            let primary_in_channels = channels.iter().any(|c| c.provider.tag == primary.tag());
+
+            if !channels.is_empty() && !primary_in_channels {
+                // 有明确的模型候选，但 selector primary 不在其中：按模型候选排，
+                // selector primary 只作最后的兜底。
+                let mut cs: Vec<Arc<dyn Outbound>> = Vec::new();
+                for c in &channels {
                     if let Some(o) = shell.registry.get(&c.provider.tag) {
                         cs.push(o);
                     }
                 }
+                if cs.is_empty() {
+                    // 渠道全挂或全停用，才落回 selector。
+                    vec![primary.clone()]
+                } else {
+                    // 追加 selector primary 作兜底：模型候选全部失败时还有退路。
+                    if let Some(o) = shell.registry.get(primary.tag()) {
+                        cs.push(o);
+                    }
+                    cs
+                }
+            } else {
+                // channels 为空（通吃渠道）或 primary 本身就在 channels 里：原逻辑。
+                let mut cs = vec![primary.clone()];
+                for c in &channels {
+                    if c.provider.tag != primary.tag() {
+                        if let Some(o) = shell.registry.get(&c.provider.tag) {
+                            cs.push(o);
+                        }
+                    }
+                }
+                cs
             }
-            cs
         }
     };
 
@@ -1455,6 +1491,7 @@ async fn serve_from_cache(
             r.ts = crate::util::now_ms();
             // 缓存重放不走 `Recorder::finish`（它早就被丢下了），所以这里的
             // 结束事件得自己补 —— 否则前端那条「进行中」会一直挂着。
+            shell_cb.inflight.remove(&r.request_id);
             shell_cb
                 .events
                 .request_finished(&crate::traffic::stream_events::RequestFinished {

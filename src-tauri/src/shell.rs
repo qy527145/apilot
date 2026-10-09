@@ -17,7 +17,7 @@ use crate::routing::selector::{Selector, SelectorManager};
 use crate::routing::Router;
 use crate::storage::aggregates::AggregateBuffer;
 use crate::traffic::events::EventBus;
-use crate::traffic::TrafficStats;
+use crate::traffic::{InflightStore, TrafficStats};
 use crate::upstream::client;
 use crate::upstream::ProviderRegistry;
 use crate::util::now_ms;
@@ -43,6 +43,7 @@ pub struct AppShell {
     pub cache: Arc<ResponseCache>,
     pub aggregates: Arc<AggregateBuffer>,
     pub traffic: Arc<TrafficStats>,
+    pub inflight: Arc<InflightStore>,
     pub events: Arc<EventBus>,
     pub gateway: Arc<crate::gateway::server::GatewayServer>,
 
@@ -119,6 +120,7 @@ impl AppShell {
             cache,
             aggregates: Arc::new(AggregateBuffer::new()),
             traffic: Arc::new(TrafficStats::new()),
+            inflight: Arc::new(crate::traffic::InflightStore::new()),
             events: Arc::new(EventBus::new(app)),
             gateway: Arc::new(crate::gateway::server::GatewayServer::new()),
             probe_latency: Arc::new(dashmap::DashMap::new()),

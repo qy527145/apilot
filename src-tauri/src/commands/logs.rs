@@ -67,6 +67,17 @@ pub struct ClearResult {
     pub captures: u64,
 }
 
+/// 返回当前正在进行的请求列表。供监控页进入时补齐遗漏的进行中条目。
+///
+/// 前端靠事件驱动维护「进行中」列表，但如果用户在请求开始后才打开监控页，
+/// 那些 `request-start` 事件已经发出去了、没有人收到。这个命令用于补查。
+#[tauri::command]
+pub async fn get_inflight_requests(
+    shell: State<'_, Arc<AppShell>>,
+) -> AppResult<Vec<crate::traffic::stream_events::RequestStarted>> {
+    Ok(shell.inflight.snapshot())
+}
+
 /// 清空请求日志与捕获原文。
 ///
 /// 只动这两张表：`usage_hourly` 与内存里的累计计数器是计费口径的历史账目，
