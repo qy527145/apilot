@@ -16,7 +16,7 @@ Tauri 2 + React 19，后端约 21k 行 Rust。
 ```bash
 source scripts/msvc-env.sh     # 每个新 shell 都要执行一次
 cd src-tauri
-cargo test                     # 502 个测试
+cargo test                     # 849 个测试
 cargo check --all-targets      # 期望零警告
 cargo build
 ```
@@ -51,7 +51,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | 缓存 | `src-tauri/src/cache/` | 缓存键、策略、存储与 LRU 淘汰 |
 | 接管 | `src-tauri/src/takeover/` | 客户端配置的保序补丁与原子写入 |
 | 存储 | `src-tauri/src/storage/` | SQLite 连接、迁移、各领域读写 |
-| 命令 | `src-tauri/src/commands/` | Tauri 命令层（60 个） |
+| 命令 | `src-tauri/src/commands/` | Tauri 命令层（62 个） |
 | 前端 | `src/` | 9 个页面 + shadcn/ui 组件 |
 
 ## 改什么去哪里
@@ -65,6 +65,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → 同文件 `Provider::auth_header()`（**鉴权头的唯一构造点**，出站转发、连通探测、拉模型列表都走它） |
 | **改「直通还是转换」的判定** | `storage/models.rs::Provider::wire_for`（渠道声明的协议集合命中就直通）+ `gateway/pipeline.rs::prefer_native_protocol`（多渠道路由时同协议优先）→ 同步更新 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md) |
 | **改出站 URL 拼接** | `storage/models.rs::Provider::endpoint`（协议默认路径，会补 `/v1`）/ `endpoint_verbatim`（用户手写路径，**不补** `/v1`） |
+| **改渠道启停 / 协议自动检测** | 启停走 `storage/providers.rs::set_enabled`（只改启用位，**别借道 `upsert`** —— 密钥不回显，改个开关就会把它抹掉）+ `commands/providers.rs::set_provider_enabled`（写完必须 `reload_providers`）。检测的判定全在 `commands/providers.rs::judge_protocol`，探测体 `PROBE_BODY` 是**故意的空对象**（不消耗 token）→ 前端 `ProviderDialog` 的「自动检测」 |
 | **改「用哪个模型」（模型名）** | 判定在 `routing/model_policy.rs::effective_model`（在 `gateway/pipeline.rs` 解码后、路由前应用）；两级配置（全局 + 客户端覆盖）在 `config/settings.rs::ModelPolicy::effective` 里拼成一条规则；模式 4 的 JS 沙箱在 `routing/model_script.rs`。规则链的 `ModelOverride` 在它之上再改 |
 | **改「用哪个渠道」（服务商）** | `routing/model_select.rs::order`（按模型策略排序）+ `gateway/pipeline.rs::build_candidates`（未配策略时回落 selector）。**优先级是「模型策略 > selector」，别反过来**。策略存在 `model_policies` 表，界面上在**路由页**改 |
 | **改计费公式** | `billing/engine.rs::settle`（唯一真源）→ 对应更新其测试；倍率字段在 `billing/pricing.rs` |

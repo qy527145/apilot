@@ -277,6 +277,25 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> AppResult<()> {
     Ok(())
 }
 
+/// 只翻转启用位。
+///
+/// 刻意不走 `upsert`：那条路要求调用方把 tag / base_url / 协议声明 / 密钥等一整套
+/// 回传，而表格里的开关手上只有列表刷新出来的那几列 —— **密钥根本不回显**。
+/// 少传一项就是一次静默的数据丢失：关一下渠道，密钥或协议声明被抹成默认值，
+/// 而且不会有任何报错，用户下次发请求才发现。
+pub async fn set_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> AppResult<()> {
+    let r = sqlx::query("UPDATE providers SET enabled = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(enabled as i64)
+        .bind(now_ms())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if r.rows_affected() == 0 {
+        return Err(AppError::ProviderNotFound(id.to_string()));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // model ↔ 渠道映射
 // ---------------------------------------------------------------------------
@@ -1162,5 +1181,51 @@ mod tests {
 
         let read = get(&p, created.id).await.unwrap().unwrap();
         assert_eq!(read.proxy.mode, ChannelProxyMode::Inherit);
+    }
+
+    #[tokio::test]
+    async fn toggling_enabled_touches_nothing_but_the_flag() {
+        // 开关走的是独立的 UPDATE 而不是 upsert：后者要求把密钥、协议声明等整套
+        // 回传，而前端手上没有（密钥不回显），少传一项就是一次静默的数据丢失。
+        let p = pool().await;
+        let mut i = input("a");
+        i.protocols = vec![ProtocolEndpoint {
+            protocol: crate::protocol::dto::Protocol::AnthropicMessages,
+            path: Some("/anthropic/v1/messages".into()),
+        }];
+        let created = upsert(&p, &i).await.unwrap();
+
+        set_enabled(&p, created.id, false).await.unwrap();
+
+        let read = get(&p, created.id).await.unwrap().unwrap();
+        assert!(!read.enabled);
+        assert_eq!(read.api_key.as_deref(), Some("sk-test"), "密钥不能被抹掉");
+        assert_eq!(read.protocols, created.protocols, "协议声明不能被重置");
+        assert_eq!(read.base_url, created.base_url);
+        assert_eq!(read.weight, created.weight);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_channel_drops_out_of_list_enabled() {
+        // 网关的注册表读的是 list_enabled：停用必须就此从路由里消失，
+        // 而列表页仍要看得到它（否则用户没法把它再打开）。
+        let p = pool().await;
+        let created = upsert(&p, &input("a")).await.unwrap();
+        assert_eq!(list_enabled(&p).await.unwrap().len(), 1);
+
+        set_enabled(&p, created.id, false).await.unwrap();
+        assert!(list_enabled(&p).await.unwrap().is_empty());
+        assert_eq!(list(&p).await.unwrap().len(), 1);
+
+        set_enabled(&p, created.id, true).await.unwrap();
+        assert_eq!(list_enabled(&p).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn toggling_an_unknown_channel_errors_instead_of_lying() {
+        // 静默成功会让界面停留在一个并不存在的变化上（乐观更新已经先改了本地状态）。
+        let p = pool().await;
+        let err = set_enabled(&p, 999, false).await.unwrap_err().to_string();
+        assert!(err.contains("999"), "错误要指名道姓: {err}");
     }
 }

@@ -107,6 +107,53 @@ export interface Provider {
   updated_at: number;
 }
 
+/* --------------------------- 协议自动检测 --------------------------- */
+
+/**
+ * 协议探测的判定。与后端 `ProtocolVerdict` 一一对应，用词与能力探测
+ * （`CapabilityVerdict`）保持一致。
+ *
+ * **`inconclusive` 不是凑数的中间态**：鉴权失败、限流、上游 5xx、回包是网页，
+ * 都说明不了"这条路径有没有这个协议的入口"。把它压成 false，用户会以为服务商
+ * 不支持，而真实原因可能只是密钥没填对。
+ */
+export type ProtocolVerdict = "supported" | "unsupported" | "inconclusive";
+
+export const PROTOCOL_VERDICT_LABEL: Record<ProtocolVerdict, string> = {
+  supported: "有入口",
+  unsupported: "无入口",
+  inconclusive: "未知",
+};
+
+/** 一种协议的探测结果。 */
+export interface ProtocolDetection {
+  protocol: Protocol;
+  verdict: ProtocolVerdict;
+  /** 实际探测的出站地址。上游报错时第一个要看的就是它。 */
+  url: string;
+  status?: number | null;
+  latency_ms?: number | null;
+  /** 判定依据。 */
+  note?: string | null;
+}
+
+/**
+ * 协议检测的入参。只描述"怎么连"，不含 tag / name —— 检测发生在保存之前。
+ *
+ * `id` 是给密钥用的：编辑已有渠道时表单不回显密钥，留空表示沿用库里存的那把，
+ * 否则检测会不带鉴权头打过去，三种协议一律 401、结论全成"未知"。
+ */
+export interface ProtocolDetectInput {
+  id?: number | null;
+  base_url: string;
+  api_key?: string | null;
+  auth_style: AuthStyle;
+  extra_headers: Record<string, string>;
+  proxy?: ChannelProxy;
+  /** 每种协议要试的路径；`path` 为空表示用协议默认路径。 */
+  paths: ProtocolEndpoint[];
+}
+
 /* --------------------------- 模型（模型视角） --------------------------- */
 
 /**
@@ -921,6 +968,18 @@ export const api = {
   /** 拉取上游 `GET {base_url}/v1/models`，返回模型 id 列表。 */
   fetchProviderModels: (id: number) =>
     call<string[]>("fetch_provider_models", { id }),
+  /**
+   * 就地启用 / 停用。只改这一个字段，**不要**用 `upsertProvider` 代替：
+   * 那条路要求把密钥等整套回传，而密钥不回显，改个开关就会把它抹掉。
+   */
+  setProviderEnabled: (id: number, enabled: boolean) =>
+    call<null>("set_provider_enabled", { id, enabled }),
+  /**
+   * 自动检测该地址支持哪些协议：对三种协议的入口各发一次**故意不合法**的请求
+   * （空对象），按回包判定 —— 不消耗 token，也不占配额。结果不落库。
+   */
+  detectProviderProtocols: (input: ProtocolDetectInput) =>
+    call<ProtocolDetection[]>("detect_provider_protocols", { input }),
 
   /* ---- 上游目录：价格与能力共用同一个网络集成 ---- */
   /**

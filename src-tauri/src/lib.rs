@@ -74,6 +74,8 @@ pub fn run() {
             commands::providers::list_provider_models,
             commands::providers::set_provider_models,
             commands::providers::fetch_provider_models,
+            commands::providers::set_provider_enabled,
+            commands::providers::detect_provider_protocols,
             // --- 上游目录（价格与能力共用同一个网络集成） ---
             commands::catalog::catalog_price_preview,
             commands::catalog::catalog_price_apply,
