@@ -10,6 +10,7 @@
     "build:mac": "bun scripts/build.mjs mac",
     "build:linux": "bun scripts/build.mjs linux",
     "build:web": "tsc && vite build",
+    "upgrade": "bun scripts/upgrade.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

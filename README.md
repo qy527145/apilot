@@ -170,6 +170,21 @@ brew install llvm makensis     # clang-cl / llvm-rc / lld-link 与 NSIS 的 make
 版本号必须四处一致（tag、`tauri.conf.json`、`Cargo.toml`、`package.json`），不一致会在编译前就失败 ——
 安装包文件名取自 `tauri.conf.json`，对不上就会得到一个「标签与文件名互相矛盾」的 Release。
 
+四处一起改用 [scripts/upgrade.mjs](scripts/upgrade.mjs)：
+
+```bash
+bun run upgrade                # 只诊断：列出四处当前版本号，不一致时点出来
+bun run upgrade patch          # 0.1.1 → 0.1.2，顺带提交并打标签 v0.1.2
+bun run upgrade minor          # 0.1.1 → 0.2.0（major 同理）
+bun run upgrade 0.2.0          # 直接指定，也可以用来把四处重新对齐
+bun run upgrade patch --push   # 连提交带标签推到远端，直接触发上面这套 CI
+```
+
+`Cargo.lock` 里根包的版本也由它一并改掉 —— 漏掉它不会当场报错，但下次 `cargo build` 会顺手改一遍
+这个文件，于是「没动代码工作区却是脏的」，事后很难归因。
+
+默认会提交（只提交这四处，不会卷进你预暂存的其他文件）并打标签，**不会推远端**；推之前可以先看看。
+
 目前不签名：macOS 的 dmg 未公证、Windows 的 exe 无代码签名，用户首次打开会看到系统的「未知开发者」提示。
 
 配置在 [.github/workflows/build-installers.yml](.github/workflows/build-installers.yml)。
