@@ -76,6 +76,12 @@ struct Recorder {
     session: BillingSession,
     capture: Option<CaptureRecord>,
     finished: bool,
+    /// 收尾已经交给了流式那条路（`finalize_stream` + `StreamEmitter`）。
+    ///
+    /// 必须与 `finished` 分开：`handle` 把响应体交出去之后自己就返回了，
+    /// `Recorder` 随即被丢弃 —— 可那时**流才刚开始跑**。少了这个标记，
+    /// 下面 `Drop` 里的兜底清理会把一条还活着的请求当成夭折处理。
+    handed_off: bool,
 }
 
 impl Recorder {
@@ -172,6 +178,31 @@ impl Recorder {
     }
 }
 
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        if self.finished || self.handed_off {
+            return;
+        }
+
+        // 走到这里说明请求**夭折**了：客户端在网关拿到上游响应之前就断开，
+        // axum 于是把整个 handler future 丢掉 —— `finish` / `fail` 一个都轮不上。
+        //
+        // 不在这里兜一把，后果不是"少写一条日志"，而是监控页的「进行中」里从此
+        // 多一个幽灵：前端重新挂载时会用 `get_inflight_requests` 把这条拉回来，
+        // 而此后再也没有事件能把它移走（请求早就不存在了）。
+        let request_id = self.record.request_id.clone();
+        self.shell.inflight.remove(&request_id);
+        self.shell
+            .events
+            .request_finished(&crate::traffic::stream_events::RequestFinished {
+                request_id,
+                // 499 是 nginx 给"客户端关闭请求"定的码，语义与这里一致。
+                status_code: 499,
+                error: Some("请求未完成：客户端提前断开".into()),
+            });
+    }
+}
+
 /// 处理一次网关请求。
 pub async fn handle(
     shell: Arc<AppShell>,
@@ -228,6 +259,7 @@ pub async fn handle(
             ..Default::default()
         }),
         finished: false,
+        handed_off: false,
     };
 
     // ---- 1.5 全局模型替换 ----
@@ -471,6 +503,7 @@ pub async fn handle_raw(
             ..Default::default()
         }),
         finished: false,
+        handed_off: false,
     };
 
     // ---- 模型替换 ----
@@ -993,6 +1026,7 @@ async fn try_outbound(
         let observer = Box::new(crate::traffic::stream_events::StreamEmitter::new(
             shell.events.clone(),
             recorder.record.request_id.clone(),
+            shell.inflight.clone(),
         ));
 
         let body = translate_stream_observed(
@@ -1003,6 +1037,9 @@ async fn try_outbound(
             Some(observer),
             move |outcome| finalize_stream(ctx, outcome),
         );
+
+        // 交棒给流：这行之后 `Recorder` 会被丢掉，但请求还活着。
+        recorder.handed_off = true;
 
         return Ok((status, response_headers, body).into_response());
     }
@@ -1531,13 +1568,20 @@ async fn serve_from_cache(
             c.response_headers = headers_to_json(&headers);
         }
 
+        // 与真实流式一样交棒：这条响应体的收尾由上面的回调负责。
+        recorder.handed_off = true;
+
         return (http::StatusCode::OK, headers, body).into_response();
     }
 
     let body = match shell.codecs.codec(protocol).encode_response(&response, &usage) {
         Ok(b) => Bytes::from(b),
         Err(e) => {
-            return error_response(protocol, 500, "缓存响应编码失败", &e.to_string())
+            // 这条以前直接返回、不记任何账，于是它既不在日志里，又只能靠
+            // `Recorder::drop` 兜底 —— 而兜出来的理由是"客户端断开"，与事实不符。
+            // 按其余错误路径的规矩记一笔，理由才对得上。
+            recorder.fail(500, "缓存响应编码失败");
+            return error_response(protocol, 500, "缓存响应编码失败", &e.to_string());
         }
     };
 
