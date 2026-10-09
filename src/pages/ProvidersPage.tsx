@@ -179,7 +179,6 @@ export default function ProvidersPage() {
                 <TableRow>
                   <TableHead className="w-8" />
                   <TableHead>名称</TableHead>
-                  <TableHead>Tag</TableHead>
                   <TableHead>类型</TableHead>
                   <TableHead className="w-full min-w-[112px] max-w-0">
                     Base URL
@@ -212,11 +211,6 @@ export default function ProvidersPage() {
                           </Button>
                         </TableCell>
                         <TableCell className="font-medium">{p.name}</TableCell>
-                        <TableCell>
-                          <code className="text-muted-foreground text-xs">
-                            {p.tag}
-                          </code>
-                        </TableCell>
                         <TableCell>
                           <div className="space-y-1">
                             <Badge variant="outline">

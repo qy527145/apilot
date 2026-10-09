@@ -16,6 +16,8 @@ pub struct RequestLogRecord {
     pub protocol_in: String,
     pub protocol_out: String,
     pub provider_tag: Option<String>,
+    /// 渠道的整数 id，落库后可 JOIN providers.name 获取最新名称。
+    pub provider_id: Option<i64>,
     pub channel_kind: Option<String>,
     pub model: String,
     pub request_model: String,
@@ -56,7 +58,12 @@ pub struct RequestLog {
     pub client: String,
     pub protocol_in: String,
     pub protocol_out: String,
+    /// 渠道的文本 slug（历史兼容，写入时同步写 provider_id）。
     pub provider_tag: Option<String>,
+    /// 渠道整数 id；查询时 LEFT JOIN providers 得到最新名称。
+    pub provider_id: Option<i64>,
+    /// 渠道当前名称（JOIN 自 providers，改名后自动更新）。
+    pub provider_name: Option<String>,
     pub model: String,
     pub request_model: String,
     pub path: String,
@@ -159,11 +166,14 @@ impl LogFilter {
     }
 }
 
-const LOG_COLUMNS: &str = "request_id, ts, client, protocol_in, protocol_out, provider_tag, \
-     model, request_model, path, upstream_url, upstream_model, upstream_status, is_stream, \
-     status_code, error_message, input_tokens, output_tokens, \
-     cache_read_tokens, cache_creation_tokens, usage_source, quota, cost_usd, latency_ms, \
-     ttfb_ms, cache_hit, saved_quota";
+const LOG_COLUMNS: &str = "l.request_id, l.ts, l.client, l.protocol_in, l.protocol_out, l.provider_tag, \
+     l.provider_id, p.name AS provider_name, \
+     l.model, l.request_model, l.path, l.upstream_url, l.upstream_model, l.upstream_status, l.is_stream, \
+     l.status_code, l.error_message, l.input_tokens, l.output_tokens, \
+     l.cache_read_tokens, l.cache_creation_tokens, l.usage_source, l.quota, l.cost_usd, l.latency_ms, \
+     l.ttfb_ms, l.cache_hit, l.saved_quota";
+
+const LOG_FROM: &str = "request_logs l LEFT JOIN providers p ON l.provider_id = p.id";
 
 fn row_to_log(r: &sqlx::sqlite::SqliteRow) -> RequestLog {
     RequestLog {
@@ -173,6 +183,8 @@ fn row_to_log(r: &sqlx::sqlite::SqliteRow) -> RequestLog {
         protocol_in: r.get("protocol_in"),
         protocol_out: r.get("protocol_out"),
         provider_tag: r.get("provider_tag"),
+        provider_id: r.get("provider_id"),
+        provider_name: r.get("provider_name"),
         model: r.get("model"),
         request_model: r.get("request_model"),
         path: r.get("path"),
@@ -200,14 +212,14 @@ fn row_to_log(r: &sqlx::sqlite::SqliteRow) -> RequestLog {
 pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> {
     sqlx::query(
         "INSERT OR REPLACE INTO request_logs (
-             request_id, ts, client, protocol_in, protocol_out, provider_tag, channel_kind,
-             model, request_model, path, upstream_url, upstream_model, upstream_status,
-             is_stream, status_code, error_message,
+             request_id, ts, client, protocol_in, protocol_out, provider_tag, provider_id,
+             channel_kind, model, request_model, path, upstream_url, upstream_model,
+             upstream_status, is_stream, status_code, error_message,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              reasoning_tokens, usage_source, quota, cost_usd, latency_ms, ttfb_ms,
              cache_hit, saved_quota, other)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
-                 ?22,?23,?24,?25,?26,?27,?28,?29)",
+                 ?22,?23,?24,?25,?26,?27,?28,?29,?30)",
     )
     .bind(&rec.request_id)
     .bind(rec.ts)
@@ -215,6 +227,7 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
     .bind(&rec.protocol_in)
     .bind(&rec.protocol_out)
     .bind(&rec.provider_tag)
+    .bind(rec.provider_id)
     .bind(&rec.channel_kind)
     .bind(&rec.model)
     .bind(&rec.request_model)
@@ -249,14 +262,14 @@ pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<(Vec<Requ
 
     // 计数与取数用同一套 WHERE，避免两者口径漂移。
     let mut count_qb: QueryBuilder<sqlx::Sqlite> =
-        QueryBuilder::new("SELECT COUNT(*) FROM request_logs WHERE 1=1");
+        QueryBuilder::new(format!("SELECT COUNT(*) FROM {LOG_FROM} WHERE 1=1"));
     push_where(&mut count_qb, &filter);
     let total: i64 = count_qb.build_query_scalar().fetch_one(pool).await?;
 
     let mut qb: QueryBuilder<sqlx::Sqlite> =
-        QueryBuilder::new(format!("SELECT {LOG_COLUMNS} FROM request_logs WHERE 1=1"));
+        QueryBuilder::new(format!("SELECT {LOG_COLUMNS} FROM {LOG_FROM} WHERE 1=1"));
     push_where(&mut qb, &filter);
-    qb.push(" ORDER BY ts DESC, id DESC LIMIT ")
+    qb.push(" ORDER BY l.ts DESC, l.id DESC LIMIT ")
         .push_bind(filter.limit)
         .push(" OFFSET ")
         .push_bind(filter.offset);
@@ -358,7 +371,7 @@ fn push_where(qb: &mut QueryBuilder<'_, sqlx::Sqlite>, f: &LogFilter) {
 
 pub async fn get(pool: &SqlitePool, request_id: &str) -> AppResult<Option<RequestLog>> {
     let row = sqlx::query(&format!(
-        "SELECT {LOG_COLUMNS} FROM request_logs WHERE request_id = ?1"
+        "SELECT {LOG_COLUMNS} FROM {LOG_FROM} WHERE l.request_id = ?1"
     ))
     .bind(request_id)
     .fetch_optional(pool)
@@ -378,6 +391,10 @@ pub struct RequestDetail {
     pub protocol_in: String,
     pub protocol_out: String,
     pub provider_tag: Option<String>,
+    /// 渠道整数 id，用于关联渠道名称。
+    pub provider_id: Option<i64>,
+    /// 渠道当前名称（从 providers 表 JOIN 而来，改名后自动更新）。
+    pub provider_name: Option<String>,
     pub model: String,
     pub request_model: String,
     pub is_stream: bool,
@@ -610,6 +627,8 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         protocol_in: log.protocol_in,
         protocol_out: log.protocol_out,
         provider_tag: log.provider_tag,
+        provider_id: log.provider_id,
+        provider_name: log.provider_name,
         model: log.model,
         request_model: log.request_model,
         is_stream: log.is_stream,
@@ -724,6 +743,7 @@ mod tests {
             protocol_in: "anthropic".into(),
             protocol_out: "openai_chat".into(),
             provider_tag: Some("p1".into()),
+            provider_id: None,
             channel_kind: Some("openai_chat".into()),
             model: model.into(),
             request_model: model.into(),

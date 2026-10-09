@@ -363,7 +363,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
     });
 
   const submit = () => {
-    if (!form.tag.trim()) return setError("请填写渠道 tag");
     if (!form.name.trim()) return setError("请填写渠道名称");
     if (!form.base_url.trim()) return setError("请填写 base_url");
     if (form.protocols.length === 0)
@@ -380,7 +379,7 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
 
     const input: ProviderInput = {
       id: provider?.id ?? null,
-      tag: form.tag.trim(),
+      tag: form.tag.trim() || undefined,
       name: form.name.trim(),
       kind: form.kind,
       base_url: form.base_url.trim(),
@@ -430,7 +429,7 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
           <div className="space-y-2">
             <Label className="text-muted-foreground text-xs">
               {provider
-                ? "套用预设（会覆盖名称、tag、base url、鉴权与协议声明）"
+                ? "套用预设（会覆盖名称、base url、鉴权与协议声明）"
                 : "快速填充常用服务商"}
             </Label>
             <div className="flex flex-wrap gap-2">
@@ -455,14 +454,6 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
                 value={form.name}
                 onChange={(e) => set("name", e.target.value)}
                 placeholder="例如：Anthropic 官方"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>Tag（唯一标识）</Label>
-              <Input
-                value={form.tag}
-                onChange={(e) => set("tag", e.target.value)}
-                placeholder="例如：anthropic-official"
               />
             </div>
           </div>

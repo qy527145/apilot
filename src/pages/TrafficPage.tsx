@@ -499,9 +499,9 @@ export default function TrafficPage() {
                       </TableCell>
                       <TableCell
                         className="max-w-[140px] truncate text-xs"
-                        title={r.provider_tag}
+                        title={r.provider_tag ?? ""}
                       >
-                        {r.provider_tag || "—"}
+                        {r.provider_name || r.provider_tag || "—"}
                       </TableCell>
                       {/* 进行中的请求没有最终状态，用「进行中」占位。 */}
                       <TableCell className="text-center">
@@ -572,7 +572,7 @@ export default function TrafficPage() {
                         className="max-w-[140px] truncate"
                         title={r.provider_tag ?? ""}
                       >
-                        {r.provider_tag || "—"}
+                        {r.provider_name || r.provider_tag || "—"}
                       </TableCell>
                       <TableCell className="text-center">
                         <Badge variant={r.status_code < 400 ? "success" : "destructive"}>

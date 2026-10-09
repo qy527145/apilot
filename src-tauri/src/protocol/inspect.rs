@@ -185,6 +185,8 @@ mod tests {
             protocol_in: "openai_responses".into(),
             protocol_out: "openai_chat".into(),
             provider_tag: Some("p".into()),
+            provider_id: None,
+            provider_name: None,
             model: "m".into(),
             request_model: "m".into(),
             is_stream: false,

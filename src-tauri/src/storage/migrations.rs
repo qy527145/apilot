@@ -356,6 +356,21 @@ ALTER TABLE model_pricing ADD COLUMN source TEXT;
     // 老行回填 `request_model = model`：那时压根没记这件事，等价于"这一行没有
     // 被改写"。不编造，界面据此不显示别名。
     USAGE_HOURLY_V8_DDL,
+    // --- v9: 请求日志记录渠道 id，查询时关联渠道名称 ---
+    //
+    // 动机：`provider_tag` 是渠道的文本 slug，用户改名后历史日志还是显示旧名字。
+    // 加 `provider_id` 整数 FK，查询时 LEFT JOIN `providers.name`，改名后日志
+    // 里渠道名实时更新。
+    //
+    // 同时把 tag 从用户必填改为内部自动生成：前端不再暴露 tag 输入框，
+    // 由后端按名称自动生成 slug，对用户完全透明。
+    //
+    // `provider_tag` 保留但不再是主要展示字段；`usage_hourly` 的 PK 含
+    // `provider_tag`，改 PK 成本太高，暂不动它。
+    r#"
+ALTER TABLE request_logs ADD COLUMN provider_id INTEGER REFERENCES providers(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_logs_provider_id ON request_logs(provider_id, ts DESC);
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -367,7 +382,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 8);
+        assert_eq!(SCHEMA_VERSION, 9);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

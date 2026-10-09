@@ -501,7 +501,7 @@ function Summary({ data }: { data: RequestDetail }) {
       </Badge>
       <Badge variant="outline">{data.client}</Badge>
       <Badge variant="outline">{data.model}</Badge>
-      {data.provider_tag && <Badge variant="outline">{data.provider_tag}</Badge>}
+      {data.provider_tag && <Badge variant="outline">{data.provider_name ?? data.provider_tag}</Badge>}
       {data.is_stream && <Badge variant="secondary">流式</Badge>}
       {data.cache_hit && <Badge variant="success">缓存命中</Badge>}
     </div>

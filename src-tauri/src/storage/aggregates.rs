@@ -499,6 +499,7 @@ mod tests {
             protocol_in: "anthropic".into(),
             protocol_out: "anthropic".into(),
             provider_tag: Some(provider.into()),
+            provider_id: None,
             model: model.into(),
             request_model: model.into(),
             status_code: 200,

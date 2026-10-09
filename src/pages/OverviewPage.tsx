@@ -287,7 +287,7 @@ export default function OverviewPage({ onNavigate }: Props) {
                             </div>
                           )}
                         </TableCell>
-                        <TableCell>{truncate(r.provider_tag, 18)}</TableCell>
+                        <TableCell>{truncate(r.provider_name ?? r.provider_tag ?? "", 18)}</TableCell>
                         <TableCell>
                           <Badge variant={r.status_code < 400 ? "success" : "destructive"}>
                             {r.status_code}

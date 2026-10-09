@@ -69,7 +69,8 @@ export interface ProtocolEndpoint {
 
 export interface ProviderInput {
   id?: number | null;
-  tag: string;
+  /** tag 为空时由后端按名称自动生成 slug；前端不需要填写也不显示。 */
+  tag?: string;
   name: string;
   kind: ProviderKind;
   base_url: string;
@@ -89,6 +90,7 @@ export interface ProviderInput {
 
 export interface Provider {
   id: number;
+  /** 内部生成的唯一 slug，前端无需展示或编辑。 */
   tag: string;
   name: string;
   kind: ProviderKind;
@@ -505,6 +507,10 @@ export interface RequestLog {
   protocol_in: string;
   protocol_out: string;
   provider_tag?: string | null;
+  /** 渠道整数 id，用于关联渠道名称。 */
+  provider_id?: number | null;
+  /** 渠道当前名称（JOIN 自 providers，改名后自动更新）。 */
+  provider_name?: string | null;
   model: string;
   request_model: string;
   /** 入站请求路径（客户端打给 Apilot 的）。 */

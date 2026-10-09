@@ -58,20 +58,19 @@ fn default_timeout() -> i64 {
 
 impl ProviderInput {
     /// 基本校验。失败时返回可读原因，供前端直接展示。
+    /// tag 为空时从名称自动生成 slug（小写、空格转 `-`、去掉非 ASCII 字母数字 `-_.`）。
     pub fn validate(&self) -> Result<(), String> {
-        if self.tag.trim().is_empty() {
-            return Err("tag 不能为空".into());
-        }
-        // tag 会被 selector / 路由规则引用，限制字符集避免歧义。
-        if !self
-            .tag
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        {
-            return Err("tag 只能包含字母、数字、-、_、.".into());
-        }
         if self.name.trim().is_empty() {
             return Err("名称不能为空".into());
+        }
+        // tag 为空时自动生成，不再要求调用方填写。
+        if !self.tag.is_empty()
+            && !self
+                .tag
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err("tag 只能包含字母、数字、-、_、.".into());
         }
         if self.base_url.trim().is_empty() {
             return Err("base_url 不能为空".into());
@@ -82,8 +81,6 @@ impl ProviderInput {
         if self.timeout_ms < 1000 {
             return Err("超时不能小于 1 秒".into());
         }
-        // 代理地址在保存时就拦下来 —— 等到构造客户端才发现写错了，
-        // 表现是"请求都失败"而没有任何指向配置的提示。
         if let Some(url) = self.proxy.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
             if !crate::upstream::client::is_supported_proxy_url(url) {
                 return Err(format!(
@@ -92,6 +89,35 @@ impl ProviderInput {
             }
         }
         Ok(())
+    }
+
+    /// 保证 tag 不为空：如果调用方没填，从 name 生成 slug。
+    pub fn ensure_tag(&self) -> String {
+        if !self.tag.trim().is_empty() {
+            return self.tag.clone();
+        }
+        // 小写、空格/特殊字符转连字符、去掉非法字符、去掉首尾连字符。
+        let slug: String = self
+            .name
+            .to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        if slug.is_empty() {
+            format!("channel-{}", crate::util::now_ms())
+        } else {
+            slug
+        }
     }
 }
 
@@ -174,6 +200,9 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
         .validate()
         .map_err(|e| AppError::msg(format!("渠道配置无效: {e}")))?;
 
+    // tag 为空时从名称自动生成 slug。
+    let tag = input.ensure_tag();
+
     let now = now_ms();
     let extra = serde_json::to_string(&input.extra_headers)?;
     let protocols = serde_json::to_string(&input.protocols)?;
@@ -194,7 +223,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
                      proxy=?15
                  WHERE id=?16",
             )
-            .bind(&input.tag)
+            .bind(&tag)
             .bind(&input.name)
             .bind(input.kind.as_str())
             .bind(&input.base_url)
@@ -225,7 +254,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
                      enabled, timeout_ms, created_at, updated_at, proxy)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,?15)",
             )
-            .bind(&input.tag)
+            .bind(&tag)
             .bind(&input.name)
             .bind(input.kind.as_str())
             .bind(&input.base_url)
@@ -245,7 +274,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .map_err(|e| {
                 // tag 有唯一约束；给出比原始 SQL 错误更可读的提示。
                 if e.to_string().contains("UNIQUE") {
-                    AppError::msg(format!("tag「{}」已被占用", input.tag))
+                    AppError::msg(format!("tag「{}」已被占用", tag))
                 } else {
                     AppError::Db(e)
                 }

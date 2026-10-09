@@ -451,8 +451,8 @@ mod tests {
             .unwrap();
         // 老账目，重建表不能把它弄丢（这正是修复与"从头再来"的区别）。
         sqlx::query(
-            "INSERT INTO usage_hourly (bucket_ts, client, provider_tag, model, requests, quota)
-             VALUES (0, 'codex', 'deepseek', 'deepseek-flash', 3, 900)",
+            "INSERT INTO usage_hourly (bucket_ts, client, provider_tag, model, request_model, requests, quota)
+             VALUES (0, 'codex', 'deepseek', 'deepseek-flash', 'deepseek-flash', 3, 900)",
         )
         .execute(&pool)
         .await

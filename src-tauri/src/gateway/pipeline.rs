@@ -600,6 +600,7 @@ async fn forward_raw(
     let wire = outbound.wire_for(Protocol::AnthropicMessages);
     recorder.record.protocol_out = wire.as_str().to_string();
     recorder.record.provider_tag = Some(outbound.tag().to_string());
+    recorder.record.provider_id = Some(outbound.provider().id);
     recorder.record.channel_kind = Some(outbound.provider().kind.as_str().to_string());
 
     // 渠道级模型映射照样生效：客户端问的是 A，上游只认 B，那也得按 B 去问。
@@ -838,6 +839,7 @@ async fn try_outbound(
     let wire = outbound.wire_for(protocol_in);
     recorder.record.protocol_out = wire.as_str().to_string();
     recorder.record.provider_tag = Some(outbound.tag().to_string());
+    recorder.record.provider_id = Some(outbound.provider().id);
     recorder.record.channel_kind = Some(outbound.provider().kind.as_str().to_string());
 
     // 渠道级模型映射：入站模型名 → 上游真实模型名。
@@ -970,6 +972,7 @@ async fn try_outbound(
             // `finalize_stream` 再想拿，原始值已经不存在了。
             request_model: recorder.record.request_model.clone(),
             provider_tag: outbound.tag().to_string(),
+            provider_id: Some(outbound.provider().id),
             protocol_in,
             protocol_out: wire,
             channel_kind: Some(outbound.provider().kind.as_str().to_string()),
@@ -1210,6 +1213,8 @@ struct StreamContext {
     /// 少了它，监控页就只剩生效模型一个名字，"我发的 A 怎么按 B 计费"查不出来。
     request_model: String,
     provider_tag: String,
+    /// 渠道整数 id，用于日志里关联渠道名称。
+    provider_id: Option<i64>,
     protocol_in: Protocol,
     protocol_out: Protocol,
     channel_kind: Option<String>,
@@ -1237,6 +1242,7 @@ fn finalize_stream(
         model,
         request_model,
         provider_tag,
+        provider_id,
         protocol_in,
         protocol_out,
         channel_kind,
@@ -1300,6 +1306,7 @@ fn finalize_stream(
             protocol_in: protocol_in.as_str().to_string(),
             protocol_out: protocol_out.as_str().to_string(),
             provider_tag: Some(provider_tag),
+            provider_id,
             channel_kind,
             model: model.clone(),
             request_model,
