@@ -114,6 +114,17 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 - 但若响应是从 SSE 还原的（`decoded_from_sse`），即使协议相同也必须重新编码 ——
   原始字节是 SSE 正文，透传会把 `event:` 行喂给要 JSON 的客户端。
 
+**思考接管**（`AppSettings::thinking_mode`，客户端页那个下拉）走两条路，**输入的必须是
+同一份配置**：
+- 解码后、**缓存键之前**由 `apply_thinking` 写进 IR 的 `reasoning`（键里含它，晚了就是
+  「键按改写前算、字节按改写后发」）；
+- 同协议直通转发的是原始字节，IR 改了它不知道 —— 所以那份配置要一路传到
+  `patch_outbound_body`，由它按**线协议**去改 `thinking` / `reasoning_effort` /
+  `reasoning.effort`。那边不能自己从设置重算。
+- 三个键里两个是子对象，**只改自己那一个键**（同级的 `display` / `summary` 是客户端的）。
+  两处都没变时原样返回原始字节 —— 重序列化会规范化空白，而上游的 prompt cache 是
+  前缀字节敏感的。
+
 **两个方向的追踪**：入站在 `handle` 建 `CaptureRecord`，出站在 `try_outbound` 里
 `prepare()` 之后补 `UpstreamTrace`（URL / headers / body / 上游状态码 / 上游原始响应）。
 流式路径没有 `Recorder::finish`，收尾在 `finalize_stream`，所以入站那份捕获必须
@@ -487,7 +498,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 |---|---|
 | `shell.rs` | **`AppShell`** —— 所有共享依赖的唯一所有权根（db / settings / registry / selectors / router / pricing / cache / aggregates / traffic / events / gateway）。`bootstrap()` 装配全部状态；`reload_*()` 做配置热重载；`spawn_background_tasks()` 跑流量推送、聚合落库、日志清理 |
 | `config/paths.rs` | 全部路径解析。用 `dirs::home_dir()` 而非 `HOME` 环境变量；`APILOT_HOME` 可覆盖数据根目录 |
-| `config/settings.rs` | `AppSettings`（单条 JSON 存 `settings_kv`）、`normalized()` 夹取非法值。`ModelPolicy` 也在这里：两级模式 + 客户端覆盖 + 自定义规则，**`normalized()` 同时负责老存档的折算**（`"off"` 靠 serde alias，`per_client` 的字符串值靠 untagged —— 认不出一个枚举串会让整份设置回落默认值）。`ProxySettings` 同理：`#[serde(other)]` 的 `Unknown` 兜住拼错的模式串；`insecure_tls` 是新加字段，靠容器上的 `#[serde(default)]` 让老存档（没有这个键）读出来是「严格校验」而不是整份回落默认） |
+| `config/settings.rs` | `AppSettings`（单条 JSON 存 `settings_kv`）、`normalized()` 夹取非法值。`ModelPolicy` 也在这里：两级模式 + 客户端覆盖 + 自定义规则，**`normalized()` 同时负责老存档的折算**（`"off"` 靠 serde alias，`per_client` 的字符串值靠 untagged —— 认不出一个枚举串会让整份设置回落默认值）。`ProxySettings` 同理：`#[serde(other)]` 的 `Unknown` 兜住拼错的模式串；`insecure_tls` 是新加字段，靠容器上的 `#[serde(default)]` 让老存档（没有这个键）读出来是「严格校验」而不是整份回落默认）。`ThinkingMode`（思考接管）也在这里，是**全局一档**：`apply_thinking` 把它折算成 IR 的 `reasoning`（`budget_tokens` 与 `effort` 一起写，因为改写发生在渠道选定之前），同协议直通那条路再复用同一份 |
 | `error.rs` | `AppError`：同时实现 `Serialize`（给 Tauri）与 `IntoResponse`（给 axum） |
 | `util.rs` | `now_ms` / `now_secs` / `hour_bucket` / `mask_secret` |
 

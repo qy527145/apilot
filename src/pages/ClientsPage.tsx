@@ -36,7 +36,13 @@ import {
 } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { qk, useSettings } from "@/hooks/queries";
-import { api, type AppSettings, type ClientDetect, type ClientModelMode } from "@/lib/api";
+import {
+  api,
+  type AppSettings,
+  type ClientDetect,
+  type ClientModelMode,
+  type ThinkingMode,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 /// 四种模式各自的说明。文案要能让人在不看源码的情况下选对 —— 尤其"有没有 apply_patch"
@@ -71,6 +77,46 @@ const MODES: { value: ClientModelMode; label: string; hint: string }[] = [
  * 不一致的话，首屏会先显示一个用户从没选过的模式，读回来再跳一下。
  */
 const DEFAULT_MODE: ClientModelMode = "both";
+
+/// 思考接管的档位。与上面那条**不同**：它不写客户端配置，而是在网关侧改写请求参数，
+/// 所以每条请求都生效 —— 不用重启客户端，也不用重新接管一次。
+///
+/// 各家的参数名与取值并不通用，所以界面上只给档位，折算由 Apilot 按上游实际协议做。
+const THINKING_MODES: { value: ThinkingMode; label: string; hint: string }[] = [
+  {
+    value: "off",
+    label: "不接管思考",
+    hint: "客户端发什么思考参数就原样转发。",
+  },
+  {
+    value: "disabled",
+    label: "关闭（不发思考参数）",
+    hint: "把请求里的思考参数去掉，由上游按默认处理。注意这不等于上游一定不思考 —— 推理模型照样推理，只是不再由客户端指定档位。",
+  },
+  {
+    value: "low",
+    label: "低",
+    hint: "Anthropic 线写 thinking.budget_tokens（4096，上限受 max_tokens 约束），OpenAI 系写 effort=low。",
+  },
+  {
+    value: "medium",
+    label: "中",
+    hint: "Anthropic 线写 thinking.budget_tokens（8192），OpenAI 系写 effort=medium。",
+  },
+  {
+    value: "high",
+    label: "高",
+    hint: "Anthropic 线写 thinking.budget_tokens（16384），OpenAI 系写 effort=high。",
+  },
+  {
+    value: "xhigh",
+    label: "极高",
+    hint: "Anthropic 线写 thinking.budget_tokens（32768），OpenAI 系写 effort=xhigh。部分上游不认这个档，会直接报错。",
+  },
+];
+
+/** 同 `DEFAULT_MODE` 的约定：必须与后端 `AppSettings::default()` 一致（那里是 `Off`）。 */
+const DEFAULT_THINKING_MODE: ThinkingMode = "off";
 
 export default function ClientsPage({
   onNavigate,
@@ -108,6 +154,17 @@ export default function ClientsPage({
       toast.success("已保存；已接管的客户端已按新策略重写", {
         description: "重启客户端后生效。",
       });
+    },
+  });
+
+  // 思考接管同样是全局设置，但它的效果发生在**每一条请求**上（网关侧改写参数），
+  // 所以保存完立刻生效 —— 没有"重启客户端""重新接管"这些后续动作。
+  const saveThinking = useMutation({
+    mutationFn: (mode: ThinkingMode) =>
+      api.updateSettings({ ...(settings as AppSettings), thinking_mode: mode }),
+    onSuccess: (s) => {
+      qc.setQueryData(qk.settings, s);
+      toast.success("已保存；下一条请求就按新档位发往上游");
     },
   });
 
@@ -208,6 +265,42 @@ export default function ClientsPage({
             </Select>
             <p className="text-muted-foreground text-xs">
               {MODES.find((m) => m.value === (settings?.client_model_mode ?? DEFAULT_MODE))?.hint}
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="space-y-3 py-4">
+            <div className="space-y-1">
+              <Label>接管思考</Label>
+              <p className="text-muted-foreground text-xs">
+                三种客户端的思考都是靠请求参数控制的，所以这里不改客户端配置，而是由 Apilot
+                在转发前改写参数。也因此它每一条请求都生效 —— 不用重启客户端，也不用重新接管一次。
+                各家协议对应的参数名与取值并不通用，折算按上游渠道实际用的协议做。
+              </p>
+            </div>
+            <Select
+              value={settings?.thinking_mode ?? DEFAULT_THINKING_MODE}
+              onValueChange={(v) => saveThinking.mutate(v as ThinkingMode)}
+              disabled={!settings || saveThinking.isPending}
+            >
+              <SelectTrigger className="w-full sm:w-80">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {THINKING_MODES.map((m) => (
+                  <SelectItem key={m.value} value={m.value}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-muted-foreground text-xs">
+              {
+                THINKING_MODES.find(
+                  (m) => m.value === (settings?.thinking_mode ?? DEFAULT_THINKING_MODE),
+                )?.hint
+              }
             </p>
           </CardContent>
         </Card>

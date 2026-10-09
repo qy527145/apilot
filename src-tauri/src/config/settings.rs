@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::error::AppResult;
+use crate::protocol::dto::{ReasoningConfig, UnifiedRequest};
 
 const SETTINGS_KEY: &str = "app_settings";
 
@@ -442,6 +443,13 @@ pub struct AppSettings {
     )]
     pub client_model_mode: ClientModelMode,
 
+    /// 接管思考（是否思考 / 思考深度）。默认不接管。
+    ///
+    /// 与 [`Self::client_model_mode`] 相反，这一项**不写客户端配置**，而是在网关侧改写
+    /// 请求参数 —— 三种客户端的思考本来就都是请求参数控制的，改写比配置客户端更直接。
+    #[serde(default, deserialize_with = "de_thinking_mode")]
+    pub thinking_mode: ThinkingMode,
+
     /// 全局出站代理。默认跟随环境变量 —— 与引入本功能之前逐字等价。
     pub proxy: ProxySettings,
 }
@@ -521,6 +529,97 @@ where
     })
 }
 
+/// 接管思考：一个全局档位，作用于**每一条**对话请求。
+///
+/// 放在网关侧而不是客户端配置里，是因为三种客户端（Claude Code / Codex / Gemini CLI）
+/// 的思考本来就都是请求参数控制的 —— 改写参数比配置客户端更直接，也不必重启客户端的
+/// 常驻进程、不必重新接管一次。
+///
+/// 界面上是一个下拉，因为**各家的参数名与取值并不通用**：
+///
+/// | 档位 | Anthropic 线 | OpenAI 系线 |
+/// |---|---|---|
+/// | 关 | 不发 `thinking` | 不发 `reasoning_effort` / `reasoning` |
+/// | 低 / 中 / 高 / 极高 | `thinking.budget_tokens` = 4096 / 8192 / 16384 / 32768 | `effort` = low / medium / high / xhigh |
+///
+/// 「极高」这个档名取自仓库里 vendored 的 Codex 模型目录（GPT-6 系的
+/// `supported_reasoning_levels` 就是 low/medium/high/xhigh/max/ultra）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingMode {
+    /// 不接管：客户端发什么就是什么。
+    #[default]
+    Off,
+    /// 不发送思考参数，由上游按默认处理。
+    ///
+    /// **注意这不是「一定不思考」**：IR 与三个 codec 都没有「关」这个概念，去掉参数
+    /// 只是退回上游的默认档，而各家默认档不一样（推理模型照样推理）。真要"关"，
+    /// 各家的表达方式还不同，且 Anthropic 官方的新模型根本不允许关。
+    Disabled,
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+/// Anthropic 编码器在 `max_tokens` 缺失时补的那个数（见 `protocol::anthropic::request`）。
+///
+/// 这里跟着用同一个值：预算要按「上游实际会看到的 `max_tokens`」夹，而那个数在
+/// 请求没带的时候正是由编码器决定的。
+const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 8192;
+
+/// Anthropic 的 `thinking.budget_tokens` 下限。低于它上游直接 400。
+const ANTHROPIC_MIN_BUDGET_TOKENS: u32 = 1024;
+
+impl ThinkingMode {
+    /// 认不出的值一律当成 [`Self::Off`]（理由同 [`ClientModelMode::parse`]）。
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "disabled" => Self::Disabled,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::XHigh,
+            _ => Self::Off,
+        }
+    }
+
+    /// 档位 → 写进报文的参数：Anthropic 那侧要的是预算，OpenAI 系要的是档名。
+    ///
+    /// **两个一起给是有意的**：改写发生在渠道选定**之前**（路由与 selector 都在后面，
+    /// 失败重试还会换渠道），所以此刻只知道入站协议、不知道上游用哪种线协议。只填一个
+    /// 的话，首选渠道是 Anthropic、重试换到 OpenAI 渠道时这个配置就丢了。
+    ///
+    /// 返回 `None` 有两种情况，调用方都不该动请求：不接管的档位，以及**这个档位在这条
+    /// 请求上表达不出来** —— Anthropic 要求 `1024 <= budget_tokens < max_tokens`，
+    /// 请求的 `max_tokens` 太小时夹不出合法预算，与其发一个必然被拒的参数，不如不动。
+    fn params(self, max_tokens: Option<u32>) -> Option<(u32, &'static str)> {
+        let (budget, effort) = match self {
+            Self::Off | Self::Disabled => return None,
+            Self::Low => (4_096, "low"),
+            Self::Medium => (8_192, "medium"),
+            Self::High => (16_384, "high"),
+            Self::XHigh => (32_768, "xhigh"),
+        };
+
+        let cap = max_tokens.unwrap_or(ANTHROPIC_FALLBACK_MAX_TOKENS);
+        let budget = budget.min(cap.saturating_sub(1));
+        (budget >= ANTHROPIC_MIN_BUDGET_TOKENS).then_some((budget, effort))
+    }
+}
+
+/// 认不出的档位一律当「不接管」（理由同 `de_client_model_mode`）。
+fn de_thinking_mode<'de, D>(deserializer: D) -> Result<ThinkingMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw {
+        serde_json::Value::String(s) => ThinkingMode::parse(&s),
+        _ => ThinkingMode::Off,
+    })
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -541,6 +640,7 @@ impl Default for AppSettings {
 
             model_policy: ModelPolicy::default(), // 默认关闭
             client_model_mode: ClientModelMode::default(), // 默认两个都写：单走一条都会留缺口
+            thinking_mode: ThinkingMode::default(), // 默认不接管：与引入本功能之前逐字等价
             proxy: ProxySettings::default(),      // 默认跟随环境变量
         }
     }
@@ -566,6 +666,41 @@ impl AppSettings {
     /// 接管时要不要把网关的模型目录地址也写进客户端配置。
     pub fn inject_catalog(&self) -> bool {
         self.client_model_mode.writes_catalog()
+    }
+
+    /// 把接管的思考配置写进 IR；不接管时返回 `None`，且**一个字段都不动**。
+    ///
+    /// 位置很讲究：必须在模型替换之后、缓存键之前（`gateway::pipeline::handle` 里）。
+    /// 缓存键把思考配置算进去了，所以键与实际发出去的参数是同源的。
+    ///
+    /// 返回的那份克隆要一路带到出站组装处，作**同协议直通路径**改原始 body 的唯一依据。
+    /// 那边不能自己从设置重算一遍 —— 两条路一旦在夹预算这类分支上分歧，就会变成
+    /// 「缓存键按 A 算、字节按 B 发」，那是不会报错的错误缓存。
+    pub fn apply_thinking(&self, req: &mut UnifiedRequest) -> Option<ReasoningConfig> {
+        let cfg = match self.thinking_mode {
+            // 不接管：连 `reasoning` 都不碰，客户端原样带过去。
+            ThinkingMode::Off => return None,
+            // 关闭用 `enabled: false` 表示，而不是 `None` —— 两者对编码器等价（都写不出
+            // 任何字段），但同协议直通那条路要能分辨「显式关闭」与「不接管」：
+            // 前者要去掉原始 body 里的键，后者一个字节都不能动。
+            ThinkingMode::Disabled => ReasoningConfig {
+                enabled: false,
+                budget_tokens: None,
+                effort: None,
+            },
+            // 档位在这条请求上表达不出来时不接管（理由见 `ThinkingMode::params`）。
+            mode => {
+                let (budget, effort) = mode.params(req.max_tokens)?;
+                ReasoningConfig {
+                    enabled: true,
+                    budget_tokens: Some(budget),
+                    effort: Some(effort.to_string()),
+                }
+            }
+        };
+
+        req.reasoning = Some(cfg.clone());
+        Some(cfg)
     }
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.listen_host, self.listen_port)
@@ -1013,6 +1148,137 @@ mod tests {
                 .unwrap();
         assert_eq!(s.client_model_mode, ClientModelMode::Off);
         assert_eq!(s.listen_port, 9999, "认不出的模式名不该把端口打回默认值");
+    }
+
+    // --- 思考接管 ---
+
+    fn settings_with(thinking_mode: ThinkingMode) -> AppSettings {
+        AppSettings {
+            thinking_mode,
+            ..Default::default()
+        }
+    }
+
+    /// 一条带 max_tokens 的请求，够放下所有档位的预算。
+    fn request(max_tokens: Option<u32>) -> UnifiedRequest {
+        let mut req = UnifiedRequest::new("m");
+        req.max_tokens = max_tokens;
+        req
+    }
+
+    #[test]
+    fn an_unknown_thinking_mode_never_resets_the_whole_settings() {
+        // 与模式名同一条铁律：整份反序列化，任何一处报错都会把用户的设置冲掉。
+        let s: AppSettings =
+            serde_json::from_str(r#"{"listen_port":9999,"thinking_mode":"some_future_tier"}"#)
+                .unwrap();
+        assert_eq!(s.thinking_mode, ThinkingMode::Off);
+        assert_eq!(s.listen_port, 9999);
+    }
+
+    #[test]
+    fn thinking_mode_defaults_to_off_when_the_field_is_missing() {
+        // 老存档里没有这个键。默认必须是不接管，否则升级一次就悄悄改了所有人的请求。
+        let s: AppSettings = serde_json::from_str(r#"{"listen_port":9000}"#).unwrap();
+        assert_eq!(s.thinking_mode, ThinkingMode::Off);
+    }
+
+    #[test]
+    fn every_tier_writes_both_a_budget_and_an_effort() {
+        // 两个字段一起写是有意的：改写发生在渠道选定之前，重试还可能换到另一种线
+        // 协议上。只填一个，换协议那一刻这个配置就丢了。
+        for (mode, budget, effort) in [
+            (ThinkingMode::Low, 4_096, "low"),
+            (ThinkingMode::Medium, 8_192, "medium"),
+            (ThinkingMode::High, 16_384, "high"),
+            (ThinkingMode::XHigh, 32_768, "xhigh"),
+        ] {
+            let mut req = request(Some(100_000));
+            let applied = settings_with(mode).apply_thinking(&mut req).unwrap();
+
+            assert!(applied.enabled, "{mode:?}");
+            assert_eq!(applied.budget_tokens, Some(budget), "{mode:?}");
+            assert_eq!(applied.effort.as_deref(), Some(effort), "{mode:?}");
+            assert_eq!(req.reasoning, Some(applied), "IR 里必须是同一份");
+        }
+    }
+
+    #[test]
+    fn a_budget_never_reaches_max_tokens() {
+        // Anthropic 要求 budget_tokens 严格小于 max_tokens，违反即 400。
+        let mut req = request(Some(5_000));
+        let applied = settings_with(ThinkingMode::XHigh)
+            .apply_thinking(&mut req)
+            .unwrap();
+
+        assert_eq!(applied.budget_tokens, Some(4_999));
+        assert_eq!(applied.effort.as_deref(), Some("xhigh"), "档名不该被一起夹掉");
+    }
+
+    #[test]
+    fn a_max_tokens_too_small_to_hold_a_budget_is_left_alone() {
+        // 夹不出合法预算（Anthropic 的下限是 1024）时宁可不注入：发一个必然被拒的
+        // 参数，只会把一条本来能过的请求变成 400。
+        for max_tokens in [Some(1_024), Some(500), Some(0)] {
+            let mut req = request(max_tokens);
+            assert!(
+                settings_with(ThinkingMode::High)
+                    .apply_thinking(&mut req)
+                    .is_none(),
+                "max_tokens={max_tokens:?}"
+            );
+            assert_eq!(req.reasoning, None, "不注入时一个字段都不该动");
+        }
+    }
+
+    #[test]
+    fn a_missing_max_tokens_is_clamped_against_the_encoders_default() {
+        // max_tokens 缺失时 Anthropic 编码器会补 8192，所以预算是按 8191 夹的 ——
+        // 按"没有上限"估出来的预算会撞上那个默认值，一样 400。
+        let mut req = request(None);
+        let applied = settings_with(ThinkingMode::High)
+            .apply_thinking(&mut req)
+            .unwrap();
+
+        assert_eq!(applied.budget_tokens, Some(8_191));
+    }
+
+    #[test]
+    fn off_leaves_the_requests_own_thinking_config_alone() {
+        // 不接管 == 与引入本功能之前逐字等价。客户端自己的配置不能被顺手改掉。
+        let own = ReasoningConfig {
+            enabled: true,
+            budget_tokens: Some(2_048),
+            effort: None,
+        };
+        let mut req = request(Some(100_000));
+        req.reasoning = Some(own.clone());
+
+        assert!(settings_with(ThinkingMode::Off)
+            .apply_thinking(&mut req)
+            .is_none());
+        assert_eq!(req.reasoning, Some(own), "不接管时应当原封不动");
+    }
+
+    #[test]
+    fn disabled_clears_the_requests_own_thinking_config() {
+        // 「关闭」要盖掉客户端自己开的思考。写成 `enabled:false` 而不是 `None`，
+        // 是因为同协议直通那条路要能分辨它与「不接管」。
+        let mut req = request(Some(100_000));
+        req.reasoning = Some(ReasoningConfig {
+            enabled: true,
+            budget_tokens: Some(2_048),
+            effort: None,
+        });
+
+        let applied = settings_with(ThinkingMode::Disabled)
+            .apply_thinking(&mut req)
+            .unwrap();
+
+        assert!(!applied.enabled);
+        assert_eq!(applied.budget_tokens, None);
+        assert_eq!(applied.effort, None);
+        assert_eq!(req.reasoning, Some(applied));
     }
 
     #[test]

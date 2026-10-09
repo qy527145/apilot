@@ -69,6 +69,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **改出站 URL 拼接** | `storage/models.rs::Provider::endpoint`（协议默认路径，会补 `/v1`）/ `endpoint_verbatim`（用户手写路径，**不补** `/v1`） |
 | **改渠道启停 / 协议自动检测** | 启停走 `storage/providers.rs::set_enabled`（只改启用位，**别借道 `upsert`** —— 密钥不回显，改个开关就会把它抹掉）+ `commands/providers.rs::set_provider_enabled`（写完必须 `reload_providers`）。检测的判定全在 `commands/providers.rs::judge_protocol`，探测体 `PROBE_BODY` 是**故意的空对象**（不消耗 token）→ 前端 `ProviderDialog` 的「自动检测」 |
 | **改「用哪个模型」（模型名）** | 判定在 `routing/model_policy.rs::effective_model`（在 `gateway/pipeline.rs` 解码后、路由前应用）；两级配置（全局 + 客户端覆盖）在 `config/settings.rs::ModelPolicy::effective` 里拼成一条规则；模式 4 的 JS 沙箱在 `routing/model_script.rs`。规则链的 `ModelOverride` 在它之上再改 |
+| **改「接管思考」（是否思考 / 思考深度）** | 唯一真源是 `config/settings.rs::ThinkingMode`（一个全局档位，客户端页那个下拉）→ `AppSettings::apply_thinking` 在 `gateway/pipeline.rs::handle` 里写进 IR（**必须在缓存键之前**）→ 同协议直通再拿**同一份**去改原始 body（`patch_outbound_body`）。它改的是请求参数，**不写客户端配置**，所以每请求生效、不用重新接管。同协议那三个键分别是 `thinking` / `reasoning_effort` / `reasoning.effort` |
 | **改「用哪个渠道」（服务商）** | `routing/model_select.rs::order`（按模型策略排序）+ `gateway/pipeline.rs::build_candidates`（未配策略时回落 selector）。**优先级是「模型策略 > selector」，别反过来**。策略存在 `model_policies` 表，界面上在**路由页**改 |
 | **改计费公式** | `billing/engine.rs::settle`（唯一真源）→ 对应更新其测试；倍率字段在 `billing/pricing.rs` |
 | **加一种路由匹配条件** | `routing/rule_item.rs` 加 `RuleItem` 变体（`matches` + `describe` + 测试）→ 前端 `src/components/routing/RuleEditor.tsx` |

@@ -286,6 +286,18 @@ export interface GatewayStatus {
  */
 export type ClientModelMode = "off" | "rename" | "catalog" | "both";
 
+/**
+ * 接管思考的档位。**与写客户端配置无关** —— 它在网关侧改写请求参数，
+ * 所以每一条对话请求都生效，不用重启客户端、也不用重新接管一次。
+ *
+ * - `off`：不接管，客户端发什么就是什么。
+ * - `disabled`：不发送思考参数（删掉 `thinking` / `reasoning_effort` / `reasoning`），
+ *   由上游按默认处理 —— 不等于"上游一定不思考"。
+ * - `low` / `medium` / `high` / `xhigh`：按上游的**线协议**折算成对应参数
+ *   （Anthropic 是 `thinking.budget_tokens`，OpenAI 系是 `effort`）。
+ */
+export type ThinkingMode = "off" | "disabled" | "low" | "medium" | "high" | "xhigh";
+
 export interface AppSettings {  listen_host: string;
   listen_port: number;
   autostart_gateway: boolean;
@@ -305,6 +317,8 @@ export interface AppSettings {  listen_host: string;
    * 两个手段解决同一件事的两面，详见 `src-tauri/src/codex/mod.rs`。
    */
   client_model_mode: ClientModelMode;
+  /** 接管思考（是否思考 / 思考深度）。默认 `"off"`（不接管）。 */
+  thinking_mode: ThinkingMode;
   /** 全局出站代理。默认 `mode: "system"`（跟随环境变量）。 */
   proxy: ProxySettings;
 }

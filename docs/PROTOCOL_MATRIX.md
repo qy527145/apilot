@@ -151,7 +151,9 @@ Codex 的 SSE 解析器（`codex-api/src/sse/responses.rs::process_responses_eve
 
 `Thinking.signature` / `RedactedThinking` 由 Anthropic 侧签名，转到别的协议再转回来必然失效，
 回传会让上游 400。所以跨协议时 Apilot 会**主动剥离**思考块
-（`gateway/pipeline.rs::strip_unportable_thinking`），并清掉 `reasoning.budget_tokens`。
+（`gateway/pipeline.rs::strip_unportable_thinking`），并清掉 `reasoning.budget_tokens`
+（清预算只在**目标不是 Anthropic** 时做：它本身没有签名这回事，反过来 Chat → Anthropic
+时它恰恰是那边唯一能用的思考参数）。
 
 同协议直通时不剥，签名原样保留 —— 这也是 Claude Code 走 Anthropic 渠道时
 必须直通的原因之一。
@@ -258,6 +260,29 @@ Responses 里 `{"type":"custom"}` 的工具（Codex 的 `apply_patch`、code mod
 坏帧只影响监控里的语义化视图，不影响客户端拿到的内容。
 
 ---
+
+## 思考接管往上游发的是什么
+
+「客户端接管」页那个档位（`AppSettings::thinking_mode`）由 Apilot 在转发前改写请求参数，
+**按上游实际用的线协议**写：
+
+| 档位 | Anthropic 线 | OpenAI Chat 线 | Responses 线 |
+|---|---|---|---|
+| 关闭 | 删掉 `thinking` | 删掉 `reasoning_effort` | 删掉 `reasoning.effort`（同级的 `summary` 留着） |
+| 低 / 中 / 高 / 极高 | `thinking:{type:"enabled",budget_tokens:N}` | `reasoning_effort` | `reasoning:{effort:...}` |
+
+`budget_tokens` 会被夹到 `< max_tokens`（Anthropic 的硬要求），夹不出合法值时本次不注入。
+
+**两个已知边界：**
+
+- **「关闭」只保证不发参数，不保证上游不思考。** IR 与三个 codec 都没有「关」这个概念，
+  去掉参数只是退回上游的默认档；推理模型照样推理。真正"关"的写法各家不同。
+- **现代 Claude 模型拒收 `budget_tokens`。** 那边只认 `thinking:{type:"adaptive"}` +
+  `output_config.effort`（`budget_tokens` 已被移除，发了就是 400），而本仓库的 anthropic
+  codec 目前只实现了经典形状。所以这个档位对**第三方 Anthropic 兼容端点**
+  （DeepSeek / Moonshot / 百炼等，也正是 Claude Code 实际打的那类）是对的，
+  对 Anthropic 官方的新模型则会失败。同理，那些模型上采样参数与思考互斥 ——
+  **「缓存开启 + 思考接管 + Anthropic 官方渠道」会因为 `temperature` 直接 400**。
 
 ## 用路径覆盖修 404
 
