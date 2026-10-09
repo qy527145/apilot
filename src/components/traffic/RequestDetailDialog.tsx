@@ -37,6 +37,7 @@ import {
   formatMs,
   formatNumber,
   formatTime,
+  formatTps,
   quotaToUsd,
 } from "@/lib/utils";
 
@@ -678,7 +679,21 @@ function Metrics({ data }: { data: RequestDetail }) {
       <div className="grid grid-cols-2 gap-x-6 gap-y-2 rounded-md border p-3 text-xs sm:grid-cols-3 lg:grid-cols-4">
         <Field label="时间" value={formatTime(data.ts)} />
         <Field label="耗时" value={formatMs(data.latency_ms)} />
-        <Field label="TTFB" value={formatMs(data.ttfb_ms)} />
+        <Field
+          label="TTFT"
+          value={formatMs(data.ttfb_ms)}
+          hint="等到首字节的时间。流式的首字节就是首 token；非流式没有独立的首字节时刻，用整体耗时近似。"
+        />
+        <Field
+          label="ITL"
+          value={formatMs(data.itl_ms)}
+          hint="平均 token 间隔 = 解码窗口 / (输出 token - 1)。只有流式量得出来；非流式与缓存命中显示「—」。"
+        />
+        <Field
+          label="TPS"
+          value={formatTps(data.tps)}
+          hint="输出速度 = 输出 token / 解码窗口。非流式按整体耗时估算；缓存命中不报 —— 重放不是生成。"
+        />
         <Field label="费用" value={quotaToUsd(data.quota)} />
         <Field label="输入 Token" value={formatNumber(data.input_tokens)} />
         <Field label="输出 Token" value={formatNumber(data.output_tokens)} />
@@ -716,14 +731,19 @@ function Field({
   label,
   value,
   highlight,
+  hint,
 }: {
   label: string;
   value: string;
   highlight?: boolean;
+  /** 悬停说明这个数是怎么来的。口径容易被误读的指标都该给一个。 */
+  hint?: string;
 }) {
   return (
     <div className="flex min-w-0 items-center justify-between gap-2">
-      <span className="text-muted-foreground shrink-0">{label}</span>
+      <span className="text-muted-foreground shrink-0" title={hint}>
+        {label}
+      </span>
       <span
         className={
           highlight

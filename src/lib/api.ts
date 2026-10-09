@@ -747,6 +747,15 @@ export interface DetailViews {
 }
 
 export interface RequestDetail extends RequestLog {
+  /**
+   * 平均 token 间隔（毫秒）与输出速度（token / 秒），由后端从已落库的标量推出。
+   *
+   * 间隔只在流式且量得出解码窗口时才有；非流式测不出间隔，缓存命中不报速度。
+   * 为 null 时界面显示「—」。
+   */
+  itl_ms?: number | null;
+  tps?: number | null;
+
   /* --- 入站：客户端 → Apilot --- */
   method: string;
   request_headers: Record<string, string>;

@@ -742,6 +742,18 @@ pub struct RequestDetail {
     pub cost_usd: f64,
     pub latency_ms: i64,
     pub ttfb_ms: Option<i64>,
+    /// 平均 token 间隔（毫秒）= 解码窗口 / (输出 token - 1)。
+    ///
+    /// 只对**真观察到 token 逐个到达**的流式请求有值：非流式的首字节就是全文
+    /// （`ttfb_ms` 与 `latency_ms` 被记成同一个数），算出来的“间隔”只是把整段
+    /// 耗时摊到 token 上，不是间隔。测不出就给 `None`，界面显示「—」。
+    pub itl_ms: Option<f64>,
+    /// 输出速度（token / 秒）。
+    ///
+    /// 解码窗口取 `latency_ms - ttfb_ms`；量不出窗口时（非流式）退回整段耗时 ——
+    /// 那种情况下正文是随首字节一起到的，生成就发生在这一段里。
+    /// 缓存命中一律为 `None`：那些 token 不是刚生成的，重放耗时与生成速度无关。
+    pub tps: Option<f64>,
     pub cache_hit: bool,
     pub saved_quota: i64,
 
@@ -953,6 +965,11 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
     let upstream_status = upstream_status.or(log.upstream_status);
     let upstream_url = upstream_url.or(log.upstream_url);
 
+    // 观感指标由已落库的标量推出来，不占新列：口径改了不必迁移数据，老日志
+    // 打开详情也能看到。
+    let (itl_ms, tps) =
+        derived_speeds(log.latency_ms, log.ttfb_ms, log.output_tokens, log.cache_hit);
+
     Ok(Some(RequestDetail {
         request_id: log.request_id,
         ts: log.ts,
@@ -976,6 +993,8 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         cost_usd: log.cost_usd,
         latency_ms: log.latency_ms,
         ttfb_ms: log.ttfb_ms,
+        itl_ms,
+        tps,
         cache_hit: log.cache_hit,
         saved_quota: log.saved_quota,
         method,
@@ -1003,6 +1022,41 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
         stream_raw_truncated,
         stream_timings,
     }))
+}
+
+/// 由已落库的标量推出观感指标：`(itl_ms, tps)`。
+///
+/// 口径说明在 `RequestDetail::itl_ms` / `tps` 上。放在这里而不是前端，是因为
+/// 这两个数是**从数据推出来的**，口径只该有一处；前端只负责显示。
+fn derived_speeds(
+    latency_ms: i64,
+    ttfb_ms: Option<i64>,
+    output_tokens: u64,
+    cache_hit: bool,
+) -> (Option<f64>, Option<f64>) {
+    // 缓存命中的耗时是重放时间，不是生成时间；没产出 token 的请求更谈不上速度。
+    if cache_hit || output_tokens == 0 || latency_ms <= 0 {
+        return (None, None);
+    }
+
+    let latency = latency_ms as f64;
+    // 首字节之后那一段才是解码窗口。非流式的 ttfb 被记成整体耗时（上游一次给
+    // 全文，见 `gateway/pipeline.rs`），差为 0 —— 此时退回整段耗时。
+    let measured = ttfb_ms
+        .map(|t| latency - t.max(0) as f64)
+        .filter(|w| *w > 0.0);
+    let window = measured.unwrap_or(latency);
+
+    let tps = output_tokens as f64 / (window / 1000.0);
+
+    // ITL 只在**确实观察到 token 逐个到达**时才有意义：得有两个以上输出 token，
+    // 且窗口是从首字节之后量出来的。非流式没有可分的窗口，摊出来的不是间隔。
+    let itl = match measured {
+        Some(w) if output_tokens >= 2 => Some(w / (output_tokens - 1) as f64),
+        _ => None,
+    };
+
+    (itl, Some(tps))
 }
 
 fn parse_json(s: Option<String>) -> serde_json::Value {
@@ -1302,6 +1356,60 @@ mod tests {
         }
         .normalized();
         assert_eq!(f.limit, 1);
+    }
+
+    #[test]
+    fn speeds_split_ttft_from_decode() {
+        // 首字节 1s、总共 3s、产出 21 个 token → 解码窗口 2s。
+        assert_eq!(
+            derived_speeds(3000, Some(1000), 21, false),
+            (Some(100.0), Some(10.5))
+        );
+    }
+
+    #[test]
+    fn non_stream_falls_back_to_whole_latency_for_tps_only() {
+        // 非流式：ttfb 与总耗时同值（上游一次给全文），没有可分的解码窗口。
+        assert_eq!(
+            derived_speeds(2000, Some(2000), 20, false),
+            (None, Some(10.0)),
+            "没观察到 token 间隔就不能报 ITL；速度仍按整段耗时算"
+        );
+    }
+
+    #[test]
+    fn cache_hits_and_empty_outputs_have_no_speed() {
+        assert_eq!(derived_speeds(5, Some(0), 100, true), (None, None), "缓存是重放，不是生成");
+        assert_eq!(derived_speeds(2000, Some(500), 0, false), (None, None), "没输出就没有速度");
+        assert_eq!(derived_speeds(0, None, 10, false), (None, None), "零耗时不参与计算");
+    }
+
+    #[test]
+    fn single_output_token_has_speed_but_no_interval() {
+        // 只有一个 token 就没有“间隔”这回事，但速度仍可算。
+        assert_eq!(derived_speeds(1500, Some(500), 1, false), (None, Some(1.0)));
+    }
+
+    #[test]
+    fn ttfb_later_than_total_is_ignored_rather_than_negative() {
+        // 时钟抖动可能让 ttfb 略大于总耗时；负数窗口不能拿去算速度。
+        assert_eq!(derived_speeds(1000, Some(1200), 10, false), (None, Some(10.0)));
+    }
+
+    #[tokio::test]
+    async fn detail_reports_speeds_from_stored_scalars() {
+        // 详情里的 ITL / TPS 是读的时候推出来的，不在落库时算 —— 加这两个指标
+        // 不需要迁移，老日志一样能显示。
+        let p = pool().await;
+        let mut r = rec("r1", "claude-code", "m");
+        r.latency_ms = 3000;
+        r.ttfb_ms = Some(1000);
+        r.output_tokens = 21;
+        insert(&p, &r).await.unwrap();
+
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(d.itl_ms, Some(100.0));
+        assert_eq!(d.tps, Some(10.5));
     }
 
     #[tokio::test]

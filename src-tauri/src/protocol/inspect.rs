@@ -201,6 +201,8 @@ mod tests {
             cost_usd: 0.0,
             latency_ms: 0,
             ttfb_ms: None,
+            itl_ms: None,
+            tps: None,
             cache_hit: false,
             saved_quota: 0,
             method: "POST".into(),
