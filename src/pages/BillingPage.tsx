@@ -29,9 +29,15 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { qk } from "@/hooks/queries";
-import { api, type GroupBy } from "@/lib/api";
+import { api, type BillingBucket, type GroupBy } from "@/lib/api";
 import { RANGE_LABELS, rangeToTimeRange, type RangePreset } from "@/lib/ranges";
-import { formatMs, formatNumber, formatPercent, quotaToUsd } from "@/lib/utils";
+import {
+  formatMs,
+  formatNumber,
+  formatPercent,
+  formatTps,
+  quotaToUsd,
+} from "@/lib/utils";
 
 const CHART_COLORS = [
   "var(--chart-1)",
@@ -46,6 +52,18 @@ const GROUP_LABELS: Record<GroupBy, string> = {
   model: "按模型",
   provider: "按渠道",
 };
+
+/**
+ * 三个速度指标背后的样本说明。
+ *
+ * 平均值算不出来时显示「—」而不是 0，悬停要能解释为什么 —— 否则"这一行全是
+ * 横杠"看起来像界面坏了，其实只是这段时间里没有可比的流式请求。
+ */
+function sampleNote(b: BillingBucket): string {
+  return b.sample_requests > 0
+    ? `样本：${formatNumber(b.sample_requests)} 条流式请求`
+    : "没有可比的样本：该范围内没有流式、非缓存的成功请求";
+}
 
 export default function BillingPage() {
   const [preset, setPreset] = useState<RangePreset>("24h");
@@ -141,7 +159,7 @@ export default function BillingPage() {
           </CardHeader>
           <CardContent className="space-y-6">
             {buckets.isLoading ? (
-              <TableSkeleton rows={5} cols={8} />
+              <TableSkeleton rows={5} cols={11} />
             ) : buckets.isError ? (
               <ErrorState onRetry={() => buckets.refetch()} />
             ) : bucketData.length === 0 ? (
@@ -251,6 +269,29 @@ export default function BillingPage() {
                         <TableHead className="text-right">缓存读</TableHead>
                         <TableHead className="text-right">缓存命中率</TableHead>
                         <TableHead className="text-right">本地缓存命中</TableHead>
+                        {/*
+                          三个观感指标只统计**流式样本**（见后端 `logs::speed_sample`）：
+                          非流式的首字节就是全文，没有可分的解码窗口。表头写清口径，
+                          否则「—」会被当成缺数据。
+                        */}
+                        <TableHead
+                          className="text-right"
+                          title="平均首字节耗时。只统计流式、非缓存命中的成功请求。"
+                        >
+                          TTFT
+                        </TableHead>
+                        <TableHead
+                          className="text-right"
+                          title="平均 token 间隔 = Σ解码窗口 / Σ(输出 token - 1)。只统计流式、非缓存命中的成功请求。"
+                        >
+                          ITL
+                        </TableHead>
+                        <TableHead
+                          className="text-right"
+                          title="平均输出速度 = Σ输出 token / Σ解码窗口，按 token 数加权。只统计流式、非缓存命中的成功请求。"
+                        >
+                          TPS
+                        </TableHead>
                         <TableHead className="text-right">费用</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -292,6 +333,24 @@ export default function BillingPage() {
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {formatNumber(b.cache_hits)}
+                          </TableCell>
+                          <TableCell
+                            className="text-right tabular-nums"
+                            title={sampleNote(b)}
+                          >
+                            {formatMs(b.avg_ttft_ms)}
+                          </TableCell>
+                          <TableCell
+                            className="text-right tabular-nums"
+                            title={sampleNote(b)}
+                          >
+                            {formatMs(b.avg_itl_ms)}
+                          </TableCell>
+                          <TableCell
+                            className="text-right tabular-nums"
+                            title={sampleNote(b)}
+                          >
+                            {formatTps(b.avg_tps)}
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {quotaToUsd(b.quota)}

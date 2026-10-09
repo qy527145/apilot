@@ -399,7 +399,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
 | `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站 / **发给客户端的响应头**）；`query`（动态过滤：时间、客户端、模型、协议、状态、是否流式）、`get_detail`、`facets`（筛选下拉的候选值）、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧 |
 | `model_policies.rs` | 每模型的渠道选择策略读写。**没有行 = 交给 selector 与路由规则** |
-| `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb`。按模型汇总时额外返回 `request_models`（被折叠进该生效模型的客户端模型名），供统计页标出改写 |
+| `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` / `speed_averages`（按 token 加权的平均 TTFT / ITL / TPS，样本口径的唯一真源在 `logs::speed_sample`）。按模型汇总时额外返回 `request_models`（被折叠进该生效模型的客户端模型名），供统计页标出改写 |
 
 **迁移规则**：`MIGRATIONS` 数组**只追加，不修改已发布的条目**。
 每条用 `IF NOT EXISTS` 保证幂等，版本号是下标。
@@ -506,7 +506,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |
 | `route_config` | 单行 `id=1` | 兜底 selector |
 | `request_logs` | `request_id` 唯一 | 请求明细：token、quota、耗时、**TTFB**、缓存命中、估算偏差；以及**方向信息**：入站 `path`、出站 `upstream_url` / `upstream_model` / `upstream_status` |
-| `usage_hourly` | `(bucket_ts, client, provider_tag, model, request_model)` | 小时聚合，SUM 后 upsert。`model` 是**生效模型**（计费口径），`request_model` 是客户端原名 —— 两者一起进主键，统计页才答得出"我发的 gpt-6-sol 怎么算在 deepseek-flash 这行"。**`clear_logs` 不动它** —— 它是计费口径的历史账目 |
+| `usage_hourly` | `(bucket_ts, client, provider_tag, model, request_model)` | 小时聚合，SUM 后 upsert。`model` 是**生效模型**（计费口径），`request_model` 是客户端原名 —— 两者一起进主键，统计页才答得出"我发的 gpt-6-sol 怎么算在 deepseek-flash 这行"。**`clear_logs` 不动它** —— 它是计费口径的历史账目。另有观感指标的**累加量**（`sample_requests` / `ttfb_sum_ms` / `decode_ms_sum` / `decode_tokens_sum`）：平均值不能相加，所以存分子分母、汇总时再相除 |
 | `model_pricing` | `model` | 单价系数。`source` 为 NULL = **用户手填**（批量导入一律不动），有值 = 由某份目录导入、可被同来源的下次导入覆盖 |
 | `model_capabilities` | `(provider_id, model, capability)` | 这个**渠道上这个模型**支不支持思考/工具/多模态。`verdict` 是三态（supported / unsupported / inconclusive）—— 探测「支不支持工具」时模型可能只是那一次没调工具，记成布尔就是撒谎。`source` 分 probe（实测，花 token）与 catalog（目录断言，零成本）；**覆盖优先级写在 `storage::capabilities` 的 upsert SQL 里**：实测且明确 > 目录 > 实测但不确定 |
 | `response_cache` | `key`（sha256） | 缓存条目：响应体、usage、原额度、命中数 |

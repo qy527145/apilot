@@ -371,6 +371,33 @@ ALTER TABLE model_pricing ADD COLUMN source TEXT;
 ALTER TABLE request_logs ADD COLUMN provider_id INTEGER REFERENCES providers(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_logs_provider_id ON request_logs(provider_id, ts DESC);
 "#,
+    // --- v10: 聚合表累加观感指标（TTFT / ITL / TPS）的分子分母 ---
+    //
+    // 动机：统计页「按模型」只答得出总量，答不了"这个模型首 token 要等多久、
+    // 吐字快不快"。`request_logs` 里有逐条的 ttfb 与耗时，但它只留 30 天
+    // （`LOG_RETENTION_DAYS`），撑不起长期统计 —— 所以累加量得落在聚合表上。
+    //
+    // 存**累加量**而不是各自的平均值：平均值不能相加，同一个小时被 flush 多次
+    // 就会算错（`ON CONFLICT DO UPDATE` 只会做加法）。分子分母都留着，汇总时
+    // 再相除，加权平均自然成立 —— 平均速度是「总 token ÷ 总解码时长」，不是
+    // 「逐条 TPS 求平均」（后者会让只吐 3 个 token 的请求和吐 3000 个的等权）。
+    //
+    // 口径的唯一定义在 `logs::speed_sample`：样本 = 流式 + 非缓存命中 + 成功 +
+    // 量得出解码窗口。非流式那条路上 ttfb 被记成整体耗时（上游一次给全文），
+    // 拿它算"首 token 耗时"和"吐字速度"都是假的。
+    //
+    // 老行一律留 0 —— 那时没记过这三样，回填得有逐条日志，而日志可能已被清掉。
+    // 样本数为 0 时界面显示「—」，不编数。
+    //
+    // 注意：形状停留在 v7 的库会被 `db::ensure_usage_hourly_v8` **重建整张表**，
+    // 重建用的是 v8 的 DDL（没有这四列），所以那边补跑完必须再补一次列
+    // （`db::ensure_usage_hourly_speed_columns`）。
+    r#"
+ALTER TABLE usage_hourly ADD COLUMN sample_requests   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_hourly ADD COLUMN ttfb_sum_ms       INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_hourly ADD COLUMN decode_ms_sum     INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_hourly ADD COLUMN decode_tokens_sum INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -382,7 +409,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 9);
+        assert_eq!(SCHEMA_VERSION, 10);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

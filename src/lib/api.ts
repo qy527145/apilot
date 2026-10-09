@@ -421,6 +421,17 @@ export interface BillingBucket {
   /** 命中**本地响应缓存**的请求条数，与上一行不是一回事。 */
   cache_hits: number;
   saved_quota: number;
+  /**
+   * 三个平均值的样本条数：流式、非缓存命中、且量得出解码窗口的请求。
+   * 为 0 时三个平均值都是 null（界面显示「—」）—— 这一桶里没有可比的生成过程。
+   */
+  sample_requests: number;
+  /** 平均首字节耗时（毫秒）。无样本时为 null。 */
+  avg_ttft_ms: number | null;
+  /** 平均 token 间隔（毫秒）。无样本时为 null。 */
+  avg_itl_ms: number | null;
+  /** 平均输出速度（token / 秒，按 token 数加权）。无样本时为 null。 */
+  avg_tps: number | null;
   /** 只有「按模型」维度非空，其余维度恒为空数组。 */
   request_models: RequestModelAlias[];
 }

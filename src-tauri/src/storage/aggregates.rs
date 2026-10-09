@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, SqlitePool};
 
-use super::logs::RequestLogRecord;
+use super::logs::{self, RequestLogRecord};
 use crate::billing::quota::quota_to_usd;
 use crate::error::AppResult;
 use crate::util::hour_bucket;
@@ -45,6 +45,15 @@ pub struct AggRow {
     pub cache_hits: i64,
     pub saved_quota: i64,
     pub latency_sum_ms: i64,
+    /// 观感指标的累加量（口径见 `logs::speed_sample`）：样本条数、首字节总和、
+    /// 解码窗口总和、样本内的输出 token 总和。
+    ///
+    /// 存分子分母而不是各自的平均值 —— 平均值不能相加，同一小时被 flush 多次时
+    /// `ON CONFLICT DO UPDATE` 只有加法可用。
+    pub sample_requests: i64,
+    pub ttfb_sum_ms: i64,
+    pub decode_ms_sum: i64,
+    pub decode_tokens_sum: i64,
 }
 
 /// 内存聚合缓冲。
@@ -110,6 +119,23 @@ impl AggregateBuffer {
         }
         row.saved_quota += rec.saved_quota;
         row.latency_sum_ms += rec.latency_ms;
+
+        // 观感指标只累加分子分母，不累加平均值。样本的判定与详情弹窗共用
+        // `logs::speed_sample` —— 两处各写一遍的话，同一个模型在详情与统计页
+        // 会给出两个数（非流式、缓存命中、失败的请求口径最容易被写歪）。
+        if let Some(s) = logs::speed_sample(
+            rec.is_stream,
+            rec.cache_hit,
+            rec.status_code,
+            rec.latency_ms,
+            rec.ttfb_ms,
+            rec.output_tokens,
+        ) {
+            row.sample_requests += 1;
+            row.ttfb_sum_ms += s.ttft_ms;
+            row.decode_ms_sum += s.decode_ms;
+            row.decode_tokens_sum += s.output_tokens as i64;
+        }
     }
 
     /// 当前缓冲里有几组聚合。
@@ -143,8 +169,9 @@ impl AggregateBuffer {
                 "INSERT INTO usage_hourly (
                      bucket_ts, client, provider_tag, model, request_model, requests,
                      failed_requests, input_tokens, output_tokens, cache_read_tokens,
-                     cache_creation_tokens, quota, cache_hits, saved_quota, latency_sum_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                     cache_creation_tokens, quota, cache_hits, saved_quota, latency_sum_ms,
+                     sample_requests, ttfb_sum_ms, decode_ms_sum, decode_tokens_sum)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
                  ON CONFLICT(bucket_ts, client, provider_tag, model, request_model) DO UPDATE SET
                      requests              = requests + excluded.requests,
                      failed_requests       = failed_requests + excluded.failed_requests,
@@ -155,7 +182,11 @@ impl AggregateBuffer {
                      quota                 = quota + excluded.quota,
                      cache_hits            = cache_hits + excluded.cache_hits,
                      saved_quota           = saved_quota + excluded.saved_quota,
-                     latency_sum_ms        = latency_sum_ms + excluded.latency_sum_ms",
+                     latency_sum_ms        = latency_sum_ms + excluded.latency_sum_ms,
+                     sample_requests       = sample_requests + excluded.sample_requests,
+                     ttfb_sum_ms           = ttfb_sum_ms + excluded.ttfb_sum_ms,
+                     decode_ms_sum         = decode_ms_sum + excluded.decode_ms_sum,
+                     decode_tokens_sum     = decode_tokens_sum + excluded.decode_tokens_sum",
             )
             .bind(r.bucket_ts)
             .bind(&r.client)
@@ -172,6 +203,10 @@ impl AggregateBuffer {
             .bind(r.cache_hits)
             .bind(r.saved_quota)
             .bind(r.latency_sum_ms)
+            .bind(r.sample_requests)
+            .bind(r.ttfb_sum_ms)
+            .bind(r.decode_ms_sum)
+            .bind(r.decode_tokens_sum)
             .execute(&mut *tx)
             .await?;
         }
@@ -237,6 +272,15 @@ pub struct BillingBucket {
     /// 命中**本地响应缓存**的请求条数。与上一行不是一回事，别混。
     pub cache_hits: i64,
     pub saved_quota: i64,
+    /// 三个平均值背后的样本条数（流式、非缓存命中、量得出解码窗口的请求）。
+    /// 为 0 说明这一桶里没有可比的生成过程（全是非流式或缓存命中）。
+    pub sample_requests: i64,
+    /// 平均首字节耗时（毫秒）。样本为空时为 `None`。
+    pub avg_ttft_ms: Option<f64>,
+    /// 平均 token 间隔（毫秒）。同上。
+    pub avg_itl_ms: Option<f64>,
+    /// 平均输出速度（token / 秒）。同上。
+    pub avg_tps: Option<f64>,
     /// 被折叠进这一行、但名字与它不同的客户端请求模型。只有「按模型」维度
     /// 会去查（也只有那个维度上这两个名字才有解释力），其余维度恒为空。
     pub request_models: Vec<RequestModelAlias>,
@@ -279,6 +323,36 @@ fn prompt_cache_hit_rate(input_tokens: i64, cache_read_tokens: i64) -> f64 {
     }
 }
 
+/// 由累加量算观感指标的三个平均值：`(平均 TTFT, 平均 ITL, 平均 TPS)`。
+///
+/// 都是「先相加再相除」而不是「逐条算完求平均」：平均速度该按 token 数加权，
+/// 否则一个只吐 3 个 token 的请求会跟一个吐 3000 个的等权，均值被前者拖垮。
+///
+/// 样本为空（全是非流式 / 缓存命中）时三项都是 `None` —— 界面据此显示「—」，
+/// 而不是拿 0 冒充：0 ms 的间隔、0 tok/s 的速度都会被读成"有数据且极快/极慢"。
+fn speed_averages(
+    sample_requests: i64,
+    ttfb_sum_ms: i64,
+    decode_ms_sum: i64,
+    decode_tokens_sum: i64,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if sample_requests <= 0 {
+        return (None, None, None);
+    }
+
+    let avg_ttft = Some(ttfb_sum_ms as f64 / sample_requests as f64);
+
+    // 间隔的分母是 Σ(token - 1)：每个请求的第一个 token 不是"间隔"。样本里有
+    // 请求一个 token 都没吐时，这个差值可能落到零或负数。
+    let intervals = decode_tokens_sum - sample_requests;
+    let avg_itl = (intervals > 0).then(|| decode_ms_sum as f64 / intervals as f64);
+
+    let avg_tps =
+        (decode_tokens_sum > 0).then(|| decode_tokens_sum as f64 * 1000.0 / decode_ms_sum as f64);
+
+    (avg_ttft, avg_itl, avg_tps)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HourlyPoint {
     pub bucket_ts: i64,
@@ -307,7 +381,9 @@ pub async fn summary_by(
     let sql = format!(
         "SELECT {col} AS k, SUM(requests) AS requests, SUM(input_tokens) AS input_tokens,
                 SUM(output_tokens) AS output_tokens, SUM(cache_read_tokens) AS cache_read_tokens,
-                SUM(quota) AS quota, SUM(cache_hits) AS cache_hits, SUM(saved_quota) AS saved_quota
+                SUM(quota) AS quota, SUM(cache_hits) AS cache_hits, SUM(saved_quota) AS saved_quota,
+                SUM(sample_requests) AS sample_requests, SUM(ttfb_sum_ms) AS ttfb_sum_ms,
+                SUM(decode_ms_sum) AS decode_ms_sum, SUM(decode_tokens_sum) AS decode_tokens_sum
          FROM usage_hourly
          WHERE bucket_ts >= ?1 AND bucket_ts <= ?2
          GROUP BY {col}
@@ -325,6 +401,12 @@ pub async fn summary_by(
         .map(|r| {
             let input_tokens: i64 = r.get("input_tokens");
             let cache_read_tokens: i64 = r.get("cache_read_tokens");
+            let (avg_ttft_ms, avg_itl_ms, avg_tps) = speed_averages(
+                r.get("sample_requests"),
+                r.get("ttfb_sum_ms"),
+                r.get("decode_ms_sum"),
+                r.get("decode_tokens_sum"),
+            );
             BillingBucket {
                 key: r.get::<String, _>("k"),
                 requests: r.get("requests"),
@@ -335,6 +417,10 @@ pub async fn summary_by(
                 quota: r.get("quota"),
                 cache_hits: r.get("cache_hits"),
                 saved_quota: r.get("saved_quota"),
+                sample_requests: r.get("sample_requests"),
+                avg_ttft_ms,
+                avg_itl_ms,
+                avg_tps,
                 request_models: Vec::new(),
             }
         })
@@ -668,6 +754,107 @@ mod tests {
         assert_eq!(s.local_cache_hit_rate, 0.0, "无数据时不应除零");
         assert_eq!(s.prompt_cache_hit_rate, 0.0, "无数据时不应除零");
         assert_eq!(s.p50_ttfb_ms, None);
+    }
+
+    /// 造一条能进观测样本的日志：流式、成功、首字节早于流结束。
+    fn stream_rec(model: &str, ttfb: i64, latency: i64, out_tokens: u64, ts_ms: i64) -> RequestLogRecord {
+        RequestLogRecord {
+            is_stream: true,
+            status_code: 200,
+            latency_ms: latency,
+            ttfb_ms: Some(ttfb),
+            output_tokens: out_tokens,
+            ..rec("c", "p", model, 0, ts_ms)
+        }
+    }
+
+    #[tokio::test]
+    async fn buffer_accumulates_speed_components_not_averages() {
+        let b = AggregateBuffer::new();
+        let now = crate::util::now_ms();
+        b.record(&stream_rec("m", 1000, 3000, 21, now));
+        b.record(&stream_rec("m", 500, 1000, 11, now));
+        // 非流式那条不进样本，但请求数照记。
+        b.record(&rec("c", "p", "m", 0, now));
+
+        let row = b.drain().pop().unwrap();
+        assert_eq!(row.requests, 3);
+        assert_eq!(row.sample_requests, 2);
+        assert_eq!(row.ttfb_sum_ms, 1500);
+        assert_eq!(row.decode_ms_sum, 2500, "窗口 = 总耗时 - 首字节");
+        assert_eq!(row.decode_tokens_sum, 32);
+    }
+
+    #[tokio::test]
+    async fn summary_by_reports_average_speeds_per_model() {
+        let p = pool().await;
+        let b = AggregateBuffer::new();
+        let now = crate::util::now_ms();
+        b.record(&stream_rec("m", 1000, 3000, 21, now)); // 窗口 2s
+        b.record(&stream_rec("m", 500, 1000, 11, now)); // 窗口 0.5s
+        b.flush(&p).await.unwrap();
+
+        let buckets = summary_by(&p, now - 3_600_000, now + 3_600_000, GroupBy::Model)
+            .await
+            .unwrap();
+        let m = &buckets[0];
+        assert_eq!(m.sample_requests, 2);
+        assert_eq!(m.avg_ttft_ms, Some(750.0));
+        assert_eq!(m.avg_itl_ms, Some(2500.0 / 30.0), "Σ窗口 / Σ(token-1)");
+        assert_eq!(m.avg_tps, Some(12.8), "32 个 token / 2.5s");
+    }
+
+    #[tokio::test]
+    async fn average_speed_is_weighted_by_tokens_not_by_request() {
+        // 一条吐 1 个 token 的慢请求不该把一条吐 999 个的拉下来：平均速度按
+        // token 加权（Σtoken / Σ窗口），不是逐条 TPS 求平均。
+        let p = pool().await;
+        let b = AggregateBuffer::new();
+        let now = crate::util::now_ms();
+        b.record(&stream_rec("m", 100, 1100, 1, now)); // 1s 吐 1 个
+        b.record(&stream_rec("m", 100, 2100, 999, now)); // 2s 吐 999 个
+        b.flush(&p).await.unwrap();
+
+        let buckets = summary_by(&p, now - 3_600_000, now + 3_600_000, GroupBy::Model)
+            .await
+            .unwrap();
+        let m = &buckets[0];
+        assert_eq!(m.avg_tps, Some(1000.0 / 3.0), "1000 个 token / 3s");
+        // 逐条求平均会得到 (1 + 499.5) / 2 = 250.25，差一个数量级。
+        assert!(m.avg_tps.unwrap() > 300.0);
+        assert_eq!(m.avg_itl_ms, Some(3000.0 / 998.0), "分母是 Σ(token-1) = 998");
+    }
+
+    #[tokio::test]
+    async fn buckets_without_streams_report_no_speed() {
+        // 全是非流式 / 缓存命中的模型：三项都是「—」，不是 0 —— 0 tok/s 会被
+        // 读成"慢得离谱"，而事实是"没测过"。
+        let p = pool().await;
+        let b = AggregateBuffer::new();
+        let now = crate::util::now_ms();
+        b.record(&rec("c", "p", "plain", 0, now));
+        let mut cached = stream_rec("cached", 100, 3000, 20, now);
+        cached.cache_hit = true;
+        b.record(&cached);
+        b.flush(&p).await.unwrap();
+
+        let buckets = summary_by(&p, now - 3_600_000, now + 3_600_000, GroupBy::Model)
+            .await
+            .unwrap();
+        assert_eq!(buckets.len(), 2);
+        for bucket in &buckets {
+            assert_eq!(bucket.sample_requests, 0, "{} 不该有样本", bucket.key);
+            assert_eq!(bucket.avg_ttft_ms, None);
+            assert_eq!(bucket.avg_itl_ms, None);
+            assert_eq!(bucket.avg_tps, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn speed_averages_are_blank_without_a_sample() {
+        assert_eq!(speed_averages(0, 0, 0, 0), (None, None, None));
+        // 一个 token 都没吐的样本：TTFT 量到了，速度与间隔无从谈起。
+        assert_eq!(speed_averages(1, 500, 1000, 0), (Some(500.0), None, None));
     }
 
     /// 带 request_model 地造一条日志。`rec()` 把两者填成一样，改写场景要单独给。
