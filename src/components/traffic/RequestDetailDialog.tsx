@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, Loader2 } from "lucide-react";
+import { ArrowRight, Loader2, Trash2 } from "lucide-react";
 
 import { CopyButton } from "@/components/common/CopyButton";
 import { RawBody } from "@/components/common/RawBody";
@@ -15,6 +15,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -40,6 +41,11 @@ import {
 interface Props {
   requestId: string | null;
   onOpenChange: (open: boolean) => void;
+  /**
+   * 删掉这条记录。确认与执行都由调用方管 —— 删除是跨页面的危险动作，
+   * 二次确认不该散落在每个入口里。
+   */
+  onDelete?: (requestId: string) => void;
 }
 
 /** 三种查看方式。表达的是"我在核对报文"还是"我在看语义"，与具体是哪一段无关。 */
@@ -111,7 +117,7 @@ function formattedOf(d: RequestDetail, side: "client" | "upstream"): string | nu
 }
 
 
-export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
+export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props) {
   const [view, setView] = useState<ViewMode>("visual");
   const [tab, setTab] = useState<DetailTab>("request");
 
@@ -269,6 +275,21 @@ export function RequestDetailDialog({ requestId, onOpenChange }: Props) {
               </p>
             )}
           </div>
+        )}
+
+        {/* 只在读到了数据时给删除 —— 记录已被后台裁剪掉时，这里没什么可删的。 */}
+        {data && onDelete && requestId && (
+          <DialogFooter className="shrink-0">
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-destructive hover:text-destructive"
+              onClick={() => onDelete(requestId)}
+            >
+              <Trash2 className="size-4" />
+              删除这条记录
+            </Button>
+          </DialogFooter>
         )}
       </DialogContent>
     </Dialog>

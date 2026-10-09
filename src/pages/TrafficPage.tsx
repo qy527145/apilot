@@ -106,6 +106,8 @@ export default function TrafficPage() {
   const [liveStream, setLiveStream] = useState<string | null>(null);
   const [live, setLive] = useState(true);
   const [confirmClear, setConfirmClear] = useState(false);
+  /** 待确认删除的那条请求。删单条是不可撤销的，所以走确认而不是一点就没。 */
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<TrafficSnapshot | null>(null);
 
   // --- 筛选条件 ---
@@ -134,8 +136,11 @@ export default function TrafficPage() {
     [limit, from, client, protocol, status, onlyStream, modelLike],
   );
 
+  // 提出来是因为删除后要按同一把键失效 —— 筛选条件在键里，写死前缀匹配不上。
+  const logsKey = qk.logs(`${LOGS_QUERY_KEY}-${JSON.stringify(filter)}`);
+
   const { data, isLoading, isError, refetch, isFetching } = useQuery({
-    queryKey: qk.logs(`${LOGS_QUERY_KEY}-${JSON.stringify(filter)}`),
+    queryKey: logsKey,
     queryFn: () => api.queryLogs(filter),
     refetchInterval: live ? 1000 : false,
     retry: 1,
@@ -241,9 +246,22 @@ export default function TrafficPage() {
     onSuccess: (res) => {
       // 详情弹窗可能正开着一条已被删掉的记录，一起关掉免得看着像卡住。
       setSelected(null);
-      qc.invalidateQueries({ queryKey: qk.logs(LOGS_QUERY_KEY) });
+      qc.invalidateQueries({ queryKey: logsKey });
       toast.success(`已清空 ${res.logs} 条请求日志、${res.captures} 条原文捕获`);
       setConfirmClear(false);
+    },
+  });
+
+  const del = useMutation({
+    mutationFn: api.deleteLog,
+    onSuccess: (_res, requestId) => {
+      // 删掉的可能正是详情弹窗里那条，关掉；顺便把它的详情缓存扔掉，
+      // 免得万一又点回同一个 id 时先闪一下已经删掉的内容。
+      if (selected === requestId) setSelected(null);
+      qc.removeQueries({ queryKey: qk.requestDetail(requestId) });
+      qc.invalidateQueries({ queryKey: logsKey });
+      toast.success("已删除该条请求记录");
+      setConfirmDelete(null);
     },
   });
 
@@ -484,6 +502,7 @@ export default function TrafficPage() {
                     <TableHead className="text-right">Token</TableHead>
                     <TableHead className="text-right">费用</TableHead>
                     <TableHead className="text-center">缓存</TableHead>
+                    <TableHead className="w-10" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -586,6 +605,25 @@ export default function TrafficPage() {
                           <span className="text-muted-foreground text-xs">—</span>
                         )}
                       </TableCell>
+                      <TableCell className="text-right">
+                        {/*
+                          删除必须拦住冒泡：整行的 onClick 是打开详情，不拦的话
+                          点删除会顺手把详情弹窗也打开。
+                        */}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="text-muted-foreground hover:text-destructive size-7"
+                          title="删除这条记录"
+                          aria-label="删除这条记录"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setConfirmDelete(r.request_id);
+                          }}
+                        >
+                          <Trash2 className="size-3.5" />
+                        </Button>
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -610,12 +648,41 @@ export default function TrafficPage() {
       <RequestDetailDialog
         requestId={selected}
         onOpenChange={(o) => !o && setSelected(null)}
+        onDelete={setConfirmDelete}
       />
 
       <LiveStreamDialog
         live={openLive}
         onOpenChange={(o) => !o && setLiveStream(null)}
       />
+
+      <Dialog
+        open={confirmDelete !== null}
+        onOpenChange={(o) => !o && setConfirmDelete(null)}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>删除这条请求记录？</DialogTitle>
+            <DialogDescription className="text-xs">
+              会删除这条请求明细与它捕获的请求 / 响应原文，无法撤销。
+              <br />
+              计费统计（用量聚合与账单）不受影响。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDelete(null)}>
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => confirmDelete && del.mutate(confirmDelete)}
+              disabled={del.isPending}
+            >
+              {del.isPending ? "删除中…" : "确认删除"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={confirmClear} onOpenChange={setConfirmClear}>
         <DialogContent className="sm:max-w-md">

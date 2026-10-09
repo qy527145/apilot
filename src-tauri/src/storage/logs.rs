@@ -707,6 +707,31 @@ pub async fn clear_all(pool: &SqlitePool) -> AppResult<(u64, u64)> {
     Ok((logs, captures))
 }
 
+/// 删除单条请求明细与它的捕获原文。返回 `(删除的日志条数, 删除的捕获条数)`。
+///
+/// 范围与 `clear_all` 一致，只是多了 `request_id` 这一个条件 —— 同样**不动**
+/// `usage_hourly` 与内存计数器，删掉一条监控记录不该让账单跟着变。
+///
+/// 记录已经不存在时返回 `(0, 0)` 而不是报错：后台的定期裁剪随时可能先把它删掉，
+/// 用户点的那一行本来就是一份可能过期的快照。
+pub async fn delete_one(pool: &SqlitePool, request_id: &str) -> AppResult<(u64, u64)> {
+    // 与 clear_all 同理放一个事务：两张表要么都删，要么都留，
+    // 不会出现"列表里没有这行了、点进去详情却还在"。
+    let mut tx = pool.begin().await?;
+    let logs = sqlx::query("DELETE FROM request_logs WHERE request_id = ?1")
+        .bind(request_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let captures = sqlx::query("DELETE FROM captures WHERE request_id = ?1")
+        .bind(request_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok((logs, captures))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1256,6 +1281,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 1, "清空日志不应影响计费聚合");
+    }
+
+    #[tokio::test]
+    async fn delete_one_removes_only_that_request() {
+        let p = pool().await;
+        insert(&p, &rec("r1", "a", "m")).await.unwrap();
+        insert(&p, &rec("r2", "a", "m")).await.unwrap();
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r1".into(),
+                ts: now_ms(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r2".into(),
+                ts: now_ms(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (logs, captures) = delete_one(&p, "r1").await.unwrap();
+        assert_eq!(logs, 1);
+        assert_eq!(captures, 1);
+
+        // 邻居必须原样留着 —— 这是"单独删除"与"清空"的全部区别。
+        assert!(get(&p, "r1").await.unwrap().is_none());
+        assert!(get(&p, "r2").await.unwrap().is_some());
+        assert!(get_detail(&p, "r1").await.unwrap().is_none());
+        assert!(get_detail(&p, "r2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_one_on_missing_request_is_a_noop() {
+        // 后台定期裁剪可能已经把它删掉了，这时再点一次不该报错。
+        let p = pool().await;
+        assert_eq!(delete_one(&p, "nope").await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn delete_one_leaves_hourly_aggregates_alone() {
+        let p = pool().await;
+        insert(&p, &rec("r1", "a", "m")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_hourly
+                 (bucket_ts, client, provider_tag, model, request_model, requests, quota)
+             VALUES (0, 'a', 'p1', 'm', 'm', 1, 300)",
+        )
+        .execute(&p)
+        .await
+        .unwrap();
+
+        delete_one(&p, "r1").await.unwrap();
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_hourly")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(left, 1, "删一条日志不应影响计费聚合");
     }
 
     // -----------------------------------------------------------------------

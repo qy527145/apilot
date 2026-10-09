@@ -76,3 +76,16 @@ pub async fn clear_logs(shell: State<'_, Arc<AppShell>>) -> AppResult<ClearResul
     let (logs, captures) = crate::storage::logs::clear_all(&shell.db).await?;
     Ok(ClearResult { logs, captures })
 }
+
+/// 删除单条请求日志及其捕获原文。
+///
+/// 范围与 `clear_logs` 相同，只是限定到一条 —— 计费聚合同样不受影响。
+/// 记录已被后台裁剪掉时返回全零，不当成错误。
+#[tauri::command]
+pub async fn delete_log(
+    shell: State<'_, Arc<AppShell>>,
+    request_id: String,
+) -> AppResult<ClearResult> {
+    let (logs, captures) = crate::storage::logs::delete_one(&shell.db, &request_id).await?;
+    Ok(ClearResult { logs, captures })
+}

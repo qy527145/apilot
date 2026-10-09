@@ -1007,6 +1007,9 @@ export const api = {
     call<RequestDetail>("get_request_detail", { requestId }),
   /** 清空请求明细与原文捕获。计费聚合不受影响。 */
   clearLogs: () => call<ClearResult>("clear_logs"),
+  /** 删除单条请求明细及其原文捕获。计费聚合不受影响。 */
+  deleteLog: (requestId: string) =>
+    call<ClearResult>("delete_log", { requestId }),
 
   /* -------------------------- 模型（模型视角） -------------------------- */
 

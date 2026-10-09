@@ -463,7 +463,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `cache.rs` | 4 | `cache_stats`、`clear_cache`、策略读写 |
 | `takeover.rs` | 7 | `detect_clients`、`takeover_status`、`takeover_readiness`（接管前置条件）、`preview_takeover`、`apply_takeover`、`restore_client`、`open_client_config`（后端按 client 解析路径后用系统默认程序打开，不收前端传的路径） |
 | `models.rs` | 8 | 模型视角：`list_model_catalog` / `list_model_options`、`get_model_policy`（模型替换，与 `app.rs` 的 `set_model_policy` 一对）、`upsert_model_policy` / `reset_model_policy` / `switch_model_channel`（每模型选渠道）、`set_model_candidates`、`probe_model_candidates` |
-| `logs.rs` | 3 | `query_logs`、`list_log_facets`（筛选下拉的候选值），`get_request_detail`、`clear_logs`（只清明细与捕获，不动 `usage_hourly`） |
+| `logs.rs` | 5 | `query_logs`、`list_log_facets`（筛选下拉的候选值）、`get_request_detail`、`clear_logs` / `delete_log`（只清明细与捕获，不动 `usage_hourly`；单条删除只是多一个 `request_id` 条件） |
 
 **命令注册**：全部在 `lib.rs` 的 `generate_handler!` 里，用**完整路径**。
 `#[tauri::command]` 生成的 `__cmd__*` 宏项不参与 re-export，不能用 `pub use` 转发。
@@ -515,7 +515,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 | 位置 | 内容 |
 |---|---|
-| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 60 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
+| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 61 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
