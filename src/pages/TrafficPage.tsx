@@ -7,6 +7,7 @@ import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
 import { PageShell } from "@/components/layout/PageShell";
 import { FilterExprPanel } from "@/components/traffic/FilterExprPanel";
+import { TimeRangePicker } from "@/components/traffic/TimeRangePicker";
 import { LiveStreamDialog, MAX_LIVE_FRAMES, type LiveRequest } from "@/components/traffic/LiveStreamDialog";
 import { RequestDetailDialog } from "@/components/traffic/RequestDetailDialog";
 import { Badge } from "@/components/ui/badge";
@@ -68,7 +69,10 @@ const MAX_LIMIT = 1000;
 /** 流结束后，实时条目在内存里再留多久。够用户看完最后几帧，又不至于一直占着。 */
 const DONE_TTL_MS = 120_000;
 
-type RangePreset = "all" | "5m" | "1h" | "24h" | "today";
+type RangePreset = "all" | "5m" | "1h" | "24h" | "today" | "custom";
+
+/** 页签只列预设 —— 自定义是旁边那个独立控件，见 `TimeRangePicker`。 */
+const PRESETS: RangePreset[] = ["all", "5m", "1h", "24h", "today"];
 
 const RANGE_LABEL: Record<RangePreset, string> = {
   all: "不限",
@@ -76,12 +80,16 @@ const RANGE_LABEL: Record<RangePreset, string> = {
   "1h": "1 小时",
   "24h": "24 小时",
   today: "今天",
+  custom: "自定义",
 };
 
+/** 预设范围 → 起点（毫秒）。`null` = 不限。
+ *  自定义的两端由输入框给，见 `rangeBounds`。 */
 function rangeFrom(preset: RangePreset): number | null {
   const now = Date.now();
   switch (preset) {
     case "all":
+    case "custom":
       return null;
     case "5m":
       return now - 5 * 60_000;
@@ -97,6 +105,26 @@ function rangeFrom(preset: RangePreset): number | null {
   }
 }
 
+/** `datetime-local` 的值（本地时间、不带时区）→ 毫秒时间戳。
+ *  空值或非法值都当作「不设这一端」，而不是当成 0（那会筛掉一切）。 */
+function localToMs(value: string): number | null {
+  if (!value) return null;
+  const t = new Date(value).getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+/** 时间条件的最终两端：预设只给起点，自定义两端都能给。 */
+function rangeBounds(
+  preset: RangePreset,
+  customFrom: string,
+  customTo: string,
+): { from: number | null; to: number | null } {
+  if (preset === "custom") {
+    return { from: localToMs(customFrom), to: localToMs(customTo) };
+  }
+  return { from: rangeFrom(preset), to: null };
+}
+
 const hostOf = (url: string) => url.replace(/^https?:\/\//, "");
 
 export default function TrafficPage() {
@@ -110,6 +138,9 @@ export default function TrafficPage() {
   // --- 筛选条件 ---
   // 时间单独控（见下方的时间行）；其余是高频条件，平铺在筛选卡第一行。
   const [range, setRange] = useState<RangePreset>("all");
+  /** 自定义范围的起止，`datetime-local` 的原始值（本地时间）。 */
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
   const [client, setClient] = useState<string>(ANY);
   /** 客户端请求时写的模型名（`request_model`）。 */
   const [requestModel, setRequestModel] = useState<string>(ANY);
@@ -122,13 +153,17 @@ export default function TrafficPage() {
   const [expr, setExpr] = useState("");
   const [limit, setLimit] = useState(PAGE_SIZE);
 
-  const from = useMemo(() => rangeFrom(range), [range]);
+  const { from, to } = useMemo(
+    () => rangeBounds(range, customFrom, customTo),
+    [range, customFrom, customTo],
+  );
 
   const filter: LogFilter = useMemo(
     () => ({
       limit,
       offset: 0,
       from,
+      to,
       client: client === ANY ? null : client,
       request_model: requestModel === ANY ? null : requestModel,
       model: routedModel === ANY ? null : routedModel,
@@ -137,7 +172,7 @@ export default function TrafficPage() {
       is_stream: onlyStream ? true : null,
       expr: expr.trim() || null,
     }),
-    [limit, from, client, requestModel, routedModel, protocol, status, onlyStream, expr],
+    [limit, from, to, client, requestModel, routedModel, protocol, status, onlyStream, expr],
   );
 
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
@@ -281,6 +316,7 @@ export default function TrafficPage() {
         .filter((r) => {
           if (r.done) return false;
           if (from !== null && r.ts < from) return false;
+          if (to !== null && r.ts > to) return false;
           if (client !== ANY && r.client !== client) return false;
           if (requestModel !== ANY && r.request_model !== requestModel) return false;
           if (routedModel !== ANY && r.model !== routedModel) return false;
@@ -292,6 +328,7 @@ export default function TrafficPage() {
     [
       inflight,
       from,
+      to,
       client,
       requestModel,
       routedModel,
@@ -314,8 +351,11 @@ export default function TrafficPage() {
   const items = data?.items ?? [];
   const total = data?.total ?? 0;
 
+  // 时间这条件看**算出来的两端**而不是看选了哪个页签：自定义范围两端都空着时
+  // 其实没筛任何东西，那时不该让「清除筛选」冒出来。
   const hasFilter =
-    range !== "all" ||
+    from !== null ||
+    to !== null ||
     client !== ANY ||
     requestModel !== ANY ||
     routedModel !== ANY ||
@@ -326,6 +366,8 @@ export default function TrafficPage() {
 
   const resetFilters = () => {
     setRange("all");
+    setCustomFrom("");
+    setCustomTo("");
     setClient(ANY);
     setRequestModel(ANY);
     setRoutedModel(ANY);
@@ -471,7 +513,15 @@ export default function TrafficPage() {
                 </Button>
               )}
 
-              <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+              <span className="text-muted-foreground ml-auto flex items-center gap-2 text-xs tabular-nums">
+                {data?.truncated && (
+                  <span
+                    className="text-amber-600 dark:text-amber-500"
+                    title="表达式会先扫最近一批日志；涉及报文内容（body / headers）的条件还受扫描预算限制，所以可能没覆盖到全部日志。缩小时间范围可以让它扫得更全。"
+                  >
+                    仅覆盖部分日志
+                  </span>
+                )}
                 共 {formatNumber(total)} 条
               </span>
             </div>
@@ -486,13 +536,30 @@ export default function TrafficPage() {
               </span>
               <Tabs value={range} onValueChange={(v) => setRange(v as RangePreset)}>
                 <TabsList>
-                  {(Object.keys(RANGE_LABEL) as RangePreset[]).map((r) => (
+                  {PRESETS.map((r) => (
                     <TabsTrigger key={r} value={r}>
                       {RANGE_LABEL[r]}
                     </TabsTrigger>
                   ))}
                 </TabsList>
               </Tabs>
+
+              {/* 自定义与预设互斥：选中它时页签那边没有高亮的那一个。 */}
+              <TimeRangePicker
+                active={range === "custom"}
+                from={customFrom}
+                to={customTo}
+                onChange={({ from: f, to: t }) => {
+                  setCustomFrom(f);
+                  setCustomTo(t);
+                  setRange("custom");
+                }}
+                onClear={() => {
+                  setCustomFrom("");
+                  setCustomTo("");
+                  if (range === "custom") setRange("all");
+                }}
+              />
             </div>
           </CardContent>
         </Card>

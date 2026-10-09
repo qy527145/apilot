@@ -426,7 +426,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 | `mod.rs` | `TrafficStats`（并发守护 `ActiveRequest`、累计计数、TTFB 环形窗口）、`TrafficEvent` |
 | `events.rs` | `EventBus`（按类型推送 + 节流）、`Throttle`、`event_names` |
 | `stream_events.rs` | **流式实时事件**：`StreamBatcher`（攒批 + 封顶 + 单帧截断，纯逻辑）、`StreamEmitter`（观察者实现，`Drop` 兜底断连）、`StreamDelta`（推流用的增量形态） |
-| `log_filter.rs` | **监控页「自定义表达式」筛选的求值器**：QuickJS 里跑用户表达式，逐行判断要不要显示。线程本地引擎，单行 50ms / 整批 500ms 预算。求值放在**后端**是因为日志分页、报文在 `captures` 另一张表 —— 前端只看得见当前页。内置对象与字段见 `expr_context` |
+| `log_filter.rs` | **监控页「自定义表达式」筛选的求值器**：QuickJS 里跑用户表达式，逐行判断要不要显示。线程本地引擎。**报文按需取用**：元数据里只放哨兵，表达式真读到才回调 Rust 解析；于是要走两趟 —— `probe`（只带元数据的探测趟，报出哪些行需要报文）与 `filter`（带真报文的终趟）。单行 1s / 整批 2s / 报文 64MB 预算，撞上批预算标 `truncated` 而不是报错。求值放在**后端**是因为日志分页、报文在 `captures` 另一张表 —— 前端只看得见当前页。内置对象与字段见 `expr_meta` |
 
 **事件名**（前端 `listen` 用的字面量，改了就静默破坏订阅）：
 
@@ -533,7 +533,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择 + 每渠道的上游模型名，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明与**自动检测** —— 逐个协议探一次，只补勾不取消；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选；每行还有**单次模型测试**与三枚**能力徽标**，点徽标即实测一项）；`CatalogCapabilitiesDialog` / `CatalogPriceDialog` 是两个目录导入入口 |
-| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库）；`FilterExprPanel`（监控页的**自定义表达式**筛选：编辑框 + 后端行内校验 + 示例 + 内置对象结构说明） |
+| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库）；`FilterExprPanel`（监控页的**自定义表达式**筛选：编辑框 + 后端行内校验 + 示例 + 内置对象结构说明）；`TimeRangePicker`（监控页的**自定义时间范围**：按钮上直接显示所选区间，弹层里两个时间框 + 常用区间；与预设页签互斥） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
 只会在运行时静默失败。

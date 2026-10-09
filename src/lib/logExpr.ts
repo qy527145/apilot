@@ -18,7 +18,7 @@ export type CompiledExpr = (ctx: Record<string, unknown>) => boolean;
 /**
  * 为一条进行中的请求组装内置对象。
  *
- * 字段与后端 `expr_context` 一一对应，只是**响应侧全为 `null`** ——
+ * 字段与后端 `expr_meta` 一一对应，只是**响应侧全为 `null`** ——
  * 请求还没结束，上游还没回话，这里如实留空而不是编一个假值。
  * 用可选链（`ctx.response?.body`）写的表达式因此不会在这里炸掉。
  */

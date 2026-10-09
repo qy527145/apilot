@@ -13,6 +13,11 @@ use crate::storage::logs::{LogFilter, RequestDetail, RequestLog};
 pub struct Page<T> {
     pub items: Vec<T>,
     pub total: i64,
+    /// 表达式筛选没扫完（扫描预算用尽）时为真 —— 此时 `total` 只是**扫过的那部分**
+    /// 里的匹配数。普通查询恒为 false。界面必须如实说出来，否则用户会把一个
+    /// 少了的数字当成全部。
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[tauri::command]
@@ -20,8 +25,8 @@ pub async fn query_logs(
     shell: State<'_, Arc<AppShell>>,
     filter: LogFilter,
 ) -> AppResult<Page<RequestLog>> {
-    let (items, total) = crate::storage::logs::query(&shell.db, &filter).await?;
-    Ok(Page { items, total })
+    let page = crate::storage::logs::query(&shell.db, &filter).await?;
+    Ok(Page { items: page.items, total: page.total, truncated: page.truncated })
 }
 
 /// 筛选下拉的候选值。前端进监控页时取一次。

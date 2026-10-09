@@ -16,7 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-/** 内置对象的结构说明。改这里要同步 `log_filter.rs::expr_context` 与 `lib/logExpr.ts`。 */
+/** 内置对象的结构说明。改这里要同步 `log_filter.rs::expr_meta` 与 `lib/logExpr.ts`。 */
 const STRUCTURE = `{
   // —— 每条请求都有的日志字段 ——
   id, ts, client,
@@ -203,7 +203,9 @@ export function FilterExprPanel({ value, onChange }: FilterExprPanelProps) {
             <span>
               body 能解析成 JSON 时是对象，否则是字符串；没有捕获到就是 null。
               「进行中」的请求只有请求侧元数据，响应侧一律为 null。
-              表达式筛选最多扫描最近 5000 条匹配日志。
+              表达式先扫最近 5000 条日志；只有元数据条件（模型、状态、耗时…）能扫满
+              这个窗口，涉及报文内容（body、headers、method）的条件还受扫描预算限制 ——
+              这时列表上方会标出「仅覆盖部分日志」。
             </span>
           </div>
         </div>

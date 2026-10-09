@@ -563,6 +563,11 @@ export interface InflightRequest {
 export interface Page<T> {
   items: T[];
   total: number;
+  /**
+   * 表达式筛选没扫完时为真 —— 此时 `total` 只是**扫过的那部分**里的匹配数。
+   * 普通查询不会带上它。界面必须如实说出来，否则用户会把一个少了的数字当成全部。
+   */
+  truncated?: boolean;
 }
 
 /** 清空日志的结果：各删了多少条。 */

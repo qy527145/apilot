@@ -1,9 +1,14 @@
 //! 请求明细日志与流量捕获的读写。
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, SqlitePool};
 
 use crate::error::AppResult;
+// `Row` 已经被 sqlx 占了，这里给表达式的行另起一个名字，免得读的人以为
+// 「行」是数据库行 —— 它其实是喂给 JS 求值器的一行。
+use crate::traffic::log_filter::{lazy_slot, Payload, Row as ExprRow};
 
 /// 写入一条请求日志所需的全部字段。
 ///
@@ -268,8 +273,19 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
     Ok(())
 }
 
-/// 按条件分页查询。返回 `(本页数据, 满足条件的总数)`。
-pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<(Vec<RequestLog>, i64)> {
+/// 一页日志。
+///
+/// `truncated` 只可能在表达式筛选下为真 —— 见 `query_with_expr`：那时 `total`
+/// 是**扫过的那部分**里的匹配数，不是全库的口径。
+#[derive(Debug, Clone, Serialize)]
+pub struct LogPage {
+    pub items: Vec<RequestLog>,
+    pub total: i64,
+    pub truncated: bool,
+}
+
+/// 按条件分页查询。
+pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<LogPage> {
     let filter = filter.clone().normalized();
 
     // 表达式筛选走另一条路：它要读捕获报文，没法下推给 SQL 分页。
@@ -292,7 +308,7 @@ pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<(Vec<Requ
         .push_bind(filter.offset);
 
     let rows = qb.build().fetch_all(pool).await?;
-    Ok((rows.iter().map(row_to_log).collect(), total))
+    Ok(LogPage { items: rows.iter().map(row_to_log).collect(), total, truncated: false })
 }
 
 /// 表达式筛选时最多扫多少行。
@@ -305,46 +321,128 @@ pub async fn query(pool: &SqlitePool, filter: &LogFilter) -> AppResult<(Vec<Requ
 /// 表达式生效时实际是「最近 N 行里的匹配数」。这是刻意的取舍。
 const EXPR_SCAN_CAP: i64 = 5000;
 
-/// 表达式路径下的捕获列。别名 `c_` 前缀用来和日志列区分 ——
-/// 两张表都有 `upstream_url`、`path` 这类同名列，不前缀会在 `row.get` 撞上。
-const CAPTURE_COLUMNS: &str = "c.method AS c_method, \
-     c.request_headers AS c_request_headers, c.request_body AS c_request_body, \
-     c.upstream_headers AS c_upstream_headers, c.upstream_body AS c_upstream_body, \
-     c.upstream_response_headers AS c_upstream_response_headers, \
-     c.upstream_response_body AS c_upstream_response_body, \
-     c.response_headers AS c_response_headers, c.response_body AS c_response_body, \
-     c.stream_text AS c_stream_text";
+/// 第二趟取的捕获列 —— **一行捕获里除 request_id 之外的全部**。
+///
+/// 第一趟一列都不取，两个理由都是实测出来的：
+///
+/// - body 列是几 MB 的 BLOB，读进来再解析就是 out of memory 那个 bug 的一半；
+/// - 连 `method`、`headers` 这种小字段也不能在第一趟取。它们住在 `captures` 里，
+///   而那张表的行被几 MB 的报文撑得极长 —— 只为读一个小字段 JOIN 上去，
+///   「只看状态码」的表达式就从 15ms 变成 800ms（本机 425 行实测）。
+///
+/// 别名 `c_` 前缀用来和日志列区分 —— 两张表都有 `upstream_url`、`path` 这类
+/// 同名列，不前缀会在 `row.get` 撞上。
+const PAYLOAD_COLUMNS: &str = "method AS c_method, \
+     request_headers AS c_request_headers, response_headers AS c_response_headers, \
+     upstream_headers AS c_upstream_headers, \
+     upstream_response_headers AS c_upstream_response_headers, \
+     request_body AS c_request_body, response_body AS c_response_body, \
+     stream_text AS c_stream_text, upstream_body AS c_upstream_body, \
+     upstream_response_body AS c_upstream_response_body";
 
-/// 带表达式的查询：JOIN 捕获 → 逐行求值 → 内存里过滤和分页。
-async fn query_with_expr(
+/// 第二趟最多把多少字节的捕获读进内存。
+///
+/// 按**字节**而不是行数：行数拦不住「400 行 × 1.7MB」，而按字节算，只读 headers
+/// 的表达式（每行几 KB）能覆盖几千行，读 body 的只剩几十行 —— 两种都恰好落在
+/// 「一次查询几百 MB」这条安全线内。上限本身也只是兜底，真正先撞上的通常是
+/// 求值器那边的时间预算（每行解析上百毫秒）。
+const PAYLOAD_FETCH_BUDGET: usize = 64 * 1024 * 1024;
+
+/// 带表达式的查询：两趟求值 → 在内存里过滤和分页。
+///
+/// **第一趟**只查 `request_logs`，连 `captures` 都不 JOIN：凡是来自捕获的字段
+/// （method、headers、四个方向的 body）在元数据里都是哨兵，表达式读到的是
+/// `null`。于是「只看状态码」这类表达式**一次都不碰**那张几 MB 一行的表，
+/// 5000 行的窗口也就跑得完。
+///
+/// 读过报文的行会被求值器标成 `dirty` —— 包括读到 `null`、以及没写可选链时
+/// 直接抛错（`ctx.request.body.tools`）这两种。它们的结果**不可信**，必须由
+/// **第二趟**带上真报文重算。没被标记的行结果已经定音，不必再碰。
+///
+/// 第二趟按 `PAYLOAD_FETCH_BUDGET` 截住，超出就如实标 `truncated`。
+async fn query_with_expr(pool: &SqlitePool, filter: &LogFilter, expr: &str) -> AppResult<LogPage> {
+    query_with_expr_budgeted(pool, filter, expr, PAYLOAD_FETCH_BUDGET).await
+}
+
+/// 预算可调的版本。测试传小预算，才能不真的造 64MB 报文。
+async fn query_with_expr_budgeted(
     pool: &SqlitePool,
     filter: &LogFilter,
     expr: &str,
-) -> AppResult<(Vec<RequestLog>, i64)> {
-    let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(format!(
-        "SELECT {LOG_COLUMNS}, {CAPTURE_COLUMNS} \
-         FROM {LOG_FROM} LEFT JOIN captures c ON c.request_id = l.request_id WHERE 1=1"
-    ));
+    payload_budget: usize,
+) -> AppResult<LogPage> {
+    let mut qb: QueryBuilder<sqlx::Sqlite> =
+        QueryBuilder::new(format!("SELECT {LOG_COLUMNS} FROM {LOG_FROM} WHERE 1=1"));
     // 其余筛选条件（客户端、协议、时间…）照常下推给 SQL —— 少求值一行是一行。
     push_where(&mut qb, filter);
     qb.push(" ORDER BY l.ts DESC, l.id DESC LIMIT ")
         .push_bind(EXPR_SCAN_CAP);
 
     let rows = qb.build().fetch_all(pool).await?;
+    let logs: Vec<RequestLog> = rows.iter().map(row_to_log).collect();
 
-    let mut logs = Vec::with_capacity(rows.len());
-    let mut contexts = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let log = row_to_log(r);
-        contexts.push(expr_context(&log, r));
-        logs.push(log);
+    let first = crate::traffic::log_filter::probe(expr, logs.len(), |i| ExprRow {
+        meta: expr_meta(&logs[i]),
+        payload: Payload::default(),
+    })
+    .map_err(expr_err)?;
+
+    let mut mask = first.mask;
+    let mut truncated = first.truncated;
+    let mut dirty = first.dirty;
+
+    if !dirty.is_empty() {
+        let ids: Vec<&str> = dirty.iter().map(|&i| logs[i].request_id.as_str()).collect();
+
+        // 先问一句每行的捕获有多大，再按扫描顺序累加到预算为止：只取前面这些行，
+        // 内存才有上限。`length()` 走的是记录头，不会把 BLOB 内容拖出来。
+        let sizes = fetch_payload_sizes(pool, &ids).await?;
+        let mut left = payload_budget;
+        let mut take = 0usize;
+        for id in &ids {
+            let size = sizes.get(*id).copied().unwrap_or(0);
+            if size > left {
+                break;
+            }
+            left -= size;
+            take += 1;
+        }
+        // 第一行就超预算时也硬着头皮算它一行：一行大报文的成败该由求值器的内存
+        // 上限去判（它会给出「报文过大」的错因），而不是在这里被静默跳过 ——
+        // 那样用户看到的会是「一条都没匹配」，方向完全错。
+        if take == 0 {
+            take = 1;
+        }
+        if take < dirty.len() {
+            dirty.truncate(take);
+            truncated = true;
+        }
+
+        let ids: Vec<&str> = dirty.iter().map(|&i| logs[i].request_id.as_str()).collect();
+        let mut payloads = fetch_payloads(pool, &ids).await?;
+
+        let second = crate::traffic::log_filter::filter(expr, dirty.len(), |j| ExprRow {
+            meta: expr_meta(&logs[dirty[j]]),
+            payload: payloads.remove(&logs[dirty[j]].request_id).unwrap_or_default(),
+        })
+        .map_err(expr_err)?;
+
+        // 第二趟自己也会撞预算。没轮到的行**不能**留着第一趟的结果 ——
+        // 那是拿空报文算出来的，留着就是撒谎。按不命中处理并把 truncated 立起来。
+        let recomputed = second.mask.len();
+        for (j, hit) in second.mask.into_iter().enumerate() {
+            mask[dirty[j]] = hit;
+        }
+        for &i in dirty.iter().skip(recomputed) {
+            mask[i] = false;
+        }
+        if second.truncated || recomputed < dirty.len() {
+            truncated = true;
+        }
     }
 
-    // 表达式出错（语法错 / 执行超时）时**如实报错**，不能静默返回空 ——
-    // 空结果看起来就是「没有匹配的请求」，会把用户引到完全错误的方向。
-    let mask = crate::traffic::log_filter::filter(expr, &contexts)
-        .map_err(|e| crate::error::AppError::msg(format!("筛选表达式出错：{e}")))?;
-
+    // 截断时 `mask` 比 `logs` 短：没被求值的行在这里被 zip 丢掉（按不命中处理），
+    // 与「扫描窗口」是同一类取舍 —— 由 `truncated` 如实告诉用户。
     let matched: Vec<RequestLog> = logs
         .into_iter()
         .zip(mask)
@@ -354,20 +452,77 @@ async fn query_with_expr(
     let total = matched.len() as i64;
     let offset = filter.offset.max(0) as usize;
     let limit = filter.limit.max(1) as usize;
-    let page = matched.into_iter().skip(offset).take(limit).collect();
-    Ok((page, total))
+    let items = matched.into_iter().skip(offset).take(limit).collect();
+    Ok(LogPage { items, total, truncated })
 }
 
-/// 组装一段表达式能看到的上下文 —— 就是界面上「内置对象」那份说明的实现。
+/// 表达式出错时的统一错因。
+///
+/// 表达式出错（语法错、某一行**自己**跑飞）时**如实报错**，不能静默返回空 ——
+/// 空结果看起来就是「没有匹配的请求」，会把用户引到完全错误的方向。
+/// 「扫到一半停下」不在此列：那不是错误，走 `Outcome::truncated`。
+fn expr_err(e: String) -> crate::error::AppError {
+    crate::error::AppError::msg(format!("筛选表达式出错：{e}"))
+}
+
+/// 只把这几个 request_id 的报文选出来。
+///
+/// **只搬字节、不解析** —— 解析推迟到表达式真的读到它的时候（见 `traffic::log_filter`）。
+async fn fetch_payloads(pool: &SqlitePool, ids: &[&str]) -> AppResult<HashMap<String, Payload>> {
+    let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(format!(
+        "SELECT c.request_id AS c_request_id, {PAYLOAD_COLUMNS} FROM captures c \
+         WHERE c.request_id IN ("
+    ));
+    push_in_list(&mut qb, ids);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<String, _>("c_request_id"), expr_payload(r)))
+        .collect())
+}
+
+/// 这几行的捕获各有多大（字节）。第二趟据此决定能带上多少行。
+///
+/// 只取长度不取内容：`length()` 读的是记录头里的字段宽度，不会把几 MB 的 BLOB
+/// 拖出来 —— 否则这个「先看看有多大」的查询自己就先把内存吃掉了。
+async fn fetch_payload_sizes(pool: &SqlitePool, ids: &[&str]) -> AppResult<HashMap<String, usize>> {
+    let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
+        "SELECT request_id, coalesce(length(request_body), 0) \
+             + coalesce(length(response_body), 0) + coalesce(length(stream_text), 0) \
+             + coalesce(length(upstream_body), 0) \
+             + coalesce(length(upstream_response_body), 0) \
+             + coalesce(length(request_headers), 0) \
+             + coalesce(length(response_headers), 0) \
+             + coalesce(length(upstream_headers), 0) \
+             + coalesce(length(upstream_response_headers), 0) AS bytes \
+         FROM captures WHERE request_id IN (",
+    );
+    push_in_list(&mut qb, ids);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    Ok(rows.iter().map(|r| (r.get::<String, _>("request_id"), r.get::<i64, _>("bytes") as usize)).collect())
+}
+
+/// 给 `IN (...)` 填参数。两个查询共用，免得各写一遍还写歪。
+fn push_in_list(qb: &mut QueryBuilder<'_, sqlx::Sqlite>, ids: &[&str]) {
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind((*id).to_string());
+    }
+    sep.push_unseparated(")");
+}
+
+/// 组装表达式能看到的**元数据** —— 就是界面上「内置对象」那份说明的实现。
 ///
 /// 字段名用 camelCase：写表达式的用户面对的是 JS，`latency_ms` 那种下划线
 /// 命名在 JS 里格格不入。**改这里就必须同步改前端的说明面板与
 /// `src/lib/logExpr.ts` 的进行中求值**，否则文档与行为会对不上。
-fn expr_context(log: &RequestLog, r: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
+///
+/// 凡是从捕获来的字段（method、headers、四个方向的 body）只放哨兵，真值由
+/// `expr_payload` 按需给 —— 所以这里**不需要数据库行**，也就不会 JOIN captures。
+fn expr_meta(log: &RequestLog) -> String {
     use serde_json::json;
-
-    let headers = |col: &str| parse_json(r.get::<Option<String>, _>(col));
-    let method: String = r.get::<Option<String>, _>("c_method").unwrap_or_default();
 
     json!({
         // --- 日志本身的字段 ---
@@ -397,54 +552,45 @@ fn expr_context(log: &RequestLog, r: &sqlx::sqlite::SqliteRow) -> serde_json::Va
 
         // --- 客户端 → Apilot ---
         "request": {
-            "method": method,
+            "method": lazy_slot("request.method"),
             "path": log.path,
-            "headers": headers("c_request_headers"),
-            "body": body_to_json(r.get::<Option<Vec<u8>>, _>("c_request_body")),
+            "headers": lazy_slot("request.headers"),
+            "body": lazy_slot("request.body"),
         },
         // --- Apilot → 客户端 ---
         "response": {
-            "headers": headers("c_response_headers"),
-            "body": response_body(r),
+            "headers": lazy_slot("response.headers"),
+            "body": lazy_slot("response.body"),
         },
         // --- Apilot → 上游 ---
         "upstreamRequest": {
             "url": log.upstream_url,
-            "headers": headers("c_upstream_headers"),
-            "body": body_to_json(r.get::<Option<Vec<u8>>, _>("c_upstream_body")),
+            "headers": lazy_slot("upstreamRequest.headers"),
+            "body": lazy_slot("upstreamRequest.body"),
         },
         // --- 上游 → Apilot ---
         "upstreamResponse": {
             "status": log.upstream_status,
-            "headers": headers("c_upstream_response_headers"),
-            "body": body_to_json(r.get::<Option<Vec<u8>>, _>("c_upstream_response_body")),
+            "headers": lazy_slot("upstreamResponse.headers"),
+            "body": lazy_slot("upstreamResponse.body"),
         },
     })
+    .to_string()
 }
 
-/// 客户端收到的那份响应体。流式没有完整 body，回落到拼接后的文本 ——
-/// 否则对绝大多数流式请求来说 `ctx.response.body` 恒为 null，等于没用。
-fn response_body(r: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
-    let body = body_to_json(r.get::<Option<Vec<u8>>, _>("c_response_body"));
-    if !body.is_null() {
-        return body;
-    }
-    match r.get::<Option<String>, _>("c_stream_text") {
-        Some(t) => serde_json::Value::String(t),
-        None => serde_json::Value::Null,
-    }
-}
-
-/// 报文 → 表达式里的值：能当 JSON 解就解成对象，否则按字符串给。
-///
-/// 不强制 JSON 是有意的：被截断的报文、非 JSON 的内容都解不出来，而那些恰恰
-/// 可能是用户想筛的东西 —— 退化成字符串比变成 `null` 有用得多。
-fn body_to_json(bytes: Option<Vec<u8>>) -> serde_json::Value {
-    match bytes {
-        None => serde_json::Value::Null,
-        Some(b) => serde_json::from_slice(&b).unwrap_or_else(|_| {
-            serde_json::Value::String(String::from_utf8_lossy(&b).into_owned())
-        }),
+/// 一行里按需取用的捕获内容。构造它只搬字节，**不解析** —— 那正是它能按需的原因。
+fn expr_payload(r: &sqlx::sqlite::SqliteRow) -> Payload {
+    Payload {
+        request_method: r.get::<Option<String>, _>("c_method"),
+        request_headers: r.get::<Option<String>, _>("c_request_headers"),
+        response_headers: r.get::<Option<String>, _>("c_response_headers"),
+        upstream_request_headers: r.get::<Option<String>, _>("c_upstream_headers"),
+        upstream_response_headers: r.get::<Option<String>, _>("c_upstream_response_headers"),
+        request_body: r.get::<Option<Vec<u8>>, _>("c_request_body"),
+        response_body: r.get::<Option<Vec<u8>>, _>("c_response_body"),
+        response_stream_text: r.get::<Option<String>, _>("c_stream_text"),
+        upstream_request_body: r.get::<Option<Vec<u8>>, _>("c_upstream_body"),
+        upstream_response_body: r.get::<Option<Vec<u8>>, _>("c_upstream_response_body"),
     }
 }
 
@@ -1004,7 +1150,7 @@ mod tests {
         updated.status_code = 500;
         insert(&p, &updated).await.unwrap();
 
-        let (items, total) = query(&p, &LogFilter::default()).await.unwrap();
+        let LogPage { items, total, .. } = query(&p, &LogFilter::default()).await.unwrap();
         assert_eq!(total, 1, "同一 request_id 不应产生两行");
         assert_eq!(items[0].status_code, 500);
     }
@@ -1015,7 +1161,7 @@ mod tests {
         insert(&p, &rec("r1", "claude-code", "claude-sonnet-5")).await.unwrap();
         insert(&p, &rec("r2", "codex", "gpt-5")).await.unwrap();
 
-        let (items, total) = query(
+        let LogPage { items, total, .. } = query(
             &p,
             &LogFilter {
                 client: Some("codex".into()),
@@ -1027,7 +1173,7 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(items[0].request_id, "r2");
 
-        let (items, _) = query(
+        let LogPage { items, .. } = query(
             &p,
             &LogFilter {
                 model: Some("claude-sonnet-5".into()),
@@ -1047,7 +1193,7 @@ mod tests {
         insert(&p, &old).await.unwrap();
         insert(&p, &rec("new", "a", "m")).await.unwrap();
 
-        let (_, total) = query(
+        let LogPage { total, .. } = query(
             &p,
             &LogFilter {
                 from: Some(now_ms() - 1000),
@@ -1060,6 +1206,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_filters_by_an_explicit_end_time() {
+        // 监控页「自定义时间范围」的下界就是它。两端都是**闭区间**：只给下界的话，
+        // 用户选「10:00 到 11:00」会把 11:00 之后的一并带出来。
+        let p = pool().await;
+        let at = |id: &str, ts: i64| {
+            let mut r = rec(id, "a", "m");
+            r.ts = ts;
+            r
+        };
+        insert(&p, &at("old", 1_000)).await.unwrap();
+        insert(&p, &at("mid", 2_000)).await.unwrap();
+        insert(&p, &at("new", 3_000)).await.unwrap();
+
+        let ids = query_ids(
+            &p,
+            LogFilter {
+                from: Some(1_500),
+                to: Some(2_500),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ids, vec!["mid"]);
+    }
+
+    #[tokio::test]
     async fn query_filters_cache_hits() {
         let p = pool().await;
         insert(&p, &rec("miss", "a", "m")).await.unwrap();
@@ -1069,7 +1241,7 @@ mod tests {
         hit.saved_quota = 300;
         insert(&p, &hit).await.unwrap();
 
-        let (items, total) = query(
+        let LogPage { items, total, .. } = query(
             &p,
             &LogFilter {
                 only_cache_hit: Some(true),
@@ -1089,7 +1261,7 @@ mod tests {
             insert(&p, &rec(&format!("r{i}"), "a", "m")).await.unwrap();
         }
 
-        let (page, total) = query(
+        let LogPage { items: page, total, .. } = query(
             &p,
             &LogFilter {
                 limit: 3,
@@ -1111,7 +1283,7 @@ mod tests {
             r.ts = ts;
             insert(&p, &r).await.unwrap();
         }
-        let (items, _) = query(&p, &LogFilter::default()).await.unwrap();
+        let LogPage { items, .. } = query(&p, &LogFilter::default()).await.unwrap();
         assert_eq!(items[0].ts, 3_000);
     }
 
@@ -1429,7 +1601,7 @@ mod tests {
         assert_eq!(logs, 2);
         assert_eq!(captures, 1);
 
-        let (items, total) = query(&p, &LogFilter::default()).await.unwrap();
+        let LogPage { items, total, .. } = query(&p, &LogFilter::default()).await.unwrap();
         assert!(items.is_empty());
         assert_eq!(total, 0);
         assert!(get_detail(&p, "r1").await.unwrap().is_none());
@@ -1480,7 +1652,7 @@ mod tests {
     }
 
     async fn query_ids(p: &SqlitePool, f: LogFilter) -> Vec<String> {
-        let (items, _) = query(p, &f).await.unwrap();
+        let LogPage { items, .. } = query(p, &f).await.unwrap();
         items.into_iter().map(|r| r.request_id).collect()
     }
 
@@ -1619,9 +1791,137 @@ mod tests {
         insert(&p, &rec("a", "c", "m1")).await.unwrap();
         insert(&p, &rec("b", "c", "m2")).await.unwrap();
 
-        let (items, total) = query(&p, &LogFilter::default()).await.unwrap();
+        let LogPage { items, total, .. } = query(&p, &LogFilter::default()).await.unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn expr_filter_reads_the_body_via_the_second_pass() {
+        // 第一趟不带报文（读到的永远是 null），所以「按 body 筛」必须靠第二趟补上 ——
+        // 少了第二趟，这条会一条都不命中。
+        let p = pool().await;
+        insert(&p, &rec("r1", "claude-code", "m")).await.unwrap();
+        save_capture(
+            &p,
+            &CaptureRecord {
+                request_id: "r1".into(),
+                request_body: Some(br#"{"tools":[{"name":"bash"}]}"#.to_vec()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let page = query(
+            &p,
+            &LogFilter {
+                expr: Some(r#"ctx.request.body.tools.length === 1"#.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert!(!page.truncated);
+    }
+
+    #[tokio::test]
+    async fn expr_filter_keeps_metadata_only_results_intact() {
+        // 不读报文的表达式在第一趟就定音了：结果该是对的，也不该被标成截断。
+        let p = pool().await;
+        insert(&p, &rec("ok", "a", "m")).await.unwrap();
+        let mut bad = rec("bad", "a", "m");
+        bad.status_code = 500;
+        insert(&p, &bad).await.unwrap();
+
+        let page = query(
+            &p,
+            &LogFilter {
+                expr: Some("ctx.status >= 400".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].request_id, "bad");
+        assert!(!page.truncated);
+    }
+
+    /// 造一行：日志 + 捕获，捕获带指定大小的 body。
+    async fn row_with_body(p: &SqlitePool, id: &str, body: Vec<u8>) {
+        insert(p, &rec(id, "a", "m")).await.unwrap();
+        save_capture(
+            p,
+            &CaptureRecord { request_id: id.into(), request_body: Some(body), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expr_filter_reports_a_truncated_scan() {
+        // 第二趟的字节预算用尽时必须如实标 truncated：没重算的行不能拿「读到空
+        // 报文」的第一趟结果冒充结论 —— 那样用户会看到一个少了的匹配数，
+        // 却以为已经扫完了。
+        let p = pool().await;
+        for i in 0..6 {
+            let id = format!("r{i}");
+            let mut body = br#"{"hit":true,"pad":""#.to_vec();
+            body.extend(vec![b'x'; 1024]);
+            body.extend(br#""}"#);
+            row_with_body(&p, &id, body).await;
+        }
+
+        let page = query_with_expr_budgeted(
+            &p,
+            &LogFilter { expr: Some("ctx.request.body.hit === true".into()), limit: 1000, ..Default::default() },
+            "ctx.request.body.hit === true",
+            3 * 1024,
+        )
+        .await
+        .unwrap();
+
+        assert!(page.truncated, "预算用尽必须报出来");
+        assert_eq!(page.total, 2, "只有重算过的两行才算数");
+    }
+
+    #[tokio::test]
+    async fn expr_filter_widens_its_window_when_payloads_are_small() {
+        // 按字节算预算的好处：只读 headers 的表达式每行才几 KB，于是 60 行
+        // 全都算得上 —— 换成一个固定行数上限就会白白丢掉一半。
+        let p = pool().await;
+        for i in 0..60 {
+            let id = format!("r{i}");
+            row_with_body(&p, &id, br#"{"hit":true}"#.to_vec()).await;
+            save_capture(
+                &p,
+                &CaptureRecord {
+                    request_id: id,
+                    request_headers: serde_json::json!({ "x-hit": "1" }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let page = query(
+            &p,
+            &LogFilter {
+                expr: Some(r#"ctx.request.headers["x-hit"] === "1""#.into()),
+                limit: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!page.truncated, "几十行小 headers 远在预算之内");
+        assert_eq!(page.total, 60, "每一行都该被算过");
     }
 
     // -----------------------------------------------------------------------
