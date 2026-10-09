@@ -22,7 +22,10 @@ use crate::takeover::patch;
 ///
 /// 放 `spawn_blocking`：这是个真起进程的同步调用，不该占着异步运行时。返回的是给用户
 /// 看的那句话（没什么可说时是 `None`）。
-async fn restart_codex_daemon(id: ClientId) -> Option<String> {
+///
+/// 接管与「策略变更后的自动重写」都走它；`serve_on` 那条路用的是同步的
+/// `codex_daemon::restart_if_running`（那里没有异步上下文可挂）。
+pub(crate) async fn restart_codex_daemon(id: ClientId) -> Option<String> {
     if id != ClientId::Codex {
         return None;
     }

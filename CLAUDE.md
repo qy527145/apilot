@@ -16,7 +16,7 @@ Tauri 2 + React 19，后端约 21k 行 Rust。
 ```bash
 source scripts/msvc-env.sh     # 每个新 shell 都要执行一次
 cd src-tauri
-cargo test                     # 849 个测试
+cargo test                     # 856 个测试
 cargo check --all-targets      # 期望零警告
 cargo build
 ```
@@ -61,7 +61,8 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **加一个新协议**（如 Gemini） | `protocol/dto.rs` 加 `Protocol` 变体 → 新建 `protocol/<name>/`（request/response/stream/mod）→ `protocol/codec.rs::CodecRegistry::new` 注册 → 按需加 `gateway/router.rs` 路由 |
 | **加一个新客户端接管** | `takeover/clients.rs` 加 `ClientId` 变体 + `config_paths()` + `plan_apply()`（顺带补 `stored_base_url()`）；`config/paths.rs` 加路径函数 |
 | **改「客户端配置里的网关地址」** | 写地址的只有一条路：`gateway/server.rs::base_url()`（通配监听地址会折算成回环）。网关换地址后跟着改的逻辑是 `takeover/clients.rs::repoint_taken_over`，**触发点在 `gateway/server.rs::serve_on` 而不是设置命令里**（只有那里知道网关真正跑在哪）。**Codex 还要顺手重启它的常驻 app-server**（`takeover/codex_daemon.rs`）—— 接管/还原/换地址三条路都接上了，漏掉任一条，用户看到的就是「明明改了却不生效」|
-| **改「Codex 走不走 Responses Lite」** | **`use_responses_lite` 是唯一开关**（决定工具走 `input[].additional_tools` 还是顶层 `tools`），而它来自 Codex 的**内置模型目录** —— GPT 系名字内置就是 Lite，而上游对这形状常常「收下、200、静默忽略」。两条对策由 `AppSettings::client_model_mode` 四选一（`takeover/clients.rs::codex_config`）：写模型名（`rename`，不依赖网关但没有 `apply_patch`）/ 下发目录（`catalog`，有 `apply_patch` 但要多两个开关 + 网关得可达）/ 都写（`both`）/ 不碰。目录内容在 `codex/mod.rs`（**分两半**：vendored 那半管 GPT 系名字，`entry` 那半管 Apilot 自己的模型名，**三个字段必须一起改**），出口是 `gateway/router.rs` 的 `/codex/models` |
+| **改接管策略 / 模型策略什么时候生效** | **保存即重写**：`update_settings` / `set_model_policy` 之后跑 `commands/app.rs::reapply_after_policy_change` → `takeover/clients.rs::reapply_taken_over`（只碰**会消费 `ClientPlan`** 的客户端，目前只有 Codex；产出与现状一致就不写，网关没起时用配置里现存的地址）。判据是 `takeover/clients.rs::plan_inputs_differ`（只看真会写进客户端的那两样）—— 与「换地址」那条（`repoint_taken_over`，只看地址）**不是同一个判据**，别合并 |
+| **改「Codex 走不走 Responses Lite」** | **`use_responses_lite` 是唯一开关**（决定工具走 `input[].additional_tools` 还是顶层 `tools`），而它来自 Codex 的**内置模型目录** —— GPT 系名字内置就是 Lite，而上游对这形状常常「收下、200、静默忽略」。两条对策由 `AppSettings::client_model_mode` 四选一（默认 `both`，见 `takeover/clients.rs::codex_config`）：写模型名（`rename`，不依赖网关但没有 `apply_patch`）/ 下发目录（`catalog`，有 `apply_patch` 但要多两个开关 + 网关得可达）/ 都写（`both`）/ 不碰。目录内容在 `codex/mod.rs`（**分两半**：vendored 那半管 GPT 系名字，`entry` 那半管 Apilot 自己的模型名，**三个字段必须一起改**），出口是 `gateway/router.rs` 的 `/codex/models` |
 | **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → 同文件 `Provider::auth_header()`（**鉴权头的唯一构造点**，出站转发、连通探测、拉模型列表都走它） |
 | **改「直通还是转换」的判定** | `storage/models.rs::Provider::wire_for`（渠道声明的协议集合命中就直通）+ `gateway/pipeline.rs::prefer_native_protocol`（多渠道路由时同协议优先）→ 同步更新 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md) |
 | **改出站 URL 拼接** | `storage/models.rs::Provider::endpoint`（协议默认路径，会补 `/v1`）/ `endpoint_verbatim`（用户手写路径，**不补** `/v1`） |

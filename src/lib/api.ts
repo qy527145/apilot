@@ -278,11 +278,11 @@ export interface GatewayStatus {
 /**
  * 接管客户端时对它模型配置做什么。
  *
- * - `off`：不碰（默认）。
+ * - `off`：不碰客户端配置。
  * - `rename`：写模型名。绕开 Codex 的 Responses Lite，不依赖网关，代价是没有 apply_patch。
  * - `catalog`：下发模型目录地址。拿到完整元数据（含 apply_patch），代价是要多写两个
  *   Codex 开关、且客户端启动时得够得着网关。
- * - `both`：两个都写 —— 目录取不到时正好轮到名字那条路兜底。
+ * - `both`：两个都写（默认）—— 目录取不到时正好轮到名字那条路兜底。
  */
 export type ClientModelMode = "off" | "rename" | "catalog" | "both";
 
@@ -300,7 +300,7 @@ export interface AppSettings {  listen_host: string;
   /** 模型替换。默认 `mode: "passthrough"`（不改写）。 */
   model_policy: ModelPolicy;
   /**
-   * 接管客户端时怎么让客户端「正确地说话」。默认 `"off"`（不碰客户端配置）。
+   * 接管客户端时怎么让客户端「正确地说话」。默认 `"both"`（两个都写）。
    *
    * 两个手段解决同一件事的两面，详见 `src-tauri/src/codex/mod.rs`。
    */

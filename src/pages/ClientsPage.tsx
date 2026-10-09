@@ -64,6 +64,14 @@ const MODES: { value: ClientModelMode; label: string; hint: string }[] = [
   },
 ];
 
+/**
+ * 设置还没读回来时按这个预选。
+ *
+ * **必须与后端 `AppSettings::default()` 一致**（那里是 `ClientModelMode::Both`）：
+ * 不一致的话，首屏会先显示一个用户从没选过的模式，读回来再跳一下。
+ */
+const DEFAULT_MODE: ClientModelMode = "both";
+
 export default function ClientsPage({
   onNavigate,
 }: {
@@ -97,7 +105,9 @@ export default function ClientsPage({
       api.updateSettings({ ...(settings as AppSettings), client_model_mode: mode }),
     onSuccess: (s) => {
       qc.setQueryData(qk.settings, s);
-      toast.success("已保存；重新接管一次才会写进客户端配置");
+      toast.success("已保存；已接管的客户端已按新策略重写", {
+        description: "重启客户端后生效。",
+      });
     },
   });
 
@@ -181,7 +191,7 @@ export default function ClientsPage({
               </p>
             </div>
             <Select
-              value={settings?.client_model_mode ?? "off"}
+              value={settings?.client_model_mode ?? DEFAULT_MODE}
               onValueChange={(v) => saveMode.mutate(v as ClientModelMode)}
               disabled={!settings || saveMode.isPending}
             >
@@ -197,7 +207,7 @@ export default function ClientsPage({
               </SelectContent>
             </Select>
             <p className="text-muted-foreground text-xs">
-              {MODES.find((m) => m.value === (settings?.client_model_mode ?? "off"))?.hint}
+              {MODES.find((m) => m.value === (settings?.client_model_mode ?? DEFAULT_MODE))?.hint}
             </p>
           </CardContent>
         </Card>

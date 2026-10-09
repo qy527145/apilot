@@ -433,7 +433,7 @@ pub struct AppSettings {
     /// 全局模型替换。默认关闭。
     pub model_policy: ModelPolicy,
 
-    /// 接管客户端时怎么让客户端「正确地说话」。默认什么都不做。
+    /// 接管客户端时怎么让客户端「正确地说话」。默认 `Both`（两个都写）。
     #[serde(
         default,
         // 旧键名。值那边由 `de_client_model_mode` 兼容（`true` = 只写模型名）。
@@ -459,17 +459,21 @@ pub struct AppSettings {
 ///   （取不到会静默退回内置目录，也就是 Lite）。
 ///
 /// 两个是**互补**的（`Both`），因为目录取不到时正好轮到名字那条路兜底。
+///
+/// 所以**默认就是 `Both`**：单用任何一条都留着一个已知的缺口 —— 只写名字要牺牲
+/// `apply_patch`，只下发目录在网关没起（或目录被撤）时静默退回 Lite。两条一起写，
+/// 缺口互相补上。想让 Apilot 一个字都不碰客户端配置的人，显式选 `Off`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientModelMode {
     /// 不碰客户端自己选的模型。
-    #[default]
     Off,
     /// 只写模型名。
     Rename,
     /// 只写模型目录地址（外加让它生效的两个开关）。
     Catalog,
     /// 两个都写。
+    #[default]
     Both,
 }
 
@@ -536,7 +540,7 @@ impl Default for AppSettings {
             cache_max_entries: 1000,
 
             model_policy: ModelPolicy::default(), // 默认关闭
-            client_model_mode: ClientModelMode::default(), // 默认不碰客户端的模型配置
+            client_model_mode: ClientModelMode::default(), // 默认两个都写：单走一条都会留缺口
             proxy: ProxySettings::default(),      // 默认跟随环境变量
         }
     }
@@ -871,8 +875,25 @@ mod tests {
     }
 
     #[test]
+    fn the_default_mode_writes_both_halves() {
+        // 默认值本身是个决定：只写名字要牺牲 apply_patch，只下发目录在网关没起时
+        // 会静默退回 Lite。所以默认两条一起写，让它们互相兜底。
+        let settings = AppSettings {
+            model_policy: ModelPolicy {
+                mode: ModelPolicyMode::Fallback,
+                active_model: Some("deepseek-chat".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(settings.client_model_mode, ClientModelMode::Both);
+        assert_eq!(settings.client_model("codex"), Some("deepseek-chat"));
+        assert!(settings.inject_catalog());
+    }
+
+    #[test]
     fn off_mode_writes_nothing() {
-        // 默认：用户自己选的模型名一个字都不该被我们改掉。
+        // 显式选了「不碰」时，用户自己挑的模型名一个字都不该被我们改掉。
         let settings = AppSettings {
             client_model_mode: ClientModelMode::Off,
             model_policy: ModelPolicy {

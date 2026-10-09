@@ -241,7 +241,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 GPT 系名字，就会落到 Codex 自己的兜底元数据上（那里没有 `apply_patch`），于是
 **「配了目录」和「换了模型名」互相抵消** —— 配了半天一点用没有。
 
-**接管会不会用它，由 `AppSettings::client_model_mode` 决定**（客户端页四选一，默认 `off`）：
+**接管会不会用它，由 `AppSettings::client_model_mode` 决定**（客户端页四选一，默认 `both`）：
 `catalog` / `both` 会把 `model_catalog_url` 写进客户端配置，`off` / `rename` 则会把
 它（和那两个开关）**删掉**。细节与四个模式各自的取舍见上面 takeover 一节。
 
@@ -335,7 +335,7 @@ quota           += tool_call_surcharge × 工具调用次数
 密钥也当成"不一致"，然后被 `plan_apply` 抹掉。
 
 **Codex 还会按模式多写两样东西**（`plan_codex` + `AppSettings::client_model_mode`，
-客户端页四选一，默认 `off`）。两样都在解决同一件事：**别让客户端走 Responses Lite**
+客户端页四选一，默认 `both`）。两样都在解决同一件事：**别让客户端走 Responses Lite**
 （工具塞进 `input[].additional_tools`）—— 那形状对不少上游是**静默失效**的：收下请求、
 返回 200、工具一个不认，模型只能把调用写成 DSML 正文。
 
@@ -344,7 +344,7 @@ quota           += tool_call_surcharge × 工具调用次数
 | `off` | 无 | 什么都不碰 |
 | `rename` | `model` | 换成 Codex 不认识的模型名 → 元数据退回兜底那份（经典顶层 `tools`）。**不用联网、不依赖任何客户端开关**；代价是没有 `apply_patch`，且按模型名配的路由规则会跟着变 |
 | `catalog` | `model_catalog_url` + `features.api_key_model_discovery` + `suppress_unstable_features_warning` | 拿到完整元数据（**含 `apply_patch`**）；代价是要多写两个开关、客户端启动时得够得着网关（取不到会静默退回 Lite） |
-| `both` | 上面两套 | 互补：目录取不到时正好轮到名字那条路兜底 |
+| `both` | 上面两套 | **默认**。互补：目录取不到时正好轮到名字那条路兜底 |
 
 两个细节值得记住：
 
@@ -355,7 +355,8 @@ quota           += tool_call_surcharge × 工具调用次数
   `patch::TomlOp` 加了 `Remove*`。代价是：万一用户在我们接管**之前**就自己设过同名键，
   切回 `off` 会把他的值一并清掉 —— 撞车极罕见，且比"留着我们塞进去的东西"好解释；
   要精确回到原样就用「还原」（写回接管前的原始字节）。
-- **改模式要重新接管一次**才生效（判据只看地址，见下）。
+- **改模式保存即生效**：设置写完就调 `reapply_taken_over` 把已接管的客户端重写一遍
+  （判据与触发点见下）。
 
 Claude Code / Gemini 那边**没有**注入模型：Claude 的接管反而是**清掉**模型覆盖键的，
 要给它注入得先想清楚和那个动作的关系。
@@ -374,9 +375,15 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 （`codex exec` 的用户全程不需要它，凭空拉起来是越界）；重启失败**不影响接管成败**，
 只在提示里让用户自己执行 `codex app-server daemon restart`。
 
-**判据是「客户端现在指的地址 ≠ 目标地址」**，所以只有地址变了才会写文件 —— 改上面那个
-开关本身不会触发写入，**改完开关要重新接管一次**。`repoint_taken_over` 逐客户端算模型名
-（模型策略允许给单个客户端单独指定），因此它收的是 `&AppSettings` 而不是一个模型名。
+**两条自动路，判据不同，别合并**：
+
+- **策略**（`client_model_mode` + 每个客户端的模型名）：`commands/app.rs` 在
+  `update_settings` / `set_model_policy` 之后调 `reapply_taken_over`，保存即重写。它只碰
+  **会消费 `ClientPlan`** 的客户端（目前只有 Codex），产出与现状逐字节一致时一个字节都不
+  写；网关没在跑时退回客户端配置里现存的地址（地址本就不该在这次改动里变）。
+- **地址**：「客户端现在指的地址 ≠ 目标地址」才写。触发点是 `serve_on`（启动 / 换地址 /
+  退回老地址），逐客户端算模型名（模型策略允许给单个客户端单独指定），因此它收的是
+  `&AppSettings` 而不是一个模型名。
 
 ---
 
@@ -533,7 +540,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 ## 测试
 
-849 个测试，**与实现同文件**（`#[cfg(test)] mod tests`），`cargo test` 全量运行。
+856 个测试，**与实现同文件**（`#[cfg(test)] mod tests`），`cargo test` 全量运行。
 
 | 层次 | 代表 |
 |---|---|
