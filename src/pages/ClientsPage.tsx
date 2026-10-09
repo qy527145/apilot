@@ -1,6 +1,14 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Eye, FilePenLine, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
+import {
+  AlertTriangle,
+  Eye,
+  FilePenLine,
+  Info,
+  RefreshCw,
+  RotateCcw,
+  ShieldCheck,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
@@ -117,6 +125,30 @@ const THINKING_MODES: { value: ThinkingMode; label: string; hint: string }[] = [
 
 /** 同 `DEFAULT_MODE` 的约定：必须与后端 `AppSettings::default()` 一致（那里是 `Off`）。 */
 const DEFAULT_THINKING_MODE: ThinkingMode = "off";
+
+/**
+ * 标签旁边那个 ⓘ：把「为什么要有这一项」收进去。
+ *
+ * 这两个下拉的每个选项都有代价，依据不能删；但整段摊在页面上会把真正要操作的
+ * 客户端列表挤到折叠线以下 —— 那才是这一页的主体。每个选项各自的后果仍然留在
+ * 下拉下面直接可见，只有背景说明收进这里。
+ */
+function Hint({ children }: { children: ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label="说明"
+          className="text-muted-foreground hover:text-foreground inline-flex shrink-0 cursor-help"
+        >
+          <Info className="size-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-sm">{children}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 export default function ClientsPage({
   onNavigate,
@@ -237,71 +269,74 @@ export default function ClientsPage({
           </div>
         )}
 
+        {/* 两个全局策略并排一行：它们只是两三个选项的下拉，正文（为什么这么设计）
+            收进 ⓘ 里。原来的写法把整段解释摊在页面上，把真正要操作的客户端列表
+            挤到折叠线以下 —— 而那才是这一页的主体。 */}
         <Card>
-          <CardContent className="space-y-3 py-4">
-            <div className="space-y-1">
-              <Label>接管时怎么处理模型配置</Label>
+          <CardContent className="grid gap-x-6 gap-y-4 py-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5">
+                <Label>接管时怎么处理模型配置</Label>
+                <Hint>
+                  Codex 用不用 Responses Lite 只由它的模型元数据决定，而 GPT 系名字内置就是
+                  Lite —— 工具被塞进 input 里的 additional_tools。有些上游收下这种请求、
+                  返回 200，工具却一个都不认，模型只能把工具调用当正文吐出来。
+                </Hint>
+              </div>
+              <Select
+                value={settings?.client_model_mode ?? DEFAULT_MODE}
+                onValueChange={(v) => saveMode.mutate(v as ClientModelMode)}
+                disabled={!settings || saveMode.isPending}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {MODES.map((m) => (
+                    <SelectItem key={m.value} value={m.value}>
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <p className="text-muted-foreground text-xs">
-                Codex 用不用 Responses Lite 只由它的模型元数据决定，而 GPT 系名字内置就是
-                Lite —— 工具被塞进 input 里的 additional_tools。有些上游收下这种请求、返回
-                200，工具却一个都不认，模型只能把工具调用当正文吐出来。
+                {MODES.find((m) => m.value === (settings?.client_model_mode ?? DEFAULT_MODE))?.hint}
               </p>
             </div>
-            <Select
-              value={settings?.client_model_mode ?? DEFAULT_MODE}
-              onValueChange={(v) => saveMode.mutate(v as ClientModelMode)}
-              disabled={!settings || saveMode.isPending}
-            >
-              <SelectTrigger className="w-full sm:w-80">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {MODES.map((m) => (
-                  <SelectItem key={m.value} value={m.value}>
-                    {m.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-muted-foreground text-xs">
-              {MODES.find((m) => m.value === (settings?.client_model_mode ?? DEFAULT_MODE))?.hint}
-            </p>
-          </CardContent>
-        </Card>
 
-        <Card>
-          <CardContent className="space-y-3 py-4">
-            <div className="space-y-1">
-              <Label>接管思考</Label>
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5">
+                <Label>接管思考</Label>
+                <Hint>
+                  三种客户端的思考都是靠请求参数控制的，所以这里不改客户端配置，而是由 Apilot
+                  在转发前改写参数。也因此它每一条请求都生效 —— 不用重启客户端，也不用重新接管
+                  一次。各家协议对应的参数名与取值并不通用，折算按上游渠道实际用的协议做。
+                </Hint>
+              </div>
+              <Select
+                value={settings?.thinking_mode ?? DEFAULT_THINKING_MODE}
+                onValueChange={(v) => saveThinking.mutate(v as ThinkingMode)}
+                disabled={!settings || saveThinking.isPending}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {THINKING_MODES.map((m) => (
+                    <SelectItem key={m.value} value={m.value}>
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <p className="text-muted-foreground text-xs">
-                三种客户端的思考都是靠请求参数控制的，所以这里不改客户端配置，而是由 Apilot
-                在转发前改写参数。也因此它每一条请求都生效 —— 不用重启客户端，也不用重新接管一次。
-                各家协议对应的参数名与取值并不通用，折算按上游渠道实际用的协议做。
+                {
+                  THINKING_MODES.find(
+                    (m) => m.value === (settings?.thinking_mode ?? DEFAULT_THINKING_MODE),
+                  )?.hint
+                }
               </p>
             </div>
-            <Select
-              value={settings?.thinking_mode ?? DEFAULT_THINKING_MODE}
-              onValueChange={(v) => saveThinking.mutate(v as ThinkingMode)}
-              disabled={!settings || saveThinking.isPending}
-            >
-              <SelectTrigger className="w-full sm:w-80">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {THINKING_MODES.map((m) => (
-                  <SelectItem key={m.value} value={m.value}>
-                    {m.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-muted-foreground text-xs">
-              {
-                THINKING_MODES.find(
-                  (m) => m.value === (settings?.thinking_mode ?? DEFAULT_THINKING_MODE),
-                )?.hint
-              }
-            </p>
           </CardContent>
         </Card>
 
