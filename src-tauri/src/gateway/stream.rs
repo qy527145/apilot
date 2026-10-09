@@ -373,7 +373,24 @@ where
                         // 单个事件解析失败不该中断整条流 —— 记下来继续，
                         // 否则客户端的回答会被从中间截断。观察者照样收到这个块，
                         // 只是增量是空的：坏帧恰恰是排查时最该看见的。
-                        tracing::warn!("流事件解析失败，已跳过: {e}");
+                        tracing::warn!("流事件解析失败，原样转发给客户端: {e}");
+
+                        // 解不出就**原样发给客户端**，而不是替它丢掉。
+                        //
+                        // 非标准事件解不出是常态（上游自定义的帧、不是 JSON 的
+                        // `data`），而"解不出"只说明 Apilot 的语义化视图缺一块，
+                        // 不说明这个事件没有内容 —— 丢了才是真把内容吞了。
+                        // 客户端的 SSE 解析器本来就按事件名挑、认不出的跳过
+                        // （Claude Code 与 Codex 都如此），多一帧不会把它弄坏。
+                        //
+                        // 只在**转码**这条路上补发：直通时这一个块的原始字节上面
+                        // 已经发过了，再发一次就是重复。补上 `\n\n` 是因为
+                        // `take_sse_block` 只回块内容，不回上游用的是哪种换行。
+                        if !passthrough {
+                            let bytes = Bytes::from(format!("{block}\n\n"));
+                            raw_client.push(&bytes);
+                            yield Ok::<Bytes, std::io::Error>(bytes);
+                        }
                         Vec::new()
                     }
                 };
@@ -663,6 +680,72 @@ mod tests {
         assert!(String::from_utf8_lossy(&client_raw).contains("chat.completion.chunk"));
         assert_ne!(outcome.raw_upstream, client_raw);
         assert_eq!(client_raw, bytes, "下游原始帧应等于客户端实际收到的字节");
+    }
+
+    /// 解不出的事件照样要送到客户端 —— **只在转码**这条路上补发。
+    ///
+    /// 上游发了个 `data` 不是 JSON 的事件（自定义帧之类），解码器在最上面那层
+    /// 就失败了。以前它被无声跳过：客户端凭空空掉一段，而"空掉的那段"恰恰是
+    /// 排查时最该看见的东西。
+    #[tokio::test]
+    async fn an_undecodable_event_is_forwarded_verbatim_when_transcoding() {
+        let chunks = vec![
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: content_block_delta\ndata: <not json at all>\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_observed(
+            upstream(chunks),
+            Box::new(AnthropicStreamDecoder::new()),
+            Some(Box::new(ChatStreamEncoder::new())),
+            StreamTimeouts::default(),
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+        let bytes = run(body).await;
+        let client = String::from_utf8_lossy(&bytes);
+
+        assert_eq!(
+            client.matches("<not json at all>").count(),
+            1,
+            "解不出的事件要原样发一次给客户端，不能替它丢掉"
+        );
+        assert_eq!(
+            rx.await.unwrap().raw_client.as_deref(),
+            Some(bytes.as_slice()),
+            "转发出去的字节同样算客户端侧原始帧"
+        );
+    }
+
+    /// 直通时这一帧的原始字节上面已经发过，不能补发第二次。
+    #[tokio::test]
+    async fn an_undecodable_event_is_not_duplicated_when_passing_through() {
+        let chunks = vec!["event: content_block_delta\ndata: <not json at all>\n\n"];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_observed(
+            upstream(chunks),
+            Box::new(AnthropicStreamDecoder::new()),
+            None, // 直通
+            StreamTimeouts::default(),
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+        let bytes = run(body).await;
+
+        assert_eq!(
+            String::from_utf8_lossy(&bytes)
+                .matches("<not json at all>")
+                .count(),
+            1,
+            "直通时原始字节只该出现一次"
+        );
+        assert!(rx.await.unwrap().raw_client.is_none());
     }
 
     /// 原始帧缓冲必须有上限：一个长回答的 SSE 轻松上 MB，无限累积等于把

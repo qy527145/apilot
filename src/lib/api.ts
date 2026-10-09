@@ -582,7 +582,15 @@ export type ContentBlock =
       is_error: boolean;
     }
   | { type: "thinking"; text: string; signature?: string | null }
-  | { type: "redacted_thinking"; data: string };
+  | { type: "redacted_thinking"; data: string }
+  /**
+   * 后端没建模的内容块，整个原始 JSON 留在 `raw` 里。
+   *
+   * 出现的场合：客户端先用上了新块类型（Claude Code 带附件时发的 `document`），
+   * 或上游发来的是非标准形状。这一块只要求"能看到原文" —— 它本来就不要求
+   * 语义化渲染。
+   */
+  | { type: "unmodeled"; raw: unknown };
 
 export interface UnifiedMessage {
   role: Role;

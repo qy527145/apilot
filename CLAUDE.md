@@ -118,6 +118,12 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 9. **发往回环与私有网段的请求要绕过系统代理。** 清单在 `upstream/client.rs::NO_PROXY_LIST`。
    少了它，配了 `HTTP_PROXY` 的机器连不上本地的 ollama / LM Studio。
 
+10. **解不出不等于要失败。** 客户端与上游总在先用上新结构（Claude Code 带附件时发的
+    `document` 内容块）。IR 不认识就**整块原样留着**（`ContentBlock::Unmodeled`）放请求过去，
+    只在跨协议转换时才降级 —— 直通那条路本就不需要理解它们，报 400 挡掉的反而是完全正常的路。
+    响应侧同理：非流式解不出就透传原文（`gateway/pipeline.rs::try_outbound`），
+    流式的坏帧原样转发给客户端（`gateway/stream.rs`）。
+
 ## 代码约定
 
 - **注释用中文，写「为什么」不写「是什么」。** 项目里大量注释在解释取舍原因（为什么不这么做、

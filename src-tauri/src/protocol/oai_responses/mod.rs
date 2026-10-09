@@ -277,10 +277,11 @@ fn decode_message_content(v: &Value) -> Result<Vec<ContentBlock>, ConvertError> 
                     };
                     Ok(ContentBlock::Image { media_type, data })
                 }
-                other => Err(ConvertError::decode_request(
-                    P,
-                    format!("未知的 content 类型: {other}"),
-                )),
+                // 与上面跳过未建模条目同一个道理：不认识的 content 整块留着。
+                other => {
+                    tracing::debug!(content_type = other, "未建模的 Responses content，整块原样保留");
+                    Ok(ContentBlock::Unmodeled { raw: p.clone() })
+                }
             })
             .collect(),
         other => Err(ConvertError::decode_request(
