@@ -381,6 +381,10 @@ pub async fn handle(
     // 此刻才既有生效模型、又有选定的渠道，而用户在意的正是"这一条在跑哪条路"。
     // 缓存命中在上面就返回了，所以它不会出现在「进行中」—— 那是对的，
     // 缓存命中没有过程可看。
+    // 进行中条目要描述"这条请求真正走的那条路"，得用第一个候选，而不是 selector
+    // 选的 primary：模型策略 / 模型声明渠道会把别的渠道排到 primary 前面（primary
+    // 那时只作兜底），照 primary 填会让渠道名和上游 URL 都指向一条根本不会走的路。
+    let first = &candidates[0];
     let started_payload = crate::traffic::stream_events::RequestStarted {
         request_id: recorder.record.request_id.clone(),
         ts: recorder.record.ts,
@@ -389,9 +393,9 @@ pub async fn handle(
         request_model: recorder.record.request_model.clone(),
         path: recorder.record.path.clone(),
         protocol_in: protocol.as_str().to_string(),
-        provider_tag: primary.tag().to_string(),
-        provider_name: primary.provider().name.clone(),
-        upstream_url: primary.provider().endpoint_for(primary.wire_for(protocol)),
+        provider_tag: first.tag().to_string(),
+        provider_name: first.provider().name.clone(),
+        upstream_url: first.provider().endpoint_for(first.wire_for(protocol)),
         is_stream: req.stream,
     };
     // 先写进行中快照，再广播事件：顺序保证前端任何时刻查询都不会漏掉刚进来的请求。
