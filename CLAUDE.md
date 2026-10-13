@@ -117,14 +117,23 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 8. **不要在 async 里跨 `await` 持锁。** 从 `DashMap` / `RwLock` 取出对象后先 `.clone()` 成 `Arc`
    再释放守卫；`ArcSwap` 没有守卫，`load_full()` 返回 `Arc` 即结束。
 
-9. **发往回环与私有网段的请求要绕过系统代理。** 清单在 `upstream/client.rs::NO_PROXY_LIST`。
-   少了它，配了 `HTTP_PROXY` 的机器连不上本地的 ollama / LM Studio。
+9. **发往回环与私有网段的请求要绕过*环境变量里那个*代理。** 清单在
+   `upstream/client.rs::NO_PROXY_LIST`，只对「跟随环境变量」生效 —— 少了它，配了
+   `HTTP_PROXY` 的机器连不上本地的 ollama / LM Studio。但**用户显式填的代理
+   （全局或渠道的 manual）一个地址都不豁免**：那是明确指令，再替他摘掉一批地址
+   就成了看不见的例外（`ProxySpec::Proxied.bypass_local`）。要豁免就在那条渠道上选「直连」。
 
 10. **解不出不等于要失败。** 客户端与上游总在先用上新结构（Claude Code 带附件时发的
     `document` 内容块）。IR 不认识就**整块原样留着**（`ContentBlock::Unmodeled`）放请求过去，
     只在跨协议转换时才降级 —— 直通那条路本就不需要理解它们，报 400 挡掉的反而是完全正常的路。
     响应侧同理：非流式解不出就透传原文（`gateway/pipeline.rs::try_outbound`），
     流式的坏帧原样转发给客户端（`gateway/stream.rs`）。
+
+11. **上游报错要看得见，且状态码原样透传。** 上游真的回了 HTTP 响应时，客户端收到的
+    就是它那个码（400 不是 502，由 `gateway/pipeline.rs::client_status_for` 判定），
+    只有连不上/超时才 502。**失败路径也必须把回给客户端的报文落进捕获**
+    （`record_client_response`）—— 少了它，「上游 → Apilot」有原文、「Apilot → 客户端」
+    空白，用户就只能猜那句报错是谁说的。折成 502 还会让客户端把 400 当网关抽风反复重试。
 
 ## 代码约定
 

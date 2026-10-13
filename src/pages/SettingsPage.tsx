@@ -31,7 +31,7 @@ const PROXY_MODE_HINT: Record<ProxyMode, string> = {
   system:
     "按 HTTPS_PROXY / ALL_PROXY / HTTP_PROXY（大小写都看）决定。没配就直连。",
   direct: "不走任何代理，环境变量里配了也不走。",
-  manual: "所有渠道默认走下面这个地址。留空等同于直连。",
+  manual: "所有渠道默认走下面这个地址，一个地址都不豁免。留空等同于直连。",
 };
 
 export default function SettingsPage() {
@@ -229,8 +229,12 @@ export default function SettingsPage() {
                 <code>socks5://</code>、<code>socks5h://</code>
                 （<code>socks5h</code> 由代理解析域名，能绕开 DNS 污染）。
                 <br />
-                回环与私有网段（<code>127.0.0.1</code>、<code>192.168.*</code>{" "}
-                等）始终直连，本地模型服务不会因为这里配了代理而连不上。
+                <strong className="font-medium">
+                  「使用指定代理」是你下的一条明确指令，回环与内网地址也照走
+                </strong>
+                —— 抓包、走公司代理时不会有地址被悄悄放过。本地模型服务（ollama /
+                LM Studio）请在那条渠道上选「直连」。「跟随环境变量」才自动豁免
+                回环与私有网段（<code>127.0.0.1</code>、<code>192.168.*</code> 等）。
                 单个渠道可以在渠道对话框里单独设置。
               </p>
             </CardContent>

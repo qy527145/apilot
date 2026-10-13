@@ -89,10 +89,16 @@ function rawOf(
 
   const body = side === "client" ? d.response_body : d.upstream_response_body;
   if (body) {
-    return {
-      raw: body,
-      rawNote: d.is_stream ? "上游无视 stream 参数，回了完整响应" : undefined,
-    };
+    // 出错那次的正文必须带上状态码一起说 —— 它才是"这是 Apilot 的包装还是上游的原话"
+    // 的判据。少了它，用户对着一个 JSON 错误体只能猜。
+    const status = side === "client" ? d.status_code : d.upstream_status;
+    const note = status != null ? `状态码 ${status}` : undefined;
+    const suffix = d.is_stream
+      ? status != null && status >= 400
+        ? "（这次是错误响应，不是 SSE）"
+        : "上游无视 stream 参数，回了完整响应"
+      : "";
+    return { raw: body, rawNote: [note, suffix].filter(Boolean).join(" · ") || undefined };
   }
 
   // 改动之前的旧日志没有原始帧，只有拼接后的文本 —— 给出来但要说清它是什么。

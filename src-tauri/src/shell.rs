@@ -1,7 +1,7 @@
 //! `AppShell` —— 全部共享依赖的唯一所有权根。
 //!
-//! 由 Tauri 的 `manage` 持有，命令层用 `State<'_, Arc<AppShell>>` 取用；
-//! 网关侧用 [`GatewayState`] 暴露给 axum handler。
+//! 由 Tauri 的 `manage` 持有，命令层用 `State<'_, Arc<AppShell>>` 取用，
+//! 网关侧直接把它当 axum 的 state（`gateway/router.rs::build`）。
 
 use std::sync::Arc;
 

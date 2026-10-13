@@ -188,7 +188,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | `outbound.rs` | `Outbound` trait（`tag` / `wire` / `prepare` / `dial`）、`PreparedRequest`、`UpstreamResponse` / `UpstreamBody`、`UpstreamError::is_retryable` |
 | `channel.rs` | `Channel` —— 唯一的 HTTP 实现。转发请求头时的**剔除清单**、鉴权头注入、`looks_like_json` 判定 |
 | `registry.rs` | `ProviderRegistry`：`DashMap<String, Arc<dyn Outbound>>` + `ArcSwapOption<String>` 默认渠道 |
-| `client.rs` | 共享 `reqwest::Client` 与**出站代理**。`ProxySpec`（解析出的出站路径）、`ClientSpec`（路径 + TLS 策略，**也是 `ClientPool` 的缓存键**）、`resolve_global` / `resolve_channel`（把设置折算成 spec）、`NO_PROXY_LIST`（回环与私有网段绕过代理） |
+| `client.rs` | 共享 `reqwest::Client` 与**出站代理**。`ProxySpec`（解析出的出站路径，含 `bypass_local`）、`ClientSpec`（路径 + TLS 策略，**也是 `ClientPool` 的缓存键**）、`resolve_global` / `resolve_channel`（把设置折算成 spec）、`NO_PROXY_LIST`（回环与私有网段绕过**环境变量里的**代理） |
 | `oneshot.rs` | **脱离网关管线的单次真实请求**：协议编码 → `prepare` → `dial`。模型测试与能力探测都走它 —— 走管线会写日志、计费、查缓存，对一次探测全是副作用 |
 
 **出站 URL 由渠道的线协议决定，与入站路径无关**：客户端说 Anthropic，
@@ -198,6 +198,11 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 渠道 `Provider.proxy`（跟随全局 / 直连 / 指定地址）。解析成 `ProxySpec` 后按它
 在 `ClientPool` 里取客户端 —— 客户端数量 = 不同 `ClientSpec` 数，不是渠道数。
 `Direct` 分支必须显式 `no_proxy()`，否则 reqwest 会自己读环境变量绕过「直连」。
+
+**豁免清单只跟在环境代理上**（`ProxySpec::Proxied.bypass_local`）：只有
+`ProxyMode::System` 从环境变量捡来的代理才配上 `NO_PROXY_LIST`；用户显式填的地址
+（全局或渠道的 `manual`）一个都不豁免 —— 否则内网上游会出现"配了代理却是直连"
+这种没有出口的怪事。本地模型服务请在那条渠道上选「直连」。
 
 **TLS 校验收在 `ClientSpec` 里，不随渠道变化**：`ProxySettings.insecure_tls`
 （「忽略 TLS 证书校验」，抓包时免装 CA）对所有出站连接生效，与走不走代理无关。

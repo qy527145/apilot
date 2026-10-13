@@ -10,12 +10,17 @@ use dashmap::DashMap;
 use crate::config::settings::{ProxyMode, ProxySettings};
 use crate::storage::models::{ChannelProxy, ChannelProxyMode};
 
-/// 明确不走代理的地址。
+/// 明确不走代理的地址。**只对"从环境变量捡来的"代理生效**（见 [`ProxySpec`]）。
 ///
 /// 回环与私有网段必须直连。用户机器上常配着 `HTTP_PROXY`（公司网络、抓包工具、
 /// 本地加速器），若不加这个清单，指向本机模型服务（ollama / LM Studio /
 /// llama.cpp）的请求会被发到代理上 —— 代理不认识 `127.0.0.1` 就返回 502，
 /// 表现为"本地模型连不上"，排查起来很费劲。
+///
+/// 环境代理是**环境里顺手存在**的，用户并没有对着 Apilot 说过"所有出站都要绕一圈"，
+/// 所以这里替他兜一层。用户**显式填**的代理则一个字都不改 —— 那是有意为之的指令，
+/// 再自动摘掉一批地址就成了看不见的例外（配了代理抓包，内网上游却直连，
+/// 现象就是"代理根本不生效"）。要豁免就在那条渠道上选「直连」，那是看得见的。
 const NO_PROXY_LIST: &str = "localhost,127.0.0.1,::1,0.0.0.0,\
      10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,.local,.internal";
 
@@ -25,7 +30,16 @@ const NO_PROXY_LIST: &str = "localhost,127.0.0.1,::1,0.0.0.0,\
 pub enum ProxySpec {
     /// 明确直连，**连环境变量都不看**。
     Direct,
-    Proxied { url: String },
+    /// 走这个代理。
+    ///
+    /// `bypass_local` 决定要不要再把回环与私有网段从代理里摘出去：
+    /// - 代理来自**环境变量**（`ProxyMode::System` 那一支）时是 `true`，配上
+    ///   [`NO_PROXY_LIST`]。
+    /// - 代理是**用户显式填的**（全局或渠道的 `manual`）时是 `false`，一个地址都不豁免。
+    ///
+    /// 这个区分是踩出来的：内网上游（`192.168.x.x`）恰好落在那份清单里，
+    /// 于是用户全局与渠道都填了代理，流量却照样直连 —— 而且没有任何地方会说出来。
+    Proxied { url: String, bypass_local: bool },
 }
 
 /// 一个出站客户端的完整描述。**这就是客户端缓存的键** —— 所以它必须覆盖
@@ -104,12 +118,20 @@ fn resolve_global_with(
             // 填了自定义模式却没填地址：直连。退化成"随手走环境代理"更意外 ——
             // 用户刚明确表达了"我要指定代理"，此时静默走另一个代理最难排查。
             match sanitize_proxy_url(settings.url.as_deref()) {
-                Some(url) => ProxySpec::Proxied { url },
+                // 显式指定：不再豁免任何地址，见 `ProxySpec::Proxied`。
+                Some(url) => ProxySpec::Proxied {
+                    url,
+                    bypass_local: false,
+                },
                 None => ProxySpec::Direct,
             }
         }
+        // 环境里那个代理是"顺手存在"的，替用户兜住本地/内网服务。
         ProxyMode::System | ProxyMode::Unknown => match env() {
-            Some(url) => ProxySpec::Proxied { url },
+            Some(url) => ProxySpec::Proxied {
+                url,
+                bypass_local: true,
+            },
             None => ProxySpec::Direct,
         },
     }
@@ -119,11 +141,18 @@ fn resolve_global_with(
 ///
 /// TLS 策略不分渠道，一律取全局的 —— 这条渠道说「直连」只是不走代理，
 /// 不代表它要求更严格的校验。
+///
+/// 渠道自己填的地址同样是**显式**的，因此也不豁免任何地址：那是用户针对这条渠道
+/// 做的决定，比全局设置更具体，再替他摘掉一批地址只会让配置和现象对不上。
 pub fn resolve_channel(channel: &ChannelProxy, global: &ProxySettings) -> ClientSpec {
     let proxy = match channel.mode {
         ChannelProxyMode::Direct => ProxySpec::Direct,
         ChannelProxyMode::Manual => match sanitize_proxy_url(channel.url.as_deref()) {
-            Some(url) => ProxySpec::Proxied { url },
+            Some(url) => ProxySpec::Proxied {
+                url,
+                bypass_local: false,
+            },
+            // 填了「自定义」却没填地址：跟全局走（全局若也是 Environment，那还是环境代理那一支）。
             None => resolve_global_with(global, &env_proxy_url),
         },
         ChannelProxyMode::Inherit | ChannelProxyMode::Unknown => {
@@ -172,8 +201,16 @@ pub fn build_with(spec: &ClientSpec) -> reqwest::Client {
     // 那样「强制直连」根本不起作用（`no_proxy()` 那一支就是在关掉这个探测）。
     let builder = match &spec.proxy {
         ProxySpec::Direct => builder.no_proxy(),
-        ProxySpec::Proxied { url } => match reqwest::Proxy::all(url) {
-            Ok(proxy) => builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string(NO_PROXY_LIST))),
+        ProxySpec::Proxied { url, bypass_local } => match reqwest::Proxy::all(url) {
+            Ok(proxy) => {
+                let proxy = if *bypass_local {
+                    proxy.no_proxy(reqwest::NoProxy::from_string(NO_PROXY_LIST))
+                } else {
+                    // 一个字都不改：用户填的地址就是全部规则。
+                    proxy
+                };
+                builder.proxy(proxy)
+            }
             Err(e) => {
                 tracing::warn!("代理 {url} 无法解析，改为直连: {e}");
                 builder.no_proxy()
@@ -285,8 +322,20 @@ mod tests {
         ClientSpec::new(ProxySpec::Direct)
     }
 
+    /// 用户**显式填**的代理：一个地址都不豁免。
     fn proxied(url: &str) -> ClientSpec {
-        ClientSpec::new(ProxySpec::Proxied { url: url.into() })
+        ClientSpec::new(ProxySpec::Proxied {
+            url: url.into(),
+            bypass_local: false,
+        })
+    }
+
+    /// **从环境变量捡来的**代理：回环与内网地址仍走直连。
+    fn env_proxied(url: &str) -> ClientSpec {
+        ClientSpec::new(ProxySpec::Proxied {
+            url: url.into(),
+            bypass_local: true,
+        })
     }
 
     #[test]
@@ -340,7 +389,9 @@ mod tests {
         assert_eq!(
             spec,
             ProxySpec::Proxied {
-                url: "socks5://127.0.0.1:1080".into()
+                url: "socks5://127.0.0.1:1080".into(),
+                // 环境代理要带豁免清单，否则本地模型会被发到公司代理上。
+                bypass_local: true,
             }
         );
     }
@@ -354,9 +405,28 @@ mod tests {
         assert_eq!(
             spec,
             ProxySpec::Proxied {
-                url: "http://127.0.0.1:7890".into()
+                url: "http://127.0.0.1:7890".into(),
+                bypass_local: false,
             }
         );
+    }
+
+    /// 显式填的代理不带豁免清单，环境代理带 —— 这条守的是两者的分界，
+    /// 合到一起就会退化成"内网上游明明配了代理却直连"。
+    #[test]
+    fn only_the_environment_proxy_carries_the_bypass_list() {
+        let manual = resolve_global_with(
+            &settings(ProxyMode::Manual, Some("http://127.0.0.1:7890")),
+            &env_empty(),
+        );
+        let system = resolve_global_with(&settings(ProxyMode::System, None), &env_with("http://p:1"));
+
+        let bypass = |s: &ProxySpec| match s {
+            ProxySpec::Proxied { bypass_local, .. } => *bypass_local,
+            ProxySpec::Direct => panic!("这两支都该是 Proxied"),
+        };
+        assert!(!bypass(&manual), "用户显式填的代理不许偷偷豁免");
+        assert!(bypass(&system), "环境代理必须豁免本地/内网");
     }
 
     #[test]
@@ -404,7 +474,8 @@ mod tests {
         assert_eq!(
             resolve_channel(&channel, &global).proxy,
             ProxySpec::Proxied {
-                url: "http://corp:8080".into()
+                url: "http://corp:8080".into(),
+                bypass_local: false,
             }
         );
     }
@@ -419,7 +490,8 @@ mod tests {
         assert_eq!(
             resolve_channel(&channel, &global).proxy,
             ProxySpec::Proxied {
-                url: "socks5://127.0.0.1:1080".into()
+                url: "socks5://127.0.0.1:1080".into(),
+                bypass_local: false,
             }
         );
     }
@@ -435,6 +507,92 @@ mod tests {
         // 坏配置不该让应用起不来。能走到这里说明 URL 通过了前缀校验但 reqwest 不认，
         // 记一条 warn 后直连 —— 请求会失败，但失败的是那一条请求。
         let _ = build_with(&proxied("socks5://"));
+    }
+
+    /// 起一个只收一行的"假代理"，把收到的请求行回传出来。
+    ///
+    /// 目的只有一个：证明流量**真的**经过了代理解析出来的那条路 ——
+    /// 单元测试只能验到"spec 解析对了"，解析对了但客户端没接上照样是"代理不生效"。
+    async fn fake_proxy_that_records_one_request() -> (String, std::sync::Arc<tokio::sync::Mutex<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+            *sink.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+            // 回一个最小可用的响应，让 reqwest 这边正常收工。
+            tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+        });
+
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_proxied_client_actually_sends_through_the_proxy() {
+        let (url, seen) = fake_proxy_that_records_one_request().await;
+        let client = build_with(&proxied(&url));
+
+        // 目标主机是不存在的域名：请求要是真能到假代理手里，就说明它没在本地直连。
+        let _ = client.get("http://example.invalid/v1/messages").send().await;
+
+        let request_line = seen.lock().await.clone();
+        assert!(
+            request_line.contains("example.invalid"),
+            "假代理没收到请求，流量根本没走代理。收到的是: {request_line:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_proxy_also_carries_a_private_ip_upstream() {
+        // 现场：全局与渠道都显式填了这个代理，上游是内网地址（192.168.x.x）。
+        // 以前它被 NO_PROXY_LIST 放行，于是"配了代理却抓不到包"，而且没有任何地方
+        // 会提示这件事 —— 用户只能从"代理不生效"倒推。
+        let (url, seen) = fake_proxy_that_records_one_request().await;
+        let client = build_with(&proxied(&url));
+        let _ = client.get("http://192.168.145.16/v1/messages").send().await;
+
+        let line = seen.lock().await.clone();
+        assert!(
+            line.contains("192.168.145.16"),
+            "显式代理没有豁免任何地址，内网上游也必须走它。收到的是: {line:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_proxy_also_carries_a_loopback_upstream() {
+        // 与上一条同一个判据：显式填了代理就是"所有出站都走它"。
+        // 本地模型因此要显式在渠道上选「直连」—— 那是用户看得见的一步，
+        // 比"悄悄少绕一个地址"强。
+        let (url, seen) = fake_proxy_that_records_one_request().await;
+        let client = build_with(&proxied(&url));
+        let _ = client.get("http://127.0.0.1:11434/v1/chat/completions").send().await;
+
+        let line = seen.lock().await.clone();
+        assert!(
+            line.contains("127.0.0.1:11434"),
+            "显式代理不该豁免回环地址。收到的是: {line:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_environment_proxy_still_lets_a_private_ip_upstream_go_direct() {
+        // 另一头：环境变量里那个代理不该接管内网/本地服务，否则"本地模型连不上"。
+        let (url, seen) = fake_proxy_that_records_one_request().await;
+        let client = build_with(&env_proxied(&url));
+        let _ = client.get("http://192.168.145.16/v1/messages").send().await;
+        assert!(
+            seen.lock().await.is_empty(),
+            "环境代理必须继续豁免内网地址"
+        );
     }
 
     #[test]

@@ -639,21 +639,27 @@ async fn channel_without_the_incoming_protocol_converts_to_its_preferred_one() {
     assert_eq!(reqs[0].path, "/v1/chat/completions");
 }
 
-/// 配了代理也不能把回环地址送出去。
+/// **环境变量里的**代理不能把回环地址送出去。
 ///
 /// 这是「回环与私有网段必须直连」那条铁律的端到端验证：本地模型服务
 /// （ollama / LM Studio）常年跑在 127.0.0.1，一旦被送到代理上就是 502，
 /// 表现为"本地模型连不上"，而日志里只看得见一次失败的连接。
 ///
+/// 只有"跟随环境变量"那种代理带这份豁免清单；用户**显式填**的代理一律照做
+/// （要豁免就在那条渠道上选「直连」）。所以这里构造的是环境代理那一支。
+///
 /// 代理指向一个必然连不上的端口 —— 只要请求真的走了代理，这条就会失败。
 #[tokio::test]
-async fn a_configured_proxy_never_swallows_loopback_requests() {
+async fn an_environment_proxy_never_swallows_loopback_requests() {
     let (base, captured) = spawn_upstream(ANTHROPIC_SSE).await;
 
     for url in ["http://127.0.0.1:1", "socks5://127.0.0.1:1"] {
         let channel = Channel::new(
             provider(&base, ProviderKind::Anthropic),
-            build_with(&ClientSpec::new(ProxySpec::Proxied { url: url.into() })),
+            build_with(&ClientSpec::new(ProxySpec::Proxied {
+                url: url.into(),
+                bypass_local: true,
+            })),
         );
         let (bytes, _, _) = run_pipeline(&channel, false).await;
         assert!(

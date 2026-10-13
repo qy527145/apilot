@@ -694,8 +694,10 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
           <div className="space-y-2 rounded-md border p-3">
             <Label className="text-sm">代理</Label>
             <p className="text-muted-foreground text-xs">
-              「直连」是给本地模型服务（ollama / LM Studio）用的：全局配了公司代理时，
-              只有它能保证请求留在本机。回环与私有网段本来就会绕过代理。
+              「直连」是给本地模型服务（ollama / LM Studio）用的：这条渠道不碰代理。
+              全局或本渠道指定的代理会带走所有地址，包括回环与内网 ——
+              所以本地服务放在这里选「直连」，别指望它自动被放过。
+              全局选「跟随环境变量」时，环境里那个代理才自动绕过回环与私有网段。
             </p>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Select

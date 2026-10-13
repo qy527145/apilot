@@ -204,6 +204,65 @@ mod tests {
         assert_eq!(r.tags(), vec!["alpha", "mu", "zeta"]);
     }
 
+    /// 起一个只收一行的"假代理"，把收到的请求行回传出来。
+    async fn fake_proxy() -> (String, std::sync::Arc<tokio::sync::Mutex<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+            *sink.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+            tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// 守的是整条链：全局设置 → 渠道解析 → 实际出站。中间任何一环没接上，
+    /// 用户看到的现象都是同一句"代理不生效"，而单元测试只验得到链条的一小段。
+    #[tokio::test]
+    async fn a_globally_configured_proxy_carries_the_channels_traffic() {
+        use crate::config::settings::{ProxyMode, ProxySettings};
+
+        let (proxy_url, seen) = fake_proxy().await;
+        let r = ProviderRegistry::with_pool(std::sync::Arc::new(ClientPool::new()));
+        r.set_global_proxy(ProxySettings {
+            mode: ProxyMode::Manual,
+            url: Some(proxy_url),
+            insecure_tls: false,
+        });
+
+        // `example.invalid` 是保留给"一定解析不了"的域名：请求真到达假代理，
+        // 就只可能是走代理过去的，不可能是本地直连成功的。
+        let mut p = provider("a");
+        p.base_url = "http://example.invalid".into();
+        r.reload(&[p]);
+
+        let ch = r.get("a").unwrap();
+        let prepared = ch
+            .prepare(
+                crate::protocol::dto::Protocol::AnthropicMessages,
+                &http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"{}"),
+                false,
+            )
+            .unwrap();
+        let _ = ch.dial(prepared).await;
+
+        let line = seen.lock().await.clone();
+        assert!(
+            line.contains("example.invalid"),
+            "假代理没收到请求 —— 全局代理没走到渠道上。收到的是: {line:?}"
+        );
+    }
+
     #[test]
     fn channel_exposes_its_wire_protocol() {
         let r = registry();
