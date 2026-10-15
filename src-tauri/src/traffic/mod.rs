@@ -5,6 +5,7 @@
 
 pub mod events;
 pub mod log_filter;
+pub mod session;
 pub mod stream_events;
 
 use std::collections::HashMap;

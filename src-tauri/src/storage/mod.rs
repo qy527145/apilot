@@ -10,5 +10,6 @@ pub mod models;
 pub mod pricing;
 pub mod providers;
 pub mod routing;
+pub mod sessions;
 
 pub use db::open;

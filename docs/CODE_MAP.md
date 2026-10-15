@@ -414,6 +414,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 | `routing.rs` | 路由规则 / selector / 兜底配置的读写；`ensure_default_selector` |
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
 | `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站 / **发给客户端的响应头**）；`query`（动态过滤：时间、客户端、模型、协议、状态、是否流式）、`get_detail`、`facets`（筛选下拉的候选值）、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧 |
+| `sessions.rs` | **按对话聚合**：`list`（会话列表，模型按首次出现保序）/ `timeline`（一个会话的全部请求 + 各条线 + 压缩点）。「主线 / 子代理 / 旁路」与「哪里压缩过」**查询时现算**，不落库 —— 要看整个会话才定得下来 |
 | `model_policies.rs` | 每模型的渠道选择策略读写。**没有行 = 交给 selector 与路由规则** |
 | `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` / `speed_averages`（按 token 加权的平均 TTFT / ITL / TPS，样本口径的唯一真源在 `logs::speed_sample`）。按模型汇总时额外返回 `request_models`（被折叠进该生效模型的客户端模型名），供统计页标出改写 |
 
@@ -442,6 +443,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 | `mod.rs` | `TrafficStats`（并发守护 `ActiveRequest`、累计计数、TTFB 环形窗口）、`TrafficEvent` |
 | `events.rs` | `EventBus`（按类型推送 + 节流）、`Throttle`、`event_names` |
 | `stream_events.rs` | **流式实时事件**：`StreamBatcher`（攒批 + 封顶 + 单帧截断，纯逻辑）、`StreamEmitter`（观察者实现，`Drop` 兜底断连）、`StreamDelta`（推流用的增量形态） |
+| `session.rs` | **请求归属到对话**：会话 ID 取客户端给的（Claude Code `x-claude-code-session-id` / Codex `session-id`，body 里各有兜底），**不按对话历史推断** —— 压缩会把历史整个改写，ID 不变。线 = system 提示稳定部分的指纹（**不含工具集合**：主线中途会多出工具）；`count_tokens` 等非对话请求归会话、不归线。`classify_threads`（带工具且请求最多的是主线）、`is_compaction`（同一条线消息数骤降） |
 | `log_filter.rs` | **监控页「自定义表达式」筛选的求值器**：QuickJS 里跑用户表达式，逐行判断要不要显示。线程本地引擎。**报文按需取用**：元数据里只放哨兵，表达式真读到才回调 Rust 解析；于是要走两趟 —— `probe`（只带元数据的探测趟，报出哪些行需要报文）与 `filter`（带真报文的终趟）。单行 1s / 整批 2s / 报文 64MB 预算，撞上批预算标 `truncated` 而不是报错。求值放在**后端**是因为日志分页、报文在 `captures` 另一张表 —— 前端只看得见当前页。内置对象与字段见 `expr_meta` |
 
 **事件名**（前端 `listen` 用的字面量，改了就静默破坏订阅）：
@@ -521,7 +523,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `route_rules` | `id` | 规则链，按 `sort_index` 求值；`items` / `action` 存 JSON |
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |
 | `route_config` | 单行 `id=1` | 兜底 selector |
-| `request_logs` | `request_id` 唯一 | 请求明细：token、quota、耗时、**TTFB**、缓存命中、估算偏差；以及**方向信息**：入站 `path`、出站 `upstream_url` / `upstream_model` / `upstream_status` |
+| `request_logs` | `request_id` 唯一 | 请求明细：token、quota、耗时、**TTFB**、缓存命中、估算偏差；以及**方向信息**：入站 `path`、出站 `upstream_url` / `upstream_model` / `upstream_status`；**对话归属**（v11）：`session_id` / `thread_key` / `message_count` / `has_tools`，v11 之前的老行为 NULL |
 | `usage_hourly` | `(bucket_ts, client, provider_tag, model, request_model)` | 小时聚合，SUM 后 upsert。`model` 是**生效模型**（计费口径），`request_model` 是客户端原名 —— 两者一起进主键，统计页才答得出"我发的 gpt-6-sol 怎么算在 deepseek-flash 这行"。**`clear_logs` 不动它** —— 它是计费口径的历史账目。另有观感指标的**累加量**（`sample_requests` / `ttfb_sum_ms` / `decode_ms_sum` / `decode_tokens_sum`）：平均值不能相加，所以存分子分母、汇总时再相除 |
 | `model_pricing` | `model` | 单价系数。`source` 为 NULL = **用户手填**（批量导入一律不动），有值 = 由某份目录导入、可被同来源的下次导入覆盖 |
 | `model_capabilities` | `(provider_id, model, capability)` | 这个**渠道上这个模型**支不支持思考/工具/多模态。`verdict` 是三态（supported / unsupported / inconclusive）—— 探测「支不支持工具」时模型可能只是那一次没调工具，记成布尔就是撒谎。`source` 分 probe（实测，花 token）与 catalog（目录断言，零成本）；**覆盖优先级写在 `storage::capabilities` 的 upsert SQL 里**：实测且明确 > 目录 > 实测但不确定 |
@@ -549,7 +551,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择 + 每渠道的上游模型名，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明与**自动检测** —— 逐个协议探一次，只补勾不取消；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选；每行还有**单次模型测试**与三枚**能力徽标**，点徽标即实测一项）；`CatalogCapabilitiesDialog` / `CatalogPriceDialog` 是两个目录导入入口 |
-| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库）；`FilterExprPanel`（监控页的**自定义表达式**筛选：编辑框 + 后端行内校验 + 示例 + 内置对象结构说明）；`TimeRangePicker`（监控页的**自定义时间范围**：按钮上直接显示所选区间，弹层里两个时间框 + 常用区间；与预设页签互斥） |
+| `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库）；`FilterExprPanel`（监控页的**自定义表达式**筛选：编辑框 + 后端行内校验 + 示例 + 内置对象结构说明）；`TimeRangePicker`（监控页的**自定义时间范围**：按钮上直接显示所选区间，弹层里两个时间框 + 常用区间；与预设页签互斥）；**`SessionsView`**（监控页「对话」视图：左会话列表、右时间线，按线筛、压缩点横条、换模型高亮，点行复用 `RequestDetailDialog`，「在请求列表中查看」带 `session_id` 筛选切回去） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
 只会在运行时静默失败。

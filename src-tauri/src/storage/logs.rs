@@ -53,6 +53,11 @@ pub struct RequestLogRecord {
     pub saved_quota: i64,
     /// 附加信息（工具调用数、命中的规则等），存成 JSON。
     pub other: serde_json::Value,
+    /// 所属对话。来源与口径见 `traffic::session`。
+    pub session_id: Option<String>,
+    pub thread_key: Option<String>,
+    pub message_count: Option<i64>,
+    pub has_tools: bool,
 }
 
 /// 查询结果里返回给前端的日志行。
@@ -89,6 +94,8 @@ pub struct RequestLog {
     pub ttfb_ms: Option<i64>,
     pub cache_hit: bool,
     pub saved_quota: i64,
+    /// 所属对话；没有会话 ID 的请求为 `None`。
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,6 +120,9 @@ pub struct LogFilter {
     /// 自定义 JS 表达式筛选。对「日志字段 + 捕获报文」求值，命中的才返回。
     /// 求值在后端做，见 `traffic::log_filter` 里关于「为什么不能放前端」的说明。
     pub expr: Option<String>,
+    /// 只看某一个对话的请求。
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -141,6 +151,7 @@ impl Default for LogFilter {
             request_model: None,
             model_like: None,
             expr: None,
+            session_id: None,
             limit: default_limit(),
             offset: 0,
         }
@@ -188,7 +199,7 @@ const LOG_COLUMNS: &str = "l.request_id, l.ts, l.client, l.protocol_in, l.protoc
      l.model, l.request_model, l.path, l.upstream_url, l.upstream_model, l.upstream_status, l.is_stream, \
      l.status_code, l.error_message, l.input_tokens, l.output_tokens, \
      l.cache_read_tokens, l.cache_creation_tokens, l.usage_source, l.quota, l.cost_usd, l.latency_ms, \
-     l.ttfb_ms, l.cache_hit, l.saved_quota";
+     l.ttfb_ms, l.cache_hit, l.saved_quota, l.session_id";
 
 const LOG_FROM: &str = "request_logs l LEFT JOIN providers p ON l.provider_id = p.id";
 
@@ -222,6 +233,7 @@ fn row_to_log(r: &sqlx::sqlite::SqliteRow) -> RequestLog {
         ttfb_ms: r.get("ttfb_ms"),
         cache_hit: r.get::<i64, _>("cache_hit") != 0,
         saved_quota: r.get("saved_quota"),
+        session_id: r.get("session_id"),
     }
 }
 
@@ -234,9 +246,9 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
              upstream_status, is_stream, status_code, error_message,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              reasoning_tokens, usage_source, quota, cost_usd, latency_ms, ttfb_ms,
-             cache_hit, saved_quota, other)
+             cache_hit, saved_quota, other, session_id, thread_key, message_count, has_tools)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
-                 ?22,?23,?24,?25,?26,?27,?28,?29,?30)",
+                 ?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34)",
     )
     .bind(&rec.request_id)
     .bind(rec.ts)
@@ -268,6 +280,10 @@ pub async fn insert(pool: &SqlitePool, rec: &RequestLogRecord) -> AppResult<()> 
     .bind(rec.cache_hit as i64)
     .bind(rec.saved_quota)
     .bind(serde_json::to_string(&rec.other)?)
+    .bind(&rec.session_id)
+    .bind(&rec.thread_key)
+    .bind(rec.message_count)
+    .bind(rec.has_tools as i64)
     .execute(pool)
     .await?;
     Ok(())
@@ -699,6 +715,9 @@ fn push_where(qb: &mut QueryBuilder<'_, sqlx::Sqlite>, f: &LogFilter) {
             .push(" ESCAPE '\\' OR request_model LIKE ")
             .push_bind(pattern)
             .push(" ESCAPE '\\')");
+    }
+    if let Some(sid) = &f.session_id {
+        qb.push(" AND session_id = ").push_bind(sid.clone());
     }
 }
 

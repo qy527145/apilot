@@ -34,6 +34,8 @@ export interface RequestStarted {
   provider_name: string;
   upstream_url: string;
   is_stream: boolean;
+  /** 所属对话（客户端给的会话 ID）。 */
+  session_id?: string | null;
 }
 
 /** 请求结束。与 `apilot://request` 分开：那个会丢负载，当不了结束信号。 */

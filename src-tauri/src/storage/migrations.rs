@@ -398,6 +398,24 @@ ALTER TABLE usage_hourly ADD COLUMN ttfb_sum_ms       INTEGER NOT NULL DEFAULT 0
 ALTER TABLE usage_hourly ADD COLUMN decode_ms_sum     INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_hourly ADD COLUMN decode_tokens_sum INTEGER NOT NULL DEFAULT 0;
 "#,
+    // --- v11: 请求归属到对话（会话 / 线 / 轮数）---
+    //
+    // 动机：多开对话时所有请求混在一起，没法追溯某一个对话的链路。归属靠客户端
+    // 自己给的会话 ID（压缩不会改它），见 `traffic::session`。
+    //
+    // 只存**原始事实**（ID、线指纹、这次带了几轮、带没带工具），不存"主线 / 子代理 / 旁路"
+    // 与"是否压缩点"：那两样要看整个会话才定得下来，单条请求落库时说不清，
+    // 存下来反而会随着会话往后走而过时。查询时现算，见 `storage::sessions`。
+    //
+    // 老行全是 NULL —— 回填得从捕获里重新解析，而捕获有条数上限，补出来也是
+    // 残缺的；与其给一部分老对话编出不完整的链路，不如老数据就不归属。
+    r#"
+ALTER TABLE request_logs ADD COLUMN session_id    TEXT;
+ALTER TABLE request_logs ADD COLUMN thread_key    TEXT;
+ALTER TABLE request_logs ADD COLUMN message_count INTEGER;
+ALTER TABLE request_logs ADD COLUMN has_tools     INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_logs_session ON request_logs(session_id, ts);
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -409,7 +427,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 10);
+        assert_eq!(SCHEMA_VERSION, 11);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

@@ -161,6 +161,9 @@ pub struct RequestStarted {
     /// 请求将发往的上游 URL（endpoint_for 的结果），进行中列表用。
     pub upstream_url: String,
     pub is_stream: bool,
+    /// 所属对话。进行中的请求也要能按对话筛 —— 正在跑的那一轮往往就是要看的。
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// 请求结束。与 `apilot://request` 分开：那个走的 `EventBus::request`
@@ -368,6 +371,7 @@ mod tests {
             provider_name: "test".into(),
             upstream_url: "https://api.example.com".into(),
             is_stream: true,
+            session_id: None,
         }
     }
 

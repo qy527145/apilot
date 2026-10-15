@@ -10,6 +10,7 @@ import { FilterExprPanel } from "@/components/traffic/FilterExprPanel";
 import { TimeRangePicker } from "@/components/traffic/TimeRangePicker";
 import { LiveStreamDialog, MAX_LIVE_FRAMES, type LiveRequest } from "@/components/traffic/LiveStreamDialog";
 import { RequestDetailDialog } from "@/components/traffic/RequestDetailDialog";
+import { SessionsView } from "@/components/traffic/SessionsView";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -55,6 +56,7 @@ import {
   formatNumber,
   formatTime,
   quotaToUsd,
+  shortSessionId,
   truncate,
 } from "@/lib/utils";
 
@@ -151,6 +153,10 @@ export default function TrafficPage() {
   const [protocol, setProtocol] = useState<string>(ANY);
   const [status, setStatus] = useState<string>(ANY);
   const [onlyStream, setOnlyStream] = useState(false);
+  /** 「请求」看逐条，「对话」按客户端给的会话 ID 归组看链路。 */
+  const [view, setView] = useState<"requests" | "sessions">("requests");
+  /** 从对话视图跳过来时带的会话筛选。不进下拉 —— 会话 ID 太多，只能从对话视图点进来。 */
+  const [sessionId, setSessionId] = useState<string | null>(null);
   /** 自定义 JS 表达式。空 = 不筛。 */
   const [expr, setExpr] = useState("");
   const [limit, setLimit] = useState(PAGE_SIZE);
@@ -173,8 +179,9 @@ export default function TrafficPage() {
       status: status === ANY ? null : (status as LogStatus),
       is_stream: onlyStream ? true : null,
       expr: expr.trim() || null,
+      session_id: sessionId,
     }),
-    [limit, from, to, client, requestModel, routedModel, protocol, status, onlyStream, expr],
+    [limit, from, to, client, requestModel, routedModel, protocol, status, onlyStream, expr, sessionId],
   );
 
   // 提出来是因为删除后要按同一把键失效 —— 筛选条件在键里，写死前缀匹配不上。
@@ -228,6 +235,7 @@ export default function TrafficPage() {
             provider_name: r.provider_name,
             upstream_url: r.upstream_url,
             is_stream: r.is_stream,
+            session_id: r.session_id,
             frames: [],
             done: false,
             truncated: false,
@@ -267,6 +275,7 @@ export default function TrafficPage() {
         provider_name: p.provider_name,
         upstream_url: p.upstream_url,
         is_stream: p.is_stream,
+        session_id: p.session_id,
         frames: [],
         done: false,
         truncated: false,
@@ -327,6 +336,7 @@ export default function TrafficPage() {
           if (routedModel !== ANY && r.model !== routedModel) return false;
           if (protocol !== ANY && r.protocol_in !== protocol) return false;
           if (onlyStream && !r.is_stream) return false;
+          if (sessionId !== null && r.session_id !== sessionId) return false;
           return inflightMatches(compiledExpr, buildInflightContext(r));
         })
         .sort((a, b) => b.ts - a.ts),
@@ -339,6 +349,7 @@ export default function TrafficPage() {
       routedModel,
       protocol,
       onlyStream,
+      sessionId,
       compiledExpr,
     ],
   );
@@ -380,6 +391,7 @@ export default function TrafficPage() {
     protocol !== ANY ||
     status !== ANY ||
     onlyStream ||
+    sessionId !== null ||
     expr.trim() !== "";
 
   const resetFilters = () => {
@@ -392,6 +404,7 @@ export default function TrafficPage() {
     setProtocol(ANY);
     setStatus(ANY);
     setOnlyStream(false);
+    setSessionId(null);
     setExpr("");
     setLimit(PAGE_SIZE);
   };
@@ -447,6 +460,15 @@ export default function TrafficPage() {
           <CardContent className="space-y-3 p-3">
             {/* 高频筛选条件 */}
             <div className="flex flex-wrap items-center gap-3">
+              <Tabs value={view} onValueChange={(v) => setView(v as typeof view)}>
+                <TabsList>
+                  <TabsTrigger value="requests">请求</TabsTrigger>
+                  <TabsTrigger value="sessions" title="按对话归组，看每个对话的完整链路">
+                    对话
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
+
               <Select value={client} onValueChange={setClient}>
                 <SelectTrigger size="sm" className="h-8 w-36">
                   <SelectValue placeholder="客户端" />
@@ -461,68 +483,86 @@ export default function TrafficPage() {
                 </SelectContent>
               </Select>
 
-              <Select value={requestModel} onValueChange={setRequestModel}>
-                <SelectTrigger size="sm" className="h-8 w-44">
-                  <SelectValue placeholder="请求模型" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={ANY}>全部请求模型</SelectItem>
-                  {(facets.data?.models ?? []).map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {m}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              {view === "requests" && (
+                <>
+                  <Select value={requestModel} onValueChange={setRequestModel}>
+                    <SelectTrigger size="sm" className="h-8 w-44">
+                      <SelectValue placeholder="请求模型" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ANY}>全部请求模型</SelectItem>
+                      {(facets.data?.models ?? []).map((m) => (
+                        <SelectItem key={m} value={m}>
+                          {m}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
 
-              <Select value={routedModel} onValueChange={setRoutedModel}>
-                <SelectTrigger size="sm" className="h-8 w-44">
-                  <SelectValue placeholder="实际模型" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={ANY}>全部实际模型</SelectItem>
-                  {(facets.data?.routed_models ?? []).map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {m}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                  <Select value={routedModel} onValueChange={setRoutedModel}>
+                    <SelectTrigger size="sm" className="h-8 w-44">
+                      <SelectValue placeholder="实际模型" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ANY}>全部实际模型</SelectItem>
+                      {(facets.data?.routed_models ?? []).map((m) => (
+                        <SelectItem key={m} value={m}>
+                          {m}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
 
-              <Select value={protocol} onValueChange={setProtocol}>
-                <SelectTrigger size="sm" className="h-8 w-40">
-                  <SelectValue placeholder="协议" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={ANY}>全部协议</SelectItem>
-                  {ALL_PROTOCOLS.map((p) => (
-                    <SelectItem key={p} value={p}>
-                      {PROTOCOL_LABEL[p]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                  <Select value={protocol} onValueChange={setProtocol}>
+                    <SelectTrigger size="sm" className="h-8 w-40">
+                      <SelectValue placeholder="协议" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ANY}>全部协议</SelectItem>
+                      {ALL_PROTOCOLS.map((p) => (
+                        <SelectItem key={p} value={p}>
+                          {PROTOCOL_LABEL[p]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
 
-              <Select value={status} onValueChange={setStatus}>
-                <SelectTrigger size="sm" className="h-8 w-32">
-                  <SelectValue placeholder="状态" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={ANY}>全部状态</SelectItem>
-                  <SelectItem value="ok">只看成功</SelectItem>
-                  <SelectItem value="error">只看失败</SelectItem>
-                </SelectContent>
-              </Select>
+                  <Select value={status} onValueChange={setStatus}>
+                    <SelectTrigger size="sm" className="h-8 w-32">
+                      <SelectValue placeholder="状态" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ANY}>全部状态</SelectItem>
+                      <SelectItem value="ok">只看成功</SelectItem>
+                      <SelectItem value="error">只看失败</SelectItem>
+                    </SelectContent>
+                  </Select>
 
-              <Button
-                variant={onlyStream ? "default" : "outline"}
-                size="sm"
-                onClick={() => setOnlyStream((v) => !v)}
-              >
-                只看流式
-              </Button>
+                  <Button
+                    variant={onlyStream ? "default" : "outline"}
+                    size="sm"
+                    onClick={() => setOnlyStream((v) => !v)}
+                  >
+                    只看流式
+                  </Button>
 
-              <FilterExprPanel value={expr} onChange={setExpr} />
+                  <FilterExprPanel value={expr} onChange={setExpr} />
+
+                  {sessionId && (
+                    <Badge variant="secondary" className="gap-1 font-mono" title={sessionId}>
+                      对话 #{shortSessionId(sessionId)}
+                      <button
+                        type="button"
+                        aria-label="取消对话筛选"
+                        className="hover:text-foreground"
+                        onClick={() => setSessionId(null)}
+                      >
+                        <X className="size-3" />
+                      </button>
+                    </Badge>
+                  )}
+                </>
+              )}
 
               {hasFilter && (
                 <Button variant="ghost" size="sm" onClick={resetFilters}>
@@ -531,17 +571,19 @@ export default function TrafficPage() {
                 </Button>
               )}
 
-              <span className="text-muted-foreground ml-auto flex items-center gap-2 text-xs tabular-nums">
-                {data?.truncated && (
-                  <span
-                    className="text-amber-600 dark:text-amber-500"
-                    title="表达式会先扫最近一批日志；涉及报文内容（body / headers）的条件还受扫描预算限制，所以可能没覆盖到全部日志。缩小时间范围可以让它扫得更全。"
-                  >
-                    仅覆盖部分日志
-                  </span>
+              {view === "requests" && (
+                <span className="text-muted-foreground ml-auto flex items-center gap-2 text-xs tabular-nums">
+                  {data?.truncated && (
+                    <span
+                      className="text-amber-600 dark:text-amber-500"
+                      title="表达式会先扫最近一批日志；涉及报文内容（body / headers）的条件还受扫描预算限制，所以可能没覆盖到全部日志。缩小时间范围可以让它扫得更全。"
+                    >
+                      仅覆盖部分日志
+                    </span>
                 )}
                 共 {formatNumber(total)} 条
               </span>
+              )}
             </div>
 
             <Separator />
@@ -582,244 +624,259 @@ export default function TrafficPage() {
           </CardContent>
         </Card>
 
-        <Card className="py-0">
-          <CardContent className="overflow-x-auto p-0">
-            {isLoading ? (
-              <div className="p-4">
-                <TableSkeleton rows={8} cols={8} />
-              </div>
-            ) : isError ? (
-              <div className="space-y-2 p-4">
-                <ErrorState onRetry={() => refetch()} />
-                {errorMessage && (
-                  <p className="text-muted-foreground text-center text-xs">
-                    {errorMessage}
-                  </p>
-                )}
-              </div>
-            ) : inflightList.length === 0 && items.length === 0 ? (
-              <div className="p-6">
-                <EmptyState
-                  icon={Activity}
-                  title={hasFilter ? "没有符合条件的请求" : "暂无实时请求"}
-                  description={
-                    hasFilter
-                      ? "换一下筛选条件，或点「清除筛选」看看全部。"
-                      : "有请求经过网关时，会实时出现在这里。"
-                  }
-                />
-              </div>
-            ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>时间</TableHead>
-                    <TableHead>客户端</TableHead>
-                    <TableHead>模型</TableHead>
-                    <TableHead>入站路径</TableHead>
-                    <TableHead>上游</TableHead>
-                    <TableHead>协议</TableHead>
-                    <TableHead>渠道</TableHead>
-                    <TableHead className="text-center">状态</TableHead>
-                    <TableHead className="text-right">耗时</TableHead>
-                    <TableHead className="text-right">TTFB</TableHead>
-                    <TableHead className="text-right">Token</TableHead>
-                    <TableHead className="text-right">费用</TableHead>
-                    <TableHead className="text-center">缓存</TableHead>
-                    <TableHead className="w-10" />
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {/* 进行中的请求：置顶显示，带脉冲指示器。 */}
-                  {inflightList.map((r) => (
-                    <TableRow
-                      key={r.request_id}
-                      className="cursor-pointer hover:bg-emerald-500/5"
-                      onClick={() => {
-                        if (r.is_stream) setLiveStream(r.request_id);
-                      }}
-                    >
-                      <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
-                        <span className="mr-1.5 inline-block size-1.5 rounded-full bg-emerald-500 align-middle animate-pulse" />
-                        {formatTime(r.ts)}
-                      </TableCell>
-                      <TableCell className="max-w-[120px] truncate text-xs">
-                        {truncate(r.client, 14)}
-                      </TableCell>
-                      <TableCell className="max-w-[160px] text-xs">
-                        <div className="truncate font-mono">{r.model}</div>
-                        {r.request_model && r.request_model !== r.model && (
-                          <div
-                            className="text-muted-foreground truncate text-[11px]"
-                            title={`客户端请求的模型：${r.request_model}`}
-                          >
-                            ← {r.request_model}
-                          </div>
-                        )}
-                      </TableCell>
-                      <TableCell
-                        className="text-muted-foreground max-w-[150px] truncate font-mono text-xs"
-                        title={r.path}
-                      >
-                        {r.path || "—"}
-                      </TableCell>
-                      <TableCell className="text-muted-foreground text-xs">
-                        {r.upstream_url ? hostOf(r.upstream_url) : "—"}
-                      </TableCell>
-                      <TableCell className="text-xs whitespace-nowrap">
-                        {r.is_stream ? (
-                          <Badge variant="success">流式</Badge>
-                        ) : (
-                          <Badge variant="secondary">非流式</Badge>
-                        )}
-                      </TableCell>
-                      <TableCell
-                        className="max-w-[140px] truncate text-xs"
-                        title={r.provider_tag ?? ""}
-                      >
-                        {r.provider_name || r.provider_tag || "—"}
-                      </TableCell>
-                      {/* 进行中的请求没有最终状态，用「进行中」占位。 */}
-                      <TableCell className="text-center">
-                        <Badge variant="secondary">进行中</Badge>
-                      </TableCell>
-                      <TableCell className="text-right text-xs">—</TableCell>
-                      <TableCell className="text-right text-xs">—</TableCell>
-                      <TableCell className="text-right text-xs">—</TableCell>
-                      <TableCell className="text-right text-xs">—</TableCell>
-                      <TableCell className="text-center text-xs">—</TableCell>
-                    </TableRow>
-                  ))}
-
-                  {/* 已完成的请求：来自数据库。 */}
-                  {items.map((r) => (
-                    <TableRow
-                      key={r.request_id}
-                      className="cursor-pointer"
-                      onClick={() => setSelected(r.request_id)}
-                    >
-                      <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
-                        {formatTime(r.ts)}
-                      </TableCell>
-                      <TableCell className="max-w-[120px] truncate text-xs">
-                        {truncate(r.client, 14)}
-                      </TableCell>
-                      <TableCell className="max-w-[160px] text-xs">
-                        <div className="truncate font-mono">{r.model}</div>
-                        {r.request_model && r.request_model !== r.model && (
-                          <div
-                            className="text-muted-foreground truncate text-[11px]"
-                            title={`客户端请求的模型：${r.request_model}`}
-                          >
-                            ← {r.request_model}
-                          </div>
-                        )}
-                        {r.upstream_model && r.upstream_model !== r.model && (
-                          <div
-                            className="text-muted-foreground truncate text-[11px]"
-                            title={`实际发给上游：${r.upstream_model}`}
-                          >
-                            ↑ {r.upstream_model}
-                          </div>
-                        )}
-                      </TableCell>
-                      <TableCell
-                        className="text-muted-foreground max-w-[150px] truncate font-mono text-xs"
-                        title={r.path}
-                      >
-                        {r.path || "—"}
-                      </TableCell>
-                      <TableCell
-                        className="text-muted-foreground max-w-[220px] truncate font-mono text-xs"
-                        title={r.upstream_url ?? undefined}
-                      >
-                        {r.upstream_url ? hostOf(r.upstream_url) : "—"}
-                      </TableCell>
-                      <TableCell className="text-xs whitespace-nowrap">
-                        {r.protocol_in === r.protocol_out ? (
-                          <Badge variant="success">直通</Badge>
-                        ) : (
-                          <Badge variant="secondary" title={`${r.protocol_in} → ${r.protocol_out}`}>
-                            转换
-                          </Badge>
-                        )}
-                      </TableCell>
-                      <TableCell
-                        className="max-w-[140px] truncate"
-                        title={r.provider_tag ?? ""}
-                      >
-                        {r.provider_name || r.provider_tag || "—"}
-                      </TableCell>
-                      <TableCell className="text-center">
-                        <Badge variant={r.status_code < 400 ? "success" : "destructive"}>
-                          {r.status_code}
-                        </Badge>
-                        {r.upstream_status != null &&
-                          r.upstream_status !== r.status_code && (
-                            <div
-                              className="text-muted-foreground mt-0.5 text-[11px]"
-                              title="上游返回的原始状态码"
-                            >
-                              上游 {r.upstream_status}
-                            </div>
-                          )}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {formatMs(r.latency_ms)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {formatMs(r.ttfb_ms)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {formatNumber(r.input_tokens + r.output_tokens)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {quotaToUsd(r.quota)}
-                      </TableCell>
-                      <TableCell className="text-center">
-                        {r.cache_hit ? (
-                          <Badge variant="success">命中</Badge>
-                        ) : (
-                          <span className="text-muted-foreground text-xs">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {/*
-                          删除必须拦住冒泡：整行的 onClick 是打开详情，不拦的话
-                          点删除会顺手把详情弹窗也打开。
-                        */}
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="text-muted-foreground hover:text-destructive size-7"
-                          title="删除这条记录"
-                          aria-label="删除这条记录"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setConfirmDelete(r.request_id);
+        {view === "sessions" ? (
+          <SessionsView
+            client={client === ANY ? null : client}
+            from={from}
+            to={to}
+            onOpenRequest={setSelected}
+            onFilterRequests={(sid) => {
+              setSessionId(sid);
+              setView("requests");
+            }}
+          />
+        ) : (
+          <>
+            <Card className="py-0">
+              <CardContent className="overflow-x-auto p-0">
+                {isLoading ? (
+                  <div className="p-4">
+                    <TableSkeleton rows={8} cols={8} />
+                  </div>
+                ) : isError ? (
+                  <div className="space-y-2 p-4">
+                    <ErrorState onRetry={() => refetch()} />
+                    {errorMessage && (
+                      <p className="text-muted-foreground text-center text-xs">
+                        {errorMessage}
+                      </p>
+                    )}
+                  </div>
+                ) : inflightList.length === 0 && items.length === 0 ? (
+                  <div className="p-6">
+                    <EmptyState
+                      icon={Activity}
+                      title={hasFilter ? "没有符合条件的请求" : "暂无实时请求"}
+                      description={
+                        hasFilter
+                          ? "换一下筛选条件，或点「清除筛选」看看全部。"
+                          : "有请求经过网关时，会实时出现在这里。"
+                      }
+                    />
+                  </div>
+                ) : (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>时间</TableHead>
+                        <TableHead>客户端</TableHead>
+                        <TableHead>模型</TableHead>
+                        <TableHead>入站路径</TableHead>
+                        <TableHead>上游</TableHead>
+                        <TableHead>协议</TableHead>
+                        <TableHead>渠道</TableHead>
+                        <TableHead className="text-center">状态</TableHead>
+                        <TableHead className="text-right">耗时</TableHead>
+                        <TableHead className="text-right">TTFB</TableHead>
+                        <TableHead className="text-right">Token</TableHead>
+                        <TableHead className="text-right">费用</TableHead>
+                        <TableHead className="text-center">缓存</TableHead>
+                        <TableHead className="w-10" />
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {/* 进行中的请求：置顶显示，带脉冲指示器。 */}
+                      {inflightList.map((r) => (
+                        <TableRow
+                          key={r.request_id}
+                          className="cursor-pointer hover:bg-emerald-500/5"
+                          onClick={() => {
+                            if (r.is_stream) setLiveStream(r.request_id);
                           }}
                         >
-                          <Trash2 className="size-3.5" />
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            )}
-          </CardContent>
-        </Card>
+                          <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
+                            <span className="mr-1.5 inline-block size-1.5 rounded-full bg-emerald-500 align-middle animate-pulse" />
+                            {formatTime(r.ts)}
+                          </TableCell>
+                          <TableCell className="max-w-[120px] truncate text-xs">
+                            {truncate(r.client, 14)}
+                          </TableCell>
+                          <TableCell className="max-w-[160px] text-xs">
+                            <div className="truncate font-mono">{r.model}</div>
+                            {r.request_model && r.request_model !== r.model && (
+                              <div
+                                className="text-muted-foreground truncate text-[11px]"
+                                title={`客户端请求的模型：${r.request_model}`}
+                              >
+                                ← {r.request_model}
+                              </div>
+                            )}
+                          </TableCell>
+                          <TableCell
+                            className="text-muted-foreground max-w-[150px] truncate font-mono text-xs"
+                            title={r.path}
+                          >
+                            {r.path || "—"}
+                          </TableCell>
+                          <TableCell className="text-muted-foreground text-xs">
+                            {r.upstream_url ? hostOf(r.upstream_url) : "—"}
+                          </TableCell>
+                          <TableCell className="text-xs whitespace-nowrap">
+                            {r.is_stream ? (
+                              <Badge variant="success">流式</Badge>
+                            ) : (
+                              <Badge variant="secondary">非流式</Badge>
+                            )}
+                          </TableCell>
+                          <TableCell
+                            className="max-w-[140px] truncate text-xs"
+                            title={r.provider_tag ?? ""}
+                          >
+                            {r.provider_name || r.provider_tag || "—"}
+                          </TableCell>
+                          {/* 进行中的请求没有最终状态，用「进行中」占位。 */}
+                          <TableCell className="text-center">
+                            <Badge variant="secondary">进行中</Badge>
+                          </TableCell>
+                          <TableCell className="text-right text-xs">—</TableCell>
+                          <TableCell className="text-right text-xs">—</TableCell>
+                          <TableCell className="text-right text-xs">—</TableCell>
+                          <TableCell className="text-right text-xs">—</TableCell>
+                          <TableCell className="text-center text-xs">—</TableCell>
+                        </TableRow>
+                      ))}
 
-        {items.length > 0 && limit < MAX_LIMIT && items.length >= limit && (
-          <div className="flex justify-center">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setLimit((v) => Math.min(v + PAGE_SIZE, MAX_LIMIT))}
-            >
-              加载更多
-            </Button>
-          </div>
+                      {/* 已完成的请求：来自数据库。 */}
+                      {items.map((r) => (
+                        <TableRow
+                          key={r.request_id}
+                          className="cursor-pointer"
+                          onClick={() => setSelected(r.request_id)}
+                        >
+                          <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
+                            {formatTime(r.ts)}
+                          </TableCell>
+                          <TableCell className="max-w-[120px] truncate text-xs">
+                            {truncate(r.client, 14)}
+                          </TableCell>
+                          <TableCell className="max-w-[160px] text-xs">
+                            <div className="truncate font-mono">{r.model}</div>
+                            {r.request_model && r.request_model !== r.model && (
+                              <div
+                                className="text-muted-foreground truncate text-[11px]"
+                                title={`客户端请求的模型：${r.request_model}`}
+                              >
+                                ← {r.request_model}
+                              </div>
+                            )}
+                            {r.upstream_model && r.upstream_model !== r.model && (
+                              <div
+                                className="text-muted-foreground truncate text-[11px]"
+                                title={`实际发给上游：${r.upstream_model}`}
+                              >
+                                ↑ {r.upstream_model}
+                              </div>
+                            )}
+                          </TableCell>
+                          <TableCell
+                            className="text-muted-foreground max-w-[150px] truncate font-mono text-xs"
+                            title={r.path}
+                          >
+                            {r.path || "—"}
+                          </TableCell>
+                          <TableCell
+                            className="text-muted-foreground max-w-[220px] truncate font-mono text-xs"
+                            title={r.upstream_url ?? undefined}
+                          >
+                            {r.upstream_url ? hostOf(r.upstream_url) : "—"}
+                          </TableCell>
+                          <TableCell className="text-xs whitespace-nowrap">
+                            {r.protocol_in === r.protocol_out ? (
+                              <Badge variant="success">直通</Badge>
+                            ) : (
+                              <Badge variant="secondary" title={`${r.protocol_in} → ${r.protocol_out}`}>
+                                转换
+                              </Badge>
+                            )}
+                          </TableCell>
+                          <TableCell
+                            className="max-w-[140px] truncate"
+                            title={r.provider_tag ?? ""}
+                          >
+                            {r.provider_name || r.provider_tag || "—"}
+                          </TableCell>
+                          <TableCell className="text-center">
+                            <Badge variant={r.status_code < 400 ? "success" : "destructive"}>
+                              {r.status_code}
+                            </Badge>
+                            {r.upstream_status != null &&
+                              r.upstream_status !== r.status_code && (
+                                <div
+                                  className="text-muted-foreground mt-0.5 text-[11px]"
+                                  title="上游返回的原始状态码"
+                                >
+                                  上游 {r.upstream_status}
+                                </div>
+                              )}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {formatMs(r.latency_ms)}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {formatMs(r.ttfb_ms)}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {formatNumber(r.input_tokens + r.output_tokens)}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {quotaToUsd(r.quota)}
+                          </TableCell>
+                          <TableCell className="text-center">
+                            {r.cache_hit ? (
+                              <Badge variant="success">命中</Badge>
+                            ) : (
+                              <span className="text-muted-foreground text-xs">—</span>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            {/*
+                              删除必须拦住冒泡：整行的 onClick 是打开详情，不拦的话
+                              点删除会顺手把详情弹窗也打开。
+                            */}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="text-muted-foreground hover:text-destructive size-7"
+                              title="删除这条记录"
+                              aria-label="删除这条记录"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setConfirmDelete(r.request_id);
+                              }}
+                            >
+                              <Trash2 className="size-3.5" />
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                )}
+              </CardContent>
+            </Card>
+
+            {items.length > 0 && limit < MAX_LIMIT && items.length >= limit && (
+              <div className="flex justify-center">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setLimit((v) => Math.min(v + PAGE_SIZE, MAX_LIMIT))}
+                >
+                  加载更多
+                </Button>
+              </div>
+            )}
+          </>
         )}
       </div>
 

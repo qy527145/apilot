@@ -86,6 +86,16 @@ struct Recorder {
 }
 
 impl Recorder {
+    /// 记下这次请求属于哪个对话。三条入口（对话 / 原样转发 / 读体失败）都要调，
+    /// 漏了哪条，那类请求就会从对话链路里消失 —— 而失败的那几条恰恰最需要追溯。
+    fn tag_session(&mut self, headers: &HeaderMap, body: &[u8]) {
+        let t = crate::traffic::session::tag(headers, &self.record.path, body);
+        self.record.session_id = t.session_id;
+        self.record.thread_key = t.thread_key;
+        self.record.message_count = t.message_count;
+        self.record.has_tools = t.has_tools;
+    }
+
     fn finish(&mut self, status: i32, usage: UnifiedUsage, ttfb_ms: Option<i64>) {
         if self.finished {
             return;
@@ -249,6 +259,8 @@ pub async fn handle(
         finished: false,
         handed_off: false,
     };
+    // 在解码之前：解不出的请求也得能归到对话里。
+    recorder.tag_session(&headers, &body);
 
     // ---- 1. 解码入站请求 ----
     let codec_in = shell.codecs.codec(protocol);
@@ -416,6 +428,7 @@ pub async fn handle(
         provider_name: first.provider().name.clone(),
         upstream_url: first.provider().endpoint_for(first.wire_for(protocol)),
         is_stream: req.stream,
+        session_id: recorder.record.session_id.clone(),
     };
     // 先写进行中快照，再广播事件：顺序保证前端任何时刻查询都不会漏掉刚进来的请求。
     shell.inflight.insert(started_payload.clone());
@@ -521,6 +534,7 @@ pub(crate) fn reject_body(
         finished: false,
         handed_off: false,
     };
+    recorder.tag_session(&headers, &err.partial);
     recorder.record.model = peek_model(&err.partial);
     recorder.record.request_model = recorder.record.model.clone();
 
@@ -591,6 +605,8 @@ pub async fn handle_raw(
         finished: false,
         handed_off: false,
     };
+    // count_tokens 这类请求也带会话 ID，是对话链路的一部分。
+    recorder.tag_session(&headers, &body);
 
     // ---- 模型替换 ----
     //
@@ -1079,6 +1095,12 @@ async fn try_outbound(
             // 所以它记着的那个「客户端请求的名字」必须在这里带过去 —— 到了
             // `finalize_stream` 再想拿，原始值已经不存在了。
             request_model: recorder.record.request_model.clone(),
+            session: crate::traffic::session::SessionTag {
+                session_id: recorder.record.session_id.clone(),
+                thread_key: recorder.record.thread_key.clone(),
+                message_count: recorder.record.message_count,
+                has_tools: recorder.record.has_tools,
+            },
             provider_tag: outbound.tag().to_string(),
             provider_id: Some(outbound.provider().id),
             protocol_in,
@@ -1342,6 +1364,8 @@ struct StreamContext {
     upstream_url: Option<String>,
     upstream_model: Option<String>,
     upstream_status: Option<i32>,
+    /// 对话归属。与 `request_model` 同理：`Recorder` 在这条路上会被丢掉，得带过来。
+    session: crate::traffic::session::SessionTag,
 }
 
 /// 流结束后的收尾：计费、写缓存、补捕获。
@@ -1370,6 +1394,7 @@ fn finalize_stream(
         upstream_url,
         upstream_model,
         upstream_status,
+        session,
     } = ctx;
 
     let latency = started.elapsed().as_millis() as i64;
@@ -1450,6 +1475,10 @@ fn finalize_stream(
             other: serde_json::json!({
                 "stream_events": outcome.events,
             }),
+            session_id: session.session_id,
+            thread_key: session.thread_key,
+            message_count: session.message_count,
+            has_tools: session.has_tools,
         };
 
         shell.aggregates.record(&rec);

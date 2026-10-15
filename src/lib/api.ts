@@ -519,6 +519,8 @@ export interface LogFilter {
    * 内置对象与写法见 `FilterExprPanel`，实现见 `src-tauri/src/traffic/log_filter.rs`。
    */
   expr?: string | null;
+  /** 只看某一个对话的请求。 */
+  session_id?: string | null;
   limit: number;
   offset: number;
 }
@@ -568,6 +570,71 @@ export interface RequestLog {
   ttfb_ms?: number | null;
   cache_hit: boolean;
   saved_quota: number;
+  /** 所属对话（客户端给的会话 ID）。客户端没给时为 null。 */
+  session_id?: string | null;
+}
+
+// ---------- 对话链路 ----------
+
+export interface SessionFilter {
+  client?: string | null;
+  from?: number | null;
+  to?: number | null;
+  limit?: number;
+}
+
+export interface SessionSummary {
+  session_id: string;
+  client: string;
+  first_ts: number;
+  last_ts: number;
+  requests: number;
+  errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  quota: number;
+  /** 用到过的生效模型，按首次出现排序。多个 = 中途换过模型。 */
+  models: string[];
+}
+
+/** 主线 / 子代理 / 旁路（起标题、hook 求值）。判据见 `traffic/session.rs`。 */
+export type ThreadKind = "main" | "agent" | "side";
+
+export interface ThreadSummary {
+  thread_key: string;
+  kind: ThreadKind;
+  requests: number;
+  first_ts: number;
+  last_ts: number;
+  compactions: number;
+}
+
+export interface TimelineEntry {
+  request_id: string;
+  ts: number;
+  /** null = 不是对话的一轮（count_tokens 等），不属于任何线。 */
+  thread_key: string | null;
+  model: string;
+  request_model: string;
+  path: string;
+  status_code: number;
+  error_message?: string | null;
+  message_count?: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  quota: number;
+  latency_ms: number;
+  /** 相对同一条线的上一条，消息数骤降 —— 在这之前上下文被压缩过。 */
+  compacted: boolean;
+  compacted_from?: number | null;
+}
+
+export interface SessionTimeline {
+  session_id: string;
+  threads: ThreadSummary[];
+  entries: TimelineEntry[];
 }
 
 /** 正在进行的请求（还没结束、尚未落库）。与后端 `RequestStarted` 对应。 */
@@ -583,6 +650,7 @@ export interface InflightRequest {
   provider_name: string;
   upstream_url: string;
   is_stream: boolean;
+  session_id?: string | null;
 }
 
 export interface Page<T> {
@@ -1138,6 +1206,12 @@ export const api = {
   queryLogs: (filter: LogFilter) => call<Page<RequestLog>>("query_logs", { filter }),
   /** 筛选下拉的候选值。进监控页时取一次即可。 */
   listLogFacets: () => call<LogFacets>("list_log_facets"),
+  /** 最近活跃的对话。 */
+  listSessions: (filter: SessionFilter) =>
+    call<SessionSummary[]>("list_sessions", { filter: { limit: 100, ...filter } }),
+  /** 一个对话的完整链路。 */
+  getSessionTimeline: (sessionId: string) =>
+    call<SessionTimeline>("get_session_timeline", { sessionId }),
   /**
    * 校验筛选表达式能否编译，返回错因（`null` = 通过）。
    *

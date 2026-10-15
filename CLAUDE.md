@@ -76,6 +76,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **加一种路由动作** | `routing/rule.rs::RouteAction`（注意 `is_final` 的归类）→ `routing/engine.rs::route` 的 match → 前端 `ruleSummary.ts` |
 | **加一个 Tauri 命令** | 在 `commands/<域>.rs` 写 → `lib.rs` 的 `generate_handler!` 用**完整路径**（不能 re-export）→ 前端 `src/lib/api.ts` |
 | **改缓存策略** | `cache/policy.rs::is_cacheable` + `cache/key.rs`（键必须覆盖所有影响输出的因素） |
+| **改「请求属于哪个对话」** | 识别在 `traffic/session.rs`（会话 ID 只取客户端给的，**不按对话历史猜** —— 压缩会改写历史；线的指纹**不含工具集合**）→ `gateway/pipeline.rs::Recorder::tag_session`（三条入口都要调，流式那条经 `StreamContext.session` 带到收尾）→ 聚合与压缩判定在 `storage/sessions.rs`（查询时现算）→ 前端 `SessionsView` |
 | **改监控详情的可视化** | `protocol/inspect.rs`（把捕获报文解成 IR，只解码不搬运）+ `src/components/traffic/InspectViews.tsx`（渲染 IR）。**不要新建视图模型** —— IR 已经协议无关且字段齐备 |
 | **改 SSE 处理** | `gateway/sse.rs`（原语）→ `gateway/stream.rs`（转发管线） |
 | **加数据库表/字段** | `storage/migrations.rs` **追加**一条迁移（不要改已发布的），同步 `docs/CODE_MAP.md` |

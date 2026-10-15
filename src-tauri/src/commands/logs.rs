@@ -29,6 +29,24 @@ pub async fn query_logs(
     Ok(Page { items: page.items, total: page.total, truncated: page.truncated })
 }
 
+/// 最近活跃的对话。
+#[tauri::command]
+pub async fn list_sessions(
+    shell: State<'_, Arc<AppShell>>,
+    filter: crate::storage::sessions::SessionFilter,
+) -> AppResult<Vec<crate::storage::sessions::SessionSummary>> {
+    crate::storage::sessions::list(&shell.db, &filter).await
+}
+
+/// 一个对话的完整链路：各条线 + 按时间排好的请求 + 压缩点。
+#[tauri::command]
+pub async fn get_session_timeline(
+    shell: State<'_, Arc<AppShell>>,
+    session_id: String,
+) -> AppResult<crate::storage::sessions::SessionTimeline> {
+    crate::storage::sessions::timeline(&shell.db, &session_id).await
+}
+
 /// 筛选下拉的候选值。前端进监控页时取一次。
 #[tauri::command]
 pub async fn list_log_facets(

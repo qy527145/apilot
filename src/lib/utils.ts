@@ -61,6 +61,17 @@ export function truncate(s: string | null | undefined, len = 40): string {
   return s.length > len ? `${s.slice(0, len)}…` : s;
 }
 
+/**
+ * 会话 ID 的短写。
+ *
+ * 取**末尾**而不是开头：Codex 的 ID 是 UUIDv7，开头是时间戳 —— 同一时刻开的两个
+ * 对话前 8 位一模一样（实测撞过），截开头会让两行看着是同一个对话。
+ */
+export function shortSessionId(id: string): string {
+  const tail = id.replace(/-/g, "").slice(-8);
+  return tail || id;
+}
+
 /** 简易 JSON 美化，失败时原样返回 */
 export function prettyJson(raw: string | null | undefined): string {
   if (!raw) return "";

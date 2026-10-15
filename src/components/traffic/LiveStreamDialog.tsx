@@ -33,6 +33,7 @@ export interface LiveRequest {
   provider_name?: string | null;
   upstream_url?: string | null;
   is_stream: boolean;
+  session_id?: string | null;
   frames: StreamFrame[];
   /** 流已结束（正常结束、出错或客户端断连）。 */
   done: boolean;
