@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -150,46 +150,90 @@ async fn apilot_model_names(shell: &Arc<AppShell>) -> Vec<String> {
 async fn anthropic_messages(
     State(shell): State<Arc<AppShell>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
-    pipeline::handle(
-        shell,
-        Protocol::AnthropicMessages,
-        "/v1/messages".into(),
-        headers,
-        body,
-    )
-    .await
+    chat(shell, Protocol::AnthropicMessages, "/v1/messages", headers, body).await
 }
 
-async fn openai_chat(
-    State(shell): State<Arc<AppShell>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    pipeline::handle(
-        shell,
-        Protocol::OpenAiChat,
-        "/v1/chat/completions".into(),
-        headers,
-        body,
-    )
-    .await
+async fn openai_chat(State(shell): State<Arc<AppShell>>, headers: HeaderMap, body: Body) -> Response {
+    chat(shell, Protocol::OpenAiChat, "/v1/chat/completions", headers, body).await
 }
 
 async fn openai_responses(
     State(shell): State<Arc<AppShell>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
-    pipeline::handle(
-        shell,
-        Protocol::OpenAiResponses,
-        "/v1/responses".into(),
-        headers,
-        body,
-    )
-    .await
+    chat(shell, Protocol::OpenAiResponses, "/v1/responses", headers, body).await
+}
+
+/// 三个对话入口的共同一半：自己读请求体，再交给管线。
+///
+/// 收的是原始 `Body` 而不是 `Bytes` 提取器：后者带着 axum 的默认上限（2 MiB），
+/// 超了就在**进 handler 之前**回一个 413 —— 那一刻 `Recorder` 还没建，监控页里
+/// 一个字都没有，用户只能看到客户端报 "Failed to buffer the request body"。
+/// Claude Code 带几张截图或一份 PDF 就过 2 MiB，这不是边角情况。
+async fn chat(
+    shell: Arc<AppShell>,
+    protocol: Protocol,
+    path: &str,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    match read_body(body, MAX_REQUEST_BODY).await {
+        Ok(bytes) => pipeline::handle(shell, protocol, path.into(), headers, bytes).await,
+        Err(e) => pipeline::reject_body(
+            shell,
+            Some(protocol),
+            http::Method::POST,
+            path.into(),
+            headers,
+            e.status(),
+            &e.detail,
+        ),
+    }
+}
+
+/// 网关接受的请求体上限。
+///
+/// 所有入口共用这一个数：以前对话入口吃 axum 的 2 MiB、fallback 写死 64 MiB，
+/// 同一个请求换个路径结果就不一样。64 MiB 高于主流服务商自己的上限（Anthropic
+/// 是 32 MB），真超了也该由上游说"太大"，而不是我们先挡掉。
+pub(crate) const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+
+/// 读请求体失败的原因。
+#[derive(Debug)]
+pub(crate) struct BodyError {
+    pub too_large: bool,
+    pub detail: String,
+}
+
+impl BodyError {
+    /// 超限是 413；其余（多半是客户端读到一半断了）是 400。
+    pub fn status(&self) -> u16 {
+        if self.too_large {
+            413
+        } else {
+            400
+        }
+    }
+}
+
+pub(crate) async fn read_body(body: Body, limit: usize) -> Result<Bytes, BodyError> {
+    axum::body::to_bytes(body, limit).await.map_err(|e| {
+        // 超限要单独认出来：它是用户能自己处理的那类错（少带点附件），
+        // 得给一句带上限数字的人话，而不是笼统的"读取失败"。
+        let too_large = e
+            .into_inner()
+            .downcast::<http_body_util::LengthLimitError>()
+            .is_ok();
+        let detail = if too_large {
+            format!("请求体超过网关上限 {} MiB", limit / (1024 * 1024))
+        } else {
+            "读取请求体失败（客户端可能中途断开）".to_string()
+        };
+        BodyError { too_large, detail }
+    })
 }
 
 /// 三种对话入口的路径后缀，含无 `/v1` 的变体。
@@ -261,16 +305,18 @@ async fn fallback(State(shell): State<Arc<AppShell>>, req: axum::extract::Reques
     let method = parts.method;
     let headers = parts.headers;
 
-    let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+    let bytes = match read_body(body, MAX_REQUEST_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({
-                    "error": { "message": format!("读取请求体失败: {e}") }
-                })),
+            return pipeline::reject_body(
+                shell,
+                chat_protocol(&path),
+                method,
+                path,
+                headers,
+                e.status(),
+                &e.detail,
             )
-                .into_response()
         }
     };
 
@@ -283,6 +329,37 @@ async fn fallback(State(shell): State<Arc<AppShell>>, req: axum::extract::Reques
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bodies_over_axum_default_limit_are_accepted() {
+        // 回归：对话入口曾吃 axum 的 2 MiB 默认上限，超了就在进 handler 前被 413 掉，
+        // 监控页里什么都看不到。带几张截图的请求轻松就过这个数。
+        let big = vec![b'x'; 3 * 1024 * 1024];
+        let got = read_body(Body::from(big.clone()), MAX_REQUEST_BODY).await.unwrap();
+        assert_eq!(got.len(), big.len());
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_reported_as_413_with_the_limit() {
+        let err = read_body(Body::from(vec![0u8; 2 * 1024 * 1024 + 1]), 2 * 1024 * 1024)
+            .await
+            .unwrap_err();
+        assert!(err.too_large);
+        assert_eq!(err.status(), 413);
+        assert!(err.detail.contains("2 MiB"), "要带上限数字：{}", err.detail);
+    }
+
+    #[tokio::test]
+    async fn broken_body_is_400_not_413() {
+        // 客户端读到一半断了不是"太大"，别给出误导的修复方向。
+        let stream = futures::stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"{")),
+            Err(std::io::Error::other("连接被重置")),
+        ]);
+        let err = read_body(Body::from_stream(stream), MAX_REQUEST_BODY).await.unwrap_err();
+        assert!(!err.too_large);
+        assert_eq!(err.status(), 400);
+    }
 
     #[test]
     fn chat_paths_are_recognised_by_suffix() {

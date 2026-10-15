@@ -472,6 +472,63 @@ pub async fn handle(
     fail_response(&mut recorder, protocol, status, "上游请求失败", &err)
 }
 
+/// 请求体没读下来（超限 / 客户端中途断开）时的收口。
+///
+/// 这一步本来是 axum 提取器在 handler 之前替我们做的 —— 结果是客户端收到 413，
+/// 监控页里却**一条记录都没有**。"Apilot 报的错"必须留痕，所以这里照样建一个
+/// `Recorder` 走失败收口，只是没有请求体可存（存一半的残片只会误导人）。
+///
+/// `protocol` 为 `None` 表示非对话路径，错误体用原样转发那条路的通用形状。
+pub(crate) fn reject_body(
+    shell: Arc<AppShell>,
+    protocol: Option<Protocol>,
+    method: http::Method,
+    path: String,
+    headers: HeaderMap,
+    status: u16,
+    detail: &str,
+) -> Response {
+    let _active = shell.traffic.begin_request();
+    shell.traffic.record_failure();
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let client = detect_client(&headers, &path);
+    tracing::warn!(%client, %path, "{detail}");
+
+    let protocol_in = protocol
+        .or_else(|| protocol_family(&path))
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "raw".into());
+    let mut recorder = Recorder {
+        shell: shell.clone(),
+        record: RequestLogRecord {
+            request_id: request_id.clone(),
+            ts: crate::util::now_ms(),
+            client,
+            protocol_out: protocol_in.clone(),
+            protocol_in,
+            path: path.clone(),
+            ..Default::default()
+        },
+        session: BillingSession::deferred(),
+        capture: Some(CaptureRecord {
+            request_id,
+            ts: crate::util::now_ms(),
+            method: method.as_str().to_string(),
+            path,
+            request_headers: headers_to_json(&headers),
+            ..Default::default()
+        }),
+        finished: false,
+        handed_off: false,
+    };
+
+    match protocol {
+        Some(p) => fail_response(&mut recorder, p, status, "请求体读取失败", detail),
+        None => fail_raw_response(&mut recorder, status, "请求体读取失败", detail),
+    }
+}
+
 /// 非对话请求的原样转发。
 ///
 /// `/v1/messages/count_tokens` 是典型：客户端在问"我这段上下文占了多少 token"，
