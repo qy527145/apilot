@@ -8,5 +8,6 @@ pub mod model_select;
 pub mod rule;
 pub mod rule_item;
 pub mod selector;
+pub mod session_pin;
 pub use engine::{RouteOutcome, Router};
 pub use metadata::RouteMetadata;

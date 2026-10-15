@@ -416,6 +416,26 @@ ALTER TABLE request_logs ADD COLUMN message_count INTEGER;
 ALTER TABLE request_logs ADD COLUMN has_tools     INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_logs_session ON request_logs(session_id, ts);
 "#,
+    // --- v12: 对话级模型固定 ---
+    //
+    // 动机：同一个客户端开两个对话，想让它们各用各的模型。客户端自己的 `/model`
+    // 也能做到，但那要每个对话里手动切、且全局模型策略会把它盖掉；这里让用户在
+    // 监控页的对话视图上直接点选，网关按会话 ID 改写模型名。
+    //
+    // `scope`：`tools`（只改带工具的请求 —— 主线与子代理）/ `all`（连起标题、hook
+    // 求值这类旁路一起改）。默认 `tools`：旁路是客户端特意用小模型跑的，跟着换成
+    // 大模型纯属浪费。
+    //
+    // 会话 ID 是客户端生成的随机串，不会复用，所以不设外键也不随日志清理 ——
+    // 老会话的固定留着也只是一行无人命中的数据；界面上能逐条撤销。
+    r#"
+CREATE TABLE IF NOT EXISTS session_model_pins (
+  session_id  TEXT PRIMARY KEY,
+  model       TEXT NOT NULL,
+  scope       TEXT NOT NULL DEFAULT 'tools',
+  created_at  INTEGER NOT NULL
+);
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -427,7 +447,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 11);
+        assert_eq!(SCHEMA_VERSION, 12);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

@@ -583,6 +583,16 @@ export interface SessionFilter {
   limit?: number;
 }
 
+/** 固定对哪些请求生效。`tools`：主线与子代理（默认）；`all`：连旁路一起。 */
+export type PinScope = "tools" | "all";
+
+export interface SessionPin {
+  session_id: string;
+  model: string;
+  scope: PinScope;
+  created_at: number;
+}
+
 export interface SessionSummary {
   session_id: string;
   client: string;
@@ -596,6 +606,8 @@ export interface SessionSummary {
   quota: number;
   /** 用到过的生效模型，按首次出现排序。多个 = 中途换过模型。 */
   models: string[];
+  /** 这个对话被固定到的模型。 */
+  pin?: SessionPin | null;
 }
 
 /** 主线 / 子代理 / 旁路（起标题、hook 求值）。判据见 `traffic/session.rs`。 */
@@ -629,12 +641,15 @@ export interface TimelineEntry {
   /** 相对同一条线的上一条，消息数骤降 —— 在这之前上下文被压缩过。 */
   compacted: boolean;
   compacted_from?: number | null;
+  /** 被会话固定改写之前的模型名。 */
+  pinned_from?: string | null;
 }
 
 export interface SessionTimeline {
   session_id: string;
   threads: ThreadSummary[];
   entries: TimelineEntry[];
+  pin?: SessionPin | null;
 }
 
 /** 正在进行的请求（还没结束、尚未落库）。与后端 `RequestStarted` 对应。 */
@@ -1212,6 +1227,11 @@ export const api = {
   /** 一个对话的完整链路。 */
   getSessionTimeline: (sessionId: string) =>
     call<SessionTimeline>("get_session_timeline", { sessionId }),
+  /** 把对话固定到某个模型（已固定过就改成新的）。 */
+  pinSessionModel: (sessionId: string, model: string, scope: PinScope) =>
+    call<void>("pin_session_model", { sessionId, model, scope }),
+  unpinSessionModel: (sessionId: string) =>
+    call<void>("unpin_session_model", { sessionId }),
   /**
    * 校验筛选表达式能否编译，返回错因（`null` = 通过）。
    *

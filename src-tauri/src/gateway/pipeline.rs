@@ -96,6 +96,26 @@ impl Recorder {
         self.record.has_tools = t.has_tools;
     }
 
+    /// 这个对话被固定了模型就改用它；返回改写后的模型名。
+    ///
+    /// 必须在 `tag_session` 之后（要会话 ID 与带没带工具）、在模型策略之后（固定是
+    /// 更具体的意图，不该被全局策略盖掉）。改了就在 `other.session_pin` 里留痕：
+    /// 监控里一条请求的模型与客户端发的不一样，用户得看得出是谁改的。
+    fn apply_session_pin(&mut self, model: String, is_conversation: bool) -> String {
+        let pinned = self.shell.session_pins.model_for(
+            self.record.session_id.as_deref(),
+            self.record.has_tools,
+            is_conversation,
+        );
+        match pinned {
+            Some(m) if m != model => {
+                self.record.other["session_pin"] = serde_json::json!({ "from": model, "to": m });
+                m
+            }
+            _ => model,
+        }
+    }
+
     fn finish(&mut self, status: i32, usage: UnifiedUsage, ttfb_ms: Option<i64>) {
         if self.finished {
             return;
@@ -318,7 +338,9 @@ pub async fn handle(
         };
         model_policy::effective_model(policy, &ctx, &ShellModelEnv { has_channels })
     };
-    req.model = effective;
+    // 会话固定排在策略之后：用户点名"这个对话用 X"，比"所有请求都走 Y"更具体。
+    // 也必须在思考接管与缓存键之前 —— 键里含模型名。
+    req.model = recorder.apply_session_pin(effective, true);
 
     // ---- 1.6 思考接管 ----
     //
@@ -632,6 +654,8 @@ pub async fn handle_raw(
         };
         model_policy::effective_model(policy, &ctx, &ShellModelEnv { has_channels })
     };
+    // count_tokens 也跟着会话固定走：按 A 计数、按 B 对话，客户端的上下文估算就错了。
+    let effective = recorder.apply_session_pin(effective, false);
     recorder.record.model = effective.clone();
 
     // ---- 路由与选渠道（与对话请求同一套）----

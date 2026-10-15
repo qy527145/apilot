@@ -27,6 +27,8 @@ pub struct SessionSummary {
     pub quota: i64,
     /// 会话里用到过的生效模型，按首次出现排序。多个就说明中途换过模型。
     pub models: Vec<String>,
+    /// 这个对话被固定到的模型。由命令层从内存快照里填，这里不查。
+    pub pin: Option<crate::routing::session_pin::SessionPin>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -80,19 +82,30 @@ pub async fn list(pool: &SqlitePool, f: &SessionFilter) -> AppResult<Vec<Session
             cache_read_tokens: r.get("cache_read_tokens"),
             quota: r.get("quota"),
             models: Vec::new(),
+            pin: None,
         })
         .collect();
 
     // 模型列表单独取：GROUP_CONCAT(DISTINCT) 不保序，而"先用 A 后换 B"的顺序正是要看的。
+    //
+    // 只数**对话本身**用的模型：带工具的那几条线（主线、子代理）。旁路（起标题）
+    // 和 count_tokens 是客户端自己挑的小模型 —— 把它们算进来，一个固定了模型的对话
+    // 也会显示"换过模型"，用户会以为固定没生效。会话里一条带工具的都没有（纯聊天
+    // 客户端）时，退回数全部对话请求，不然列表就空了。
     if !out.is_empty() {
         let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
-            "SELECT session_id, model, MIN(ts) AS first FROM request_logs WHERE session_id IN (",
+            "SELECT l.session_id, l.model, MIN(l.ts) AS first FROM request_logs l \
+             WHERE l.model != '' AND l.thread_key IS NOT NULL \
+               AND (l.has_tools = 1 OR NOT EXISTS ( \
+                     SELECT 1 FROM request_logs t \
+                     WHERE t.session_id = l.session_id AND t.has_tools = 1 AND t.thread_key IS NOT NULL)) \
+               AND l.session_id IN (",
         );
         let mut sep = qb.separated(", ");
         for s in &out {
             sep.push_bind(s.session_id.clone());
         }
-        qb.push(") AND model != '' GROUP BY session_id, model ORDER BY first");
+        qb.push(") GROUP BY l.session_id, l.model ORDER BY first");
         let mut models: HashMap<String, Vec<String>> = HashMap::new();
         for r in qb.build().fetch_all(pool).await? {
             models
@@ -129,6 +142,8 @@ pub struct TimelineEntry {
     pub compacted: bool,
     /// 压缩前那一条带了多少轮。只在 `compacted` 时有值。
     pub compacted_from: Option<i64>,
+    /// 被会话固定改写之前的模型名。没被改写过就是 `None`。
+    pub pinned_from: Option<String>,
 }
 
 /// 会话里的一条线。
@@ -149,6 +164,8 @@ pub struct SessionTimeline {
     pub threads: Vec<ThreadSummary>,
     /// 全部请求，按时间正序。
     pub entries: Vec<TimelineEntry>,
+    /// 同 `SessionSummary::pin`。
+    pub pin: Option<crate::routing::session_pin::SessionPin>,
 }
 
 /// 一个会话的完整链路。
@@ -156,7 +173,8 @@ pub async fn timeline(pool: &SqlitePool, session_id: &str) -> AppResult<SessionT
     let rows = sqlx::query(
         "SELECT request_id, ts, thread_key, model, request_model, path, \
                 status_code, error_message, message_count, has_tools, input_tokens, output_tokens, \
-                cache_read_tokens, quota, latency_ms \
+                cache_read_tokens, quota, latency_ms, \
+                CASE WHEN json_valid(other) THEN json_extract(other, '$.session_pin.from') END AS pinned_from \
          FROM request_logs WHERE session_id = ?1 ORDER BY ts ASC, request_id ASC",
     )
     .bind(session_id)
@@ -218,6 +236,7 @@ pub async fn timeline(pool: &SqlitePool, session_id: &str) -> AppResult<SessionT
             latency_ms: r.get("latency_ms"),
             compacted,
             compacted_from,
+            pinned_from: r.get("pinned_from"),
         });
     }
 
@@ -237,7 +256,7 @@ pub async fn timeline(pool: &SqlitePool, session_id: &str) -> AppResult<SessionT
     // 主线在前，其余按出现先后 —— 和用户脑子里"先聊了什么、中途派了什么活"的顺序一致。
     threads.sort_by_key(|t| (t.kind != ThreadKind::Main, t.first_ts));
 
-    Ok(SessionTimeline { session_id: session_id.to_string(), threads, entries })
+    Ok(SessionTimeline { session_id: session_id.to_string(), threads, entries, pin: None })
 }
 
 #[cfg(test)]
@@ -291,6 +310,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn side_tasks_on_another_model_do_not_count_as_switching() {
+        // 固定了模型的对话，起标题仍按客户端自己挑的小模型跑 —— 不能因此标"换过模型"，
+        // 否则用户会以为固定没生效。
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        let mut count = rec("3", 3, "S", "", 0, true, "haiku");
+        count.thread_key = None;
+        seed(&pool, &[
+            rec("1", 1, "S", "main", 1, true, "flash"),
+            rec("2", 2, "S", "title", 1, false, "opus"),
+            count,
+        ]).await;
+        let list = list(&pool, &SessionFilter { limit: 10, ..Default::default() }).await.unwrap();
+        assert_eq!(list[0].models, vec!["flash"]);
+    }
+
+    #[tokio::test]
+    async fn a_tool_less_session_still_lists_its_models() {
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        seed(&pool, &[rec("1", 1, "S", "chat", 1, false, "flash")]).await;
+        let list = list(&pool, &SessionFilter { limit: 10, ..Default::default() }).await.unwrap();
+        assert_eq!(list[0].models, vec!["flash"]);
+    }
+
+    #[tokio::test]
     async fn compaction_is_detected_within_a_thread_only() {
         let pool = crate::storage::db::open_memory().await.unwrap();
         seed(&pool, &[
@@ -313,6 +356,18 @@ mod tests {
         assert_eq!(t.threads[0].kind, ThreadKind::Main);
         assert_eq!(t.threads[0].compactions, 1);
         assert_eq!(t.threads[1].kind, ThreadKind::Side);
+    }
+
+    #[tokio::test]
+    async fn pinned_requests_show_the_model_they_were_rewritten_from() {
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        let mut pinned = rec("2", 2, "S", "main", 3, true, "opus");
+        pinned.other = serde_json::json!({ "session_pin": { "from": "flash", "to": "opus" } });
+        seed(&pool, &[rec("1", 1, "S", "main", 1, true, "flash"), pinned]).await;
+
+        let t = timeline(&pool, "S").await.unwrap();
+        assert_eq!(t.entries[0].pinned_from, None);
+        assert_eq!(t.entries[1].pinned_from.as_deref(), Some("flash"));
     }
 
     #[tokio::test]

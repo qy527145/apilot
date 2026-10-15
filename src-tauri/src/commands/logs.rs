@@ -35,7 +35,12 @@ pub async fn list_sessions(
     shell: State<'_, Arc<AppShell>>,
     filter: crate::storage::sessions::SessionFilter,
 ) -> AppResult<Vec<crate::storage::sessions::SessionSummary>> {
-    crate::storage::sessions::list(&shell.db, &filter).await
+    let mut list = crate::storage::sessions::list(&shell.db, &filter).await?;
+    // 固定信息从内存那份取：它就是管线此刻在用的那份，界面显示的与实际生效的不会分叉。
+    for s in &mut list {
+        s.pin = shell.session_pins.get(&s.session_id);
+    }
+    Ok(list)
 }
 
 /// 一个对话的完整链路：各条线 + 按时间排好的请求 + 压缩点。
@@ -44,7 +49,46 @@ pub async fn get_session_timeline(
     shell: State<'_, Arc<AppShell>>,
     session_id: String,
 ) -> AppResult<crate::storage::sessions::SessionTimeline> {
-    crate::storage::sessions::timeline(&shell.db, &session_id).await
+    let mut t = crate::storage::sessions::timeline(&shell.db, &session_id).await?;
+    t.pin = shell.session_pins.get(&session_id);
+    Ok(t)
+}
+
+/// 把一个对话固定到某个模型（已固定过就改成新的）。
+///
+/// 写完必须 `reload_session_pins`：管线读的是内存里那份，不重载就要等到重启才生效。
+#[tauri::command]
+pub async fn pin_session_model(
+    shell: State<'_, Arc<AppShell>>,
+    session_id: String,
+    model: String,
+    scope: crate::routing::session_pin::PinScope,
+) -> AppResult<()> {
+    let model = model.trim();
+    if session_id.trim().is_empty() || model.is_empty() {
+        return Err(crate::error::AppError::msg("会话与模型都不能为空"));
+    }
+    crate::storage::session_pins::upsert(
+        &shell.db,
+        &crate::routing::session_pin::SessionPin {
+            session_id,
+            model: model.to_string(),
+            scope,
+            created_at: crate::util::now_ms(),
+        },
+    )
+    .await?;
+    shell.reload_session_pins().await
+}
+
+/// 撤销对话的模型固定。
+#[tauri::command]
+pub async fn unpin_session_model(
+    shell: State<'_, Arc<AppShell>>,
+    session_id: String,
+) -> AppResult<()> {
+    crate::storage::session_pins::delete(&shell.db, &session_id).await?;
+    shell.reload_session_pins().await
 }
 
 /// 筛选下拉的候选值。前端进监控页时取一次。

@@ -128,6 +128,8 @@ pub fn run() {
             commands::logs::list_log_facets,
             commands::logs::list_sessions,
             commands::logs::get_session_timeline,
+            commands::logs::pin_session_model,
+            commands::logs::unpin_session_model,
             commands::logs::validate_log_expr,
             commands::logs::get_request_detail,
             commands::logs::get_inflight_requests,

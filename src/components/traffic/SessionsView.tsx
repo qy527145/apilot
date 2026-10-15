@@ -1,14 +1,19 @@
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { FoldVertical, ListFilter, MessagesSquare } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FoldVertical, ListFilter, MessagesSquare, Pin, PinOff } from "lucide-react";
+import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   api,
+  type PinScope,
+  type SessionPin,
   type SessionSummary,
   type ThreadKind,
   type ThreadSummary,
@@ -149,6 +154,12 @@ function SessionRow({ s, active, onClick }: { s: SessionSummary; active: boolean
             换过模型
           </Badge>
         )}
+        {s.pin && (
+          <Badge variant="default" className="gap-1 text-[11px]" title={`已固定到 ${s.pin.model}`}>
+            <Pin className="size-3" />
+            {s.pin.model}
+          </Badge>
+        )}
       </div>
     </button>
   );
@@ -191,6 +202,17 @@ function Timeline({
   const entries = q.data.entries.filter((e) =>
     thread === "all" ? true : e.thread_key === thread,
   );
+  // 「换了模型」只在同一条线里比：主线后面插一条起标题的旁路，模型不同是常态，
+  // 拿相邻两行比会满屏都是假的「换模型」。不属于线的请求（count_tokens）不参与。
+  const prevModelOf = new Map<string, string | null>();
+  {
+    const last = new Map<string, string>();
+    for (const e of q.data.entries) {
+      if (!e.thread_key) continue;
+      prevModelOf.set(e.request_id, last.get(e.thread_key) ?? null);
+      if (e.model) last.set(e.thread_key, e.model);
+    }
+  }
   const otherCount = q.data.entries.filter((e) => e.thread_key === null).length;
 
   return (
@@ -232,24 +254,27 @@ function Timeline({
               + {otherCount} 次计数等请求
             </span>
           )}
+          <div className="ml-auto flex min-w-0 items-center gap-2">
+          <SessionPinControl sessionId={sessionId} pin={q.data.pin ?? null} />
           <Button
             size="sm"
             variant="outline"
-            className="ml-auto h-7"
+            className="h-7 shrink-0"
             onClick={() => onFilterRequests(sessionId)}
             title="切到请求列表，只看这个对话的请求（可再叠加其它筛选与表达式）"
           >
             <ListFilter className="size-3.5" />
             在请求列表中查看
           </Button>
+          </div>
         </div>
 
         <div className="divide-y rounded-md border">
-          {entries.map((e, i) => (
+          {entries.map((e) => (
             <TimelineRow
               key={e.request_id}
               e={e}
-              prevModel={i > 0 ? entries[i - 1].model : null}
+              prevModel={prevModelOf.get(e.request_id) ?? null}
               label={e.thread_key ? labels.get(e.thread_key) ?? "" : "计数"}
               kind={e.thread_key ? kindOf.get(e.thread_key) ?? null : null}
               onClick={() => onOpenRequest(e.request_id)}
@@ -301,17 +326,35 @@ function TimelineRow({
             {label}
           </Badge>
         </span>
-        <span className="min-w-0 truncate">
-          <span className={cn("font-mono", modelChanged && "text-amber-600 dark:text-amber-500")}>
-            {modelChanged && "→ "}
-            {e.model || "—"}
+        <span className="min-w-0">
+          <span className="flex min-w-0 items-baseline gap-2">
+            <span
+              className={cn("shrink-0 font-mono", modelChanged && "text-amber-600 dark:text-amber-500")}
+              title={modelChanged ? `这条线上一次用的是 ${prevModel}` : e.model}
+            >
+              {modelChanged && "→ "}
+              {e.model || "—"}
+            </span>
+            {e.thread_key === null && (
+              // 模型名优先：路径在这一行只是辅助说明（标签已经写了「计数」），挤不下就截它。
+              <span className="text-muted-foreground min-w-0 truncate font-mono" title={e.path}>
+                {e.path}
+              </span>
+            )}
+            {e.error_message && (
+              <span className="text-destructive truncate" title={e.error_message}>
+                {e.error_message}
+              </span>
+            )}
           </span>
-          {e.thread_key === null && (
-            <span className="text-muted-foreground ml-2 font-mono">{e.path}</span>
-          )}
-          {e.error_message && (
-            <span className="text-destructive ml-2" title={e.error_message}>
-              {e.error_message}
+          {/* 单独一行：和模型名挤在一起时总是先被截掉，而它恰恰说明了"为什么是这个模型"。 */}
+          {e.pinned_from && (
+            <span
+              className="text-muted-foreground flex items-center gap-0.5 truncate text-[11px]"
+              title={`客户端发的是 ${e.pinned_from}，被对话固定改成了 ${e.model}`}
+            >
+              <Pin className="size-3 shrink-0" />
+              <span className="truncate font-mono">{e.pinned_from}</span>
             </span>
           )}
         </span>
@@ -333,5 +376,176 @@ function TimelineRow({
         </span>
       </button>
     </>
+  );
+}
+
+const SCOPE_LABEL: Record<PinScope, string> = {
+  tools: "主线与子代理",
+  all: "全部请求",
+};
+
+const SCOPE_HINT: Record<PinScope, string> = {
+  tools: "只改带工具的请求。起标题、hook 求值这类旁路是客户端特意用小模型跑的，保持原样",
+  all: "会话里的请求全部改用这个模型，旁路也算",
+};
+
+/**
+ * 「把这个对话固定到某个模型」。
+ *
+ * 候选来自渠道声明过的模型，但也允许手填：通吃的渠道（没声明模型列表）照样能接
+ * 一个列表里没有的名字，只给选不给填会把这类用法挡掉。
+ */
+function SessionPinControl({ sessionId, pin }: { sessionId: string; pin: SessionPin | null }) {
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [model, setModel] = useState(pin?.model ?? "");
+  const [scope, setScope] = useState<PinScope>(pin?.scope ?? "tools");
+
+  const options = useQuery({
+    queryKey: ["model_options"],
+    queryFn: api.listModelOptions,
+    enabled: open,
+    staleTime: 30_000,
+  });
+
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["session-timeline", sessionId] });
+    qc.invalidateQueries({ queryKey: ["sessions"] });
+  };
+  const onError = (e: unknown) =>
+    toast.error((e as { message?: string })?.message ?? String(e));
+
+  const save = useMutation({
+    mutationFn: () => api.pinSessionModel(sessionId, model.trim(), scope),
+    onSuccess: () => {
+      toast.success(`已固定到 ${model.trim()}，这个对话的下一个请求起生效`);
+      setOpen(false);
+      refresh();
+    },
+    onError,
+  });
+  const clear = useMutation({
+    mutationFn: () => api.unpinSessionModel(sessionId),
+    onSuccess: () => {
+      toast.success("已取消固定，恢复按模型策略选模型");
+      setOpen(false);
+      refresh();
+    },
+    onError,
+  });
+
+  const filtered = (options.data ?? []).filter((o) =>
+    o.model.toLowerCase().includes(model.trim().toLowerCase()),
+  );
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(o) => {
+        setOpen(o);
+        // 每次打开都从当前生效的那份起步，别留着上次没保存的草稿。
+        if (o) {
+          setModel(pin?.model ?? "");
+          setScope(pin?.scope ?? "tools");
+        }
+      }}
+    >
+      <PopoverTrigger asChild>
+        <Button
+          size="sm"
+          variant={pin ? "default" : "outline"}
+          className="h-7 max-w-56 min-w-0"
+          title={pin ? `已固定到 ${pin.model}（${SCOPE_LABEL[pin.scope]}）` : "让这个对话改用指定模型"}
+        >
+          <Pin className="size-3.5 shrink-0" />
+          <span className="truncate font-mono">{pin ? pin.model : "固定模型"}</span>
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-80 space-y-3">
+        <div className="space-y-1">
+          <p className="text-sm font-medium">这个对话用哪个模型</p>
+          <p className="text-muted-foreground text-xs">
+            只影响这一个对话，优先于全局与客户端的模型策略。客户端界面上仍显示它自己选的模型 ——
+            换成上下文窗口更小的模型时，可能还没等客户端自动压缩就先超长报错。
+          </p>
+        </div>
+
+        <Input
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          placeholder="模型名，可从下面选或直接填"
+          className="h-8 font-mono text-xs"
+          autoFocus
+        />
+        <div className="max-h-40 overflow-y-auto rounded-md border">
+          {options.isLoading ? (
+            <p className="text-muted-foreground p-2 text-xs">加载中…</p>
+          ) : filtered.length === 0 ? (
+            <p className="text-muted-foreground p-2 text-xs">
+              渠道里没有声明匹配的模型；照样可以固定，前提是有渠道接受这个名字。
+            </p>
+          ) : (
+            filtered.map((o) => (
+              <button
+                key={o.model}
+                type="button"
+                onClick={() => setModel(o.model)}
+                className={cn(
+                  "hover:bg-accent flex w-full items-center justify-between px-2 py-1 text-left text-xs",
+                  o.model === model.trim() && "bg-accent",
+                )}
+              >
+                <span className="truncate font-mono">{o.model}</span>
+                <span className="text-muted-foreground shrink-0">{o.provider_count} 个渠道</span>
+              </button>
+            ))
+          )}
+        </div>
+
+        <div className="space-y-1.5">
+          <p className="text-xs font-medium">作用范围</p>
+          <div className="flex gap-1.5">
+            {(["tools", "all"] as const).map((s) => (
+              <Button
+                key={s}
+                size="sm"
+                variant={scope === s ? "secondary" : "ghost"}
+                className="h-7 flex-1"
+                title={SCOPE_HINT[s]}
+                onClick={() => setScope(s)}
+              >
+                {SCOPE_LABEL[s]}
+              </Button>
+            ))}
+          </div>
+          <p className="text-muted-foreground text-[11px]">{SCOPE_HINT[scope]}</p>
+        </div>
+
+        <div className="flex justify-between gap-2">
+          {pin ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="text-muted-foreground h-8"
+              disabled={clear.isPending}
+              onClick={() => clear.mutate()}
+            >
+              <PinOff className="size-3.5" />
+              取消固定
+            </Button>
+          ) : (
+            <span />
+          )}
+          <Button
+            size="sm"
+            className="h-8"
+            disabled={!model.trim() || save.isPending}
+            onClick={() => save.mutate()}
+          >
+            {pin ? "更新" : "固定"}
+          </Button>
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }

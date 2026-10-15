@@ -47,6 +47,9 @@ pub struct AppShell {
     pub events: Arc<EventBus>,
     pub gateway: Arc<crate::gateway::server::GatewayServer>,
 
+    /// 对话级模型固定。每请求都要查，所以常驻内存，改库后 `reload_session_pins`。
+    pub session_pins: Arc<crate::routing::session_pin::SessionPins>,
+
     /// 最近一次测速的延迟（provider_tag → 毫秒）。
     ///
     /// 只活在内存里：它是易变的遥测数据，重启后重新测即可，落库反而会让人
@@ -108,6 +111,10 @@ impl AppShell {
         let cache = Arc::new(ResponseCache::new(policy));
         cache.restore_counters(&db).await?;
 
+        let session_pins = crate::routing::session_pin::SessionPins::new(
+            crate::storage::session_pins::list(&db).await?,
+        );
+
         let shell = Arc::new(Self {
             db,
             app: app.clone(),
@@ -123,6 +130,7 @@ impl AppShell {
             inflight: Arc::new(crate::traffic::InflightStore::new()),
             events: Arc::new(EventBus::new(app)),
             gateway: Arc::new(crate::gateway::server::GatewayServer::new()),
+            session_pins: Arc::new(session_pins),
             probe_latency: Arc::new(dashmap::DashMap::new()),
             catalog_cache: Arc::new(dashmap::DashMap::new()),
             started_at: now_ms(),
@@ -270,6 +278,12 @@ impl AppShell {
     }
 
     /// 重新加载单价表。
+    pub async fn reload_session_pins(&self) -> AppResult<()> {
+        self.session_pins
+            .replace(crate::storage::session_pins::list(&self.db).await?);
+        Ok(())
+    }
+
     pub async fn reload_pricing(&self) -> AppResult<()> {
         let table = crate::storage::pricing::load_table(&self.db).await?;
         self.pricing.store(Arc::new(table));
