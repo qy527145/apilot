@@ -173,6 +173,7 @@ async fn openai_responses(
 /// 超了就在**进 handler 之前**回一个 413 —— 那一刻 `Recorder` 还没建，监控页里
 /// 一个字都没有，用户只能看到客户端报 "Failed to buffer the request body"。
 /// Claude Code 带几张截图或一份 PDF 就过 2 MiB，这不是边角情况。
+/// 上限由上游决定，见 [`read_body`]。
 async fn chat(
     shell: Arc<AppShell>,
     protocol: Protocol,
@@ -180,60 +181,55 @@ async fn chat(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    match read_body(body, MAX_REQUEST_BODY).await {
+    match read_body(body).await {
         Ok(bytes) => pipeline::handle(shell, protocol, path.into(), headers, bytes).await,
-        Err(e) => pipeline::reject_body(
-            shell,
-            Some(protocol),
-            http::Method::POST,
-            path.into(),
-            headers,
-            e.status(),
-            &e.detail,
-        ),
-    }
-}
-
-/// 网关接受的请求体上限。
-///
-/// 所有入口共用这一个数：以前对话入口吃 axum 的 2 MiB、fallback 写死 64 MiB，
-/// 同一个请求换个路径结果就不一样。64 MiB 高于主流服务商自己的上限（Anthropic
-/// 是 32 MB），真超了也该由上游说"太大"，而不是我们先挡掉。
-pub(crate) const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
-
-/// 读请求体失败的原因。
-#[derive(Debug)]
-pub(crate) struct BodyError {
-    pub too_large: bool,
-    pub detail: String,
-}
-
-impl BodyError {
-    /// 超限是 413；其余（多半是客户端读到一半断了）是 400。
-    pub fn status(&self) -> u16 {
-        if self.too_large {
-            413
-        } else {
-            400
+        Err(e) => {
+            pipeline::reject_body(shell, Some(protocol), http::Method::POST, path.into(), headers, e)
         }
     }
 }
 
-pub(crate) async fn read_body(body: Body, limit: usize) -> Result<Bytes, BodyError> {
-    axum::body::to_bytes(body, limit).await.map_err(|e| {
-        // 超限要单独认出来：它是用户能自己处理的那类错（少带点附件），
-        // 得给一句带上限数字的人话，而不是笼统的"读取失败"。
-        let too_large = e
-            .into_inner()
-            .downcast::<http_body_util::LengthLimitError>()
-            .is_ok();
-        let detail = if too_large {
-            format!("请求体超过网关上限 {} MiB", limit / (1024 * 1024))
-        } else {
-            "读取请求体失败（客户端可能中途断开）".to_string()
-        };
-        BodyError { too_large, detail }
-    })
+/// 请求体没读完整。
+///
+/// 带着已经收到的那部分：失败的请求也得能在监控里看到"实际到了什么"，
+/// 只给一句"读取失败"是没法分析问题的。
+#[derive(Debug)]
+pub(crate) struct BodyError {
+    pub partial: Bytes,
+    pub detail: String,
+}
+
+/// 读完整个请求体，**不设上限**。
+///
+/// 网关是透明代理，"多大算太大"是上游的事：它嫌大会回 413，那个 413 原样透传、
+/// 完整落进捕获，用户能看到是谁拒的、拒的是哪份请求。我们自己先挡掉反而把
+/// 现场藏了 —— 以前 axum 的 2 MiB 默认上限就是这么让请求从监控里消失的。
+///
+/// 手写逐帧累加而不是用 `to_bytes`：后者出错时把已读的字节一起扔了。
+pub(crate) async fn read_body(body: Body) -> Result<Bytes, BodyError> {
+    use http_body_util::BodyExt;
+
+    let mut body = body;
+    let mut buf = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    buf.extend_from_slice(data);
+                }
+            }
+            Err(e) => {
+                return Err(BodyError {
+                    detail: format!(
+                        "请求体未读完整（已收到 {} 字节，客户端可能中途断开）: {e}",
+                        buf.len()
+                    ),
+                    partial: buf.freeze(),
+                })
+            }
+        }
+    }
+    Ok(buf.freeze())
 }
 
 /// 三种对话入口的路径后缀，含无 `/v1` 的变体。
@@ -305,19 +301,9 @@ async fn fallback(State(shell): State<Arc<AppShell>>, req: axum::extract::Reques
     let method = parts.method;
     let headers = parts.headers;
 
-    let bytes = match read_body(body, MAX_REQUEST_BODY).await {
+    let bytes = match read_body(body).await {
         Ok(b) => b,
-        Err(e) => {
-            return pipeline::reject_body(
-                shell,
-                chat_protocol(&path),
-                method,
-                path,
-                headers,
-                e.status(),
-                &e.detail,
-            )
-        }
+        Err(e) => return pipeline::reject_body(shell, chat_protocol(&path), method, path, headers, e),
     };
 
     match chat_protocol(&path) {
@@ -331,34 +317,25 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn bodies_over_axum_default_limit_are_accepted() {
+    async fn large_bodies_are_read_in_full_without_a_gateway_cap() {
         // 回归：对话入口曾吃 axum 的 2 MiB 默认上限，超了就在进 handler 前被 413 掉，
-        // 监控页里什么都看不到。带几张截图的请求轻松就过这个数。
-        let big = vec![b'x'; 3 * 1024 * 1024];
-        let got = read_body(Body::from(big.clone()), MAX_REQUEST_BODY).await.unwrap();
-        assert_eq!(got.len(), big.len());
+        // 监控页里什么都看不到。网关不该替上游决定"多大算太大"。
+        let big = vec![b'x'; 80 * 1024 * 1024];
+        let got = read_body(Body::from(big)).await.unwrap();
+        assert_eq!(got.len(), 80 * 1024 * 1024);
     }
 
     #[tokio::test]
-    async fn oversized_body_is_reported_as_413_with_the_limit() {
-        let err = read_body(Body::from(vec![0u8; 2 * 1024 * 1024 + 1]), 2 * 1024 * 1024)
-            .await
-            .unwrap_err();
-        assert!(err.too_large);
-        assert_eq!(err.status(), 413);
-        assert!(err.detail.contains("2 MiB"), "要带上限数字：{}", err.detail);
-    }
-
-    #[tokio::test]
-    async fn broken_body_is_400_not_413() {
-        // 客户端读到一半断了不是"太大"，别给出误导的修复方向。
+    async fn a_broken_body_keeps_what_was_received() {
+        // 读到一半断了，已收到的字节要留着进捕获 —— 那是分析问题的唯一现场。
         let stream = futures::stream::iter(vec![
-            Ok::<_, std::io::Error>(Bytes::from_static(b"{")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"{\"model\":")),
+            Ok(Bytes::from_static(b"\"m\"")),
             Err(std::io::Error::other("连接被重置")),
         ]);
-        let err = read_body(Body::from_stream(stream), MAX_REQUEST_BODY).await.unwrap_err();
-        assert!(!err.too_large);
-        assert_eq!(err.status(), 400);
+        let err = read_body(Body::from_stream(stream)).await.unwrap_err();
+        assert_eq!(&err.partial[..], br#"{"model":"m""#);
+        assert!(err.detail.contains("12 字节"), "{}", err.detail);
     }
 
     #[test]
