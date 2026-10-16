@@ -1,5 +1,6 @@
 //! LLM 网关：反向代理服务器、协议入口与转发管线。
 
+pub mod errors;
 pub mod guard;
 pub mod pipeline;
 pub mod router;

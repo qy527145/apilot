@@ -499,6 +499,21 @@ pub async fn handle(
 
     // ---- 全部失败 ----
     shell.traffic.record_failure();
+
+    // 上下文超长要**换一种说法**再回给客户端。
+    //
+    // 这不是美化措辞：Claude Code 与 Codex 是按报文里的字判断"该压缩了"的，
+    // 被我们包成 `上游请求失败: ...` 之后它们认不出，于是既不压缩也不停止 ——
+    // 用户看到的是每轮都失败、重试还是失败。上游原文附在后面，不影响排查。
+    if let Some(UpstreamError::Status { status, body }) = last_error.as_ref() {
+        if crate::gateway::errors::is_context_overflow(*status, body) {
+            let message = crate::gateway::errors::overflow_message(body);
+            // 状态码仍按上游的原值透传（400 就回 400）：客户端对"超长"的判断
+            // 是看报文，而用户与监控需要看到上游真正给的是哪个码。
+            return fail_response(&mut recorder, protocol, *status, "上下文超长", &message);
+        }
+    }
+
     let err = last_error
         .as_ref()
         .map(|e| e.to_string())
