@@ -1087,6 +1087,44 @@ async fn try_outbound(
         });
     }
 
+    // ---- 2xx 却不是 API 的回复 ----
+    //
+    // 中转站挂了、登录过期跳了登录页、Cloudflare 弹了验证页 —— 这些都以 200 返回，
+    // 内容却是一页网页或空。不认的话它会被当成**正常答案**转给客户端（Codex 收到
+    // 一页 HTML 只会报 "stream closed before response.completed"，完全指不到原因），
+    // 而且**下一个渠道永远不会被试**：既然"成功了"，就没有换渠道的理由。
+    //
+    // 判在这里、而不是收尾处，正是为了那句"换下一个渠道" —— 当成失败返回，
+    // 上面的重试循环才会去问下一个候选。
+    let content_type = resp
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // 流式只凭响应头判（正文还没读，也不该为了判断把整个流缓冲下来）；
+    // 非流式把正文一并带上，能看到"空 body"和"声明是 JSON 却不是 JSON"。
+    let suspect = if let UpstreamBody::Buffered(b) = &resp.body {
+        crate::gateway::errors::not_an_api_reply(status.as_u16(), &content_type, Some(b))
+    } else {
+        crate::gateway::errors::not_an_api_reply(status.as_u16(), &content_type, None)
+    };
+
+    if let Some(why) = suspect {
+        if let Some(c) = recorder.capture.as_mut() {
+            // 把那页网页存下来：用户看到的是"上游给了个 502"，而真正的原因
+            // （验证页？登录页？）只有这份原文里有。
+            if let UpstreamBody::Buffered(b) = &resp.body {
+                c.upstream.response_body = Some(b.to_vec());
+            }
+        }
+        return Err(UpstreamError::Status {
+            status: 502,
+            body: why,
+        });
+    }
+
     // ---- 流式 ----
     if req.stream {
         let decoder = shell.codecs.codec(wire).new_stream_decoder();
