@@ -1017,6 +1017,16 @@ async fn try_outbound(
         patch_outbound_body(raw_body, wire, &mapped_model, thinking)
     };
 
+    // 修工具配对。放在**两条路之后**而不是 IR 上：同协议直通的请求根本不经过
+    // IR（上面那一支原样转发原始字节），而中断恰恰最常发生在直通路上 —— 用户用
+    // Claude Code 接 Anthropic 官方渠道，按 Esc 就是直通。放在这里两条路都覆盖。
+    //
+    // 没改动的请求会拿到原字节（`mend_request_body` 自己比较过），所以上游的
+    // prompt cache 不会被无谓的重写打掉。
+    let out_body: Bytes = Bytes::from(crate::protocol::shared::tool_pair::mend_request_body(
+        &out_body, wire,
+    ));
+
     let prepared = outbound.prepare(wire, headers, out_body.clone(), req.stream)?;
 
     // 记下出站方向。上游报错时（尤其 404）「到底打到了哪个 URL」是唯一能快速
