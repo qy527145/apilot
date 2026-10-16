@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
+use axum::middleware::from_fn;
 use axum::routing::{get, post};
 use axum::Router as AxumRouter;
 use http::{HeaderMap, StatusCode};
@@ -31,6 +32,9 @@ pub fn build(shell: Arc<AppShell>) -> AxumRouter {
         .route("/chat/completions", post(openai_chat))
         .route("/responses", post(openai_responses))
         .fallback(fallback)
+        // 入站防护必须在最外层：被拒的请求一个字节都不该进管线（不记日志、不捕获、
+        // 不计费）——否则用户的监控里会混进别人的请求。
+        .layer(from_fn(super::guard::guard))
         .with_state(shell)
 }
 
