@@ -294,6 +294,14 @@ pub trait StreamObserver: Send + 'static {
     fn on_finish(&mut self, error: Option<&str>);
 }
 
+/// 断流时给客户端看的那句话。
+///
+/// `Codex`、`Pi` 这类客户端是按**报文里的字**判断"这个错误能不能重试"的，
+/// 所以要把原始原因带上，让用户和我们自己都看得出断在哪一步。
+fn stream_break_message(error: &str) -> String {
+    format!("上游流中断：{error}（回复可能不完整，可以重试本次请求）")
+}
+
 /// 把一个上游字节流变成客户端可读的响应体。
 ///
 /// `encoder` 为 `None` 时走直通：原样转发上游字节。
@@ -429,24 +437,44 @@ where
             }
         }
 
-        // 收尾：补齐解码器的兜底事件，再由编码器输出终止帧。
-        for d in decoder.finish() {
-            if let UnifiedDelta::Finish(r) = &d {
-                outcome.finish_reason = Some(r.clone());
-            }
-            if !passthrough {
-                if let Some(enc) = encoder.as_mut() {
-                    for out in enc.on_delta(&d) {
-                        let bytes = encode_event(&out);
-                        raw_client.push(&bytes);
-                        yield Ok::<Bytes, std::io::Error>(bytes);
+        // 收尾。**断流与正常结束必须分开走**：解码器的 `finish()` 是给"上游干脆
+        // 没发终止帧"用的兜底（补一个 `end_turn`），而超时/读取失败是**失败** ——
+        // 照旧调它会发出一个语法完整、内容却半截的"成功"回复，客户端于是把截断
+        // 当成回答完了（不重试、不报错、什么都不说）。用户看到的是一条莫名断掉
+        // 的回复，而监控里这一栏还写着成功。
+        let broken = outcome.error.is_some();
+
+        if !broken {
+            for d in decoder.finish() {
+                if let UnifiedDelta::Finish(r) = &d {
+                    outcome.finish_reason = Some(r.clone());
+                }
+                if !passthrough {
+                    if let Some(enc) = encoder.as_mut() {
+                        for out in enc.on_delta(&d) {
+                            let bytes = encode_event(&out);
+                            raw_client.push(&bytes);
+                            yield Ok::<Bytes, std::io::Error>(bytes);
+                        }
                     }
                 }
             }
         }
+
         if !passthrough {
             if let Some(enc) = encoder.as_mut() {
-                for out in enc.finish() {
+                // 失败的流**不发**终止帧：`error` 之后再来一个 `message_stop`
+                // 就等于又说了一遍"正常结束"，正好抵消掉上面那句话。
+                let events = if broken {
+                    let message = stream_break_message(outcome.error.as_deref().unwrap_or(""));
+                    enc.on_delta(&UnifiedDelta::Error {
+                        code: "api_error".into(),
+                        message,
+                    })
+                } else {
+                    enc.finish()
+                };
+                for out in events {
                     let bytes = encode_event(&out);
                     raw_client.push(&bytes);
                     yield Ok::<Bytes, std::io::Error>(bytes);
@@ -454,6 +482,10 @@ where
             }
         }
 
+        // 直通那条路**不能补发 error 帧**：客户端收到的本来就是上游的原始字节，
+        // 在末尾硬塞一帧别的协议的 error，反而可能把它弄坏。代价是客户端拿不到
+        // 我们的说明 —— 用带状态码的那句话补上一部分：上游拒绝时的码与报文都
+        // 原样在它手里，能自己判断要不要重试。监控里这一栏照旧标着失败原因。
         outcome.usage = decoder.usage();
         outcome.text = decoder.text();
         outcome.content = acc.finish();
@@ -570,7 +602,7 @@ where
 mod tests {
     use super::*;
     use crate::gateway::sse::done_event;
-    use crate::protocol::anthropic::AnthropicStreamDecoder;
+    use crate::protocol::anthropic::{AnthropicStreamDecoder, AnthropicStreamEncoder};
     use crate::protocol::oai_chat::{ChatStreamDecoder, ChatStreamEncoder};
 
     /// 把若干字节块做成上游流。
@@ -582,6 +614,26 @@ mod tests {
         ))
     }
 
+    /// 发完这几帧就再也不产出的流。配合极短的 `idle` 超时，它就是"上游断了"。
+    ///
+    /// 不用 `Err(reqwest::Error)` 来造：那个类型没有公开的构造入口（字段全私有，
+    /// `From` 实现也在 crate 内部）。走超时这条路既容易构造，又正是用户真正会
+    /// 遇到的形状 —— 上游既不回数据、也不关连接。
+    fn hanging_upstream(chunks: Vec<&'static str>) -> BoxStream<'static, reqwest::Result<Bytes>> {
+        let head = chunks
+            .into_iter()
+            .map(|c| Ok(Bytes::from_static(c.as_bytes())));
+        Box::pin(futures::stream::iter(head).chain(futures::stream::pending()))
+    }
+
+    /// 很快判超时的配置。
+    fn impatient() -> StreamTimeouts {
+        StreamTimeouts {
+            first_byte: Duration::from_millis(200),
+            idle: Duration::from_millis(50),
+        }
+    }
+
     /// 收集一个响应体的全部字节。
     async fn run(body: Body) -> Vec<u8> {
         body.into_data_stream()
@@ -591,6 +643,69 @@ mod tests {
                 acc
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn a_broken_stream_ends_in_an_error_not_a_normal_finish() {
+        // 回归：上游断流（超时/读取失败）以前照样走 `finish()`，客户端于是收到
+        // 一条语法完整、内容却是半截的"成功"回复 —— 它不重试也不报错，用户只看到
+        // 回答莫名断掉。转码这条路必须改成发 error 帧，且**不能再发终止帧**：
+        // `error` 后面跟一个 `message_stop` 等于又说了一遍"正常结束"。
+        let chunks = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"半截\"}}\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_observed(
+            hanging_upstream(chunks),
+            Box::new(AnthropicStreamDecoder::new()),
+            Some(Box::new(AnthropicStreamEncoder::new())),
+            impatient(),
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            });
+        let bytes = run(body).await;
+        let text = String::from_utf8_lossy(&bytes);
+
+        assert!(text.contains("event: error"), "断流必须以 error 帧收尾: {text}");
+        assert!(
+            !text.contains("message_stop"),
+            "失败的流不该再发终止帧，否则等于又说了一遍正常结束: {text}"
+        );
+        assert!(text.contains("上游流中断"), "要说清是我们这边看到的失败: {text}");
+
+        let o = rx.await.unwrap();
+        assert!(o.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_a_stop_event_still_finishes_normally() {
+        // 与上一条对照：上游**没报错**、只是没发终止帧时，兜底的 `finish()` 照旧
+        // 有效。把这两种情况混起来会让"上游干脆省略了 stop_reason"的正常流
+        // 被当失败，客户端于是无端重试。
+        let chunks = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"完整\"}}\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_observed(
+            upstream(chunks),
+            Box::new(AnthropicStreamDecoder::new()),
+            Some(Box::new(AnthropicStreamEncoder::new())),
+            StreamTimeouts::default(),
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            });
+        let text = String::from_utf8_lossy(&run(body).await).to_string();
+
+        assert!(!text.contains("event: error"));
+        assert!(text.contains("message_stop"), "正常结束仍要有终止帧: {text}");
+        let o = rx.await.unwrap();
+        assert!(o.error.is_none());
     }
 
     #[tokio::test]
