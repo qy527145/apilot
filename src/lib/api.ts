@@ -604,6 +604,11 @@ export interface SessionSummary {
   output_tokens: number;
   cache_read_tokens: number;
   quota: number;
+  /**
+   * 用户第一条消息里的第一句话。null = 没取到（升级前就存在的对话，或开场只有一张图），
+   * 界面回落到「客户端 #会话ID」。判据见 `traffic/session.rs::first_user_line`。
+   */
+  title?: string | null;
   /** 用到过的生效模型，按首次出现排序。多个 = 中途换过模型。 */
   models: string[];
   /** 这个对话被固定到的模型。 */
@@ -647,6 +652,8 @@ export interface TimelineEntry {
 
 export interface SessionTimeline {
   session_id: string;
+  /** 同 `SessionSummary.title`。 */
+  title?: string | null;
   threads: ThreadSummary[];
   entries: TimelineEntry[];
   pin?: SessionPin | null;

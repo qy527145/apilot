@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FoldVertical, ListFilter, MessagesSquare, Pin, PinOff } from "lucide-react";
+import { FoldVertical, ListFilter, MessagesSquare, Pin, PinOff, Search, SortAsc, SortDesc } from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
@@ -56,6 +56,7 @@ interface Props {
 
 export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests }: Props) {
   const [selected, setSelected] = useState<string | null>(null);
+  const [keyword, setKeyword] = useState("");
 
   const sessions = useQuery({
     queryKey: ["sessions", client, from, to],
@@ -64,8 +65,22 @@ export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests
     retry: 1,
   });
 
+  // 过滤放在前端：一次最多 100 条、3 秒一刷，为这点事再跑一趟后端不值得。
+  // 会话 ID 也参与匹配 —— 标题取不到的对话在列表上显示的就是它。
+  const visible = useMemo(() => {
+    const kw = keyword.trim().toLowerCase();
+    const all = sessions.data ?? [];
+    if (!kw) return all;
+    return all.filter((s) =>
+      [s.title, s.session_id, s.client].some((f) => f?.toLowerCase().includes(kw)),
+    );
+  }, [sessions.data, keyword]);
+
   // 没选时默认看最近活跃的那个 —— 进来就能看到东西，而不是一块空白。
-  const current = selected ?? sessions.data?.[0]?.session_id ?? null;
+  // 选中的那条被搜掉时也回落：右边挂着一个列表里看不见的对话更让人发懵。
+  const current = visible.some((s) => s.session_id === selected)
+    ? selected
+    : visible[0]?.session_id ?? null;
 
   if (sessions.isLoading) {
     return (
@@ -96,8 +111,19 @@ export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests
   return (
     <div className="grid gap-4 lg:grid-cols-[300px_1fr]">
       <Card className="py-0">
-        <CardContent className="max-h-[calc(100vh-260px)] overflow-y-auto p-0">
-          {sessions.data.map((s) => (
+        <div className="border-b p-2">
+          <div className="relative">
+            <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2" />
+            <Input
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+              placeholder="搜标题 / 会话 ID"
+              className="h-8 pl-7 text-xs"
+            />
+          </div>
+        </div>
+        <CardContent className="max-h-[calc(100vh-300px)] overflow-y-auto p-0">
+          {visible.map((s) => (
             <SessionRow
               key={s.session_id}
               s={s}
@@ -105,6 +131,9 @@ export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests
               onClick={() => setSelected(s.session_id)}
             />
           ))}
+          {visible.length === 0 && (
+            <p className="text-muted-foreground p-4 text-xs">没有匹配的对话。</p>
+          )}
         </CardContent>
       </Card>
 
@@ -120,6 +149,14 @@ export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests
 }
 
 function SessionRow({ s, active, onClick }: { s: SessionSummary; active: boolean; onClick: () => void }) {
+  // 标题是主角：几个对话同时开着时，"claude-code #668fff86" 谁也认不出来。
+  // 取不到标题（升级前的老对话、开场只有一张图）才回落到它 —— 那一行本来就是这个。
+  const fallback = (
+    <>
+      {s.client}
+      <span className="text-muted-foreground ml-1.5 font-mono text-xs">#{shortSessionId(s.session_id)}</span>
+    </>
+  );
   return (
     <button
       type="button"
@@ -130,15 +167,18 @@ function SessionRow({ s, active, onClick }: { s: SessionSummary; active: boolean
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="truncate text-sm font-medium">
-          {s.client}
-          <span className="text-muted-foreground ml-1.5 font-mono text-xs" title={s.session_id}>
-            #{shortSessionId(s.session_id)}
-          </span>
+        <span className="truncate text-sm font-medium" title={s.title ?? s.session_id}>
+          {s.title ?? fallback}
         </span>
         <span className="text-muted-foreground shrink-0 text-xs tabular-nums">{formatTime(s.last_ts)}</span>
       </div>
       <div className="text-muted-foreground mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+        {s.title && (
+          <span title={s.session_id}>
+            {s.client}
+            <span className="ml-1 font-mono">#{shortSessionId(s.session_id)}</span>
+          </span>
+        )}
         <span className="tabular-nums">{formatNumber(s.requests)} 次请求</span>
         {s.errors > 0 && <span className="text-destructive tabular-nums">{s.errors} 失败</span>}
         <span className="tabular-nums">{quotaToUsd(s.quota)}</span>
@@ -175,6 +215,8 @@ function Timeline({
   onFilterRequests: (sessionId: string) => void;
 }) {
   const [thread, setThread] = useState<string | "all">("all");
+  // 默认最新在前：一条对话几百轮，想看的几乎总是"刚刚发生了什么"。
+  const [newestFirst, setNewestFirst] = useState(true);
   const q = useQuery({
     queryKey: ["session-timeline", sessionId],
     queryFn: () => api.getSessionTimeline(sessionId),
@@ -214,10 +256,19 @@ function Timeline({
     }
   }
   const otherCount = q.data.entries.filter((e) => e.thread_key === null).length;
+  // 只反转**展示**用的这一份：上面 `prevModelOf` 的"上一条"必须按时间正序算，
+  // 「压缩横幅」也要跟在自己那条请求身上，倒着渲染不该改变它们的含义。
+  const shown = newestFirst ? [...entries].reverse() : entries;
 
   return (
     <Card className="py-0">
       <CardContent className="space-y-3 p-3">
+        <div className="flex min-w-0 items-baseline gap-2">
+          {q.data.title && <h2 className="truncate text-sm font-medium">{q.data.title}</h2>}
+          <span className="text-muted-foreground shrink-0 font-mono text-xs" title={sessionId}>
+            #{shortSessionId(sessionId)}
+          </span>
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button
             size="sm"
@@ -255,6 +306,16 @@ function Timeline({
             </span>
           )}
           <div className="ml-auto flex min-w-0 items-center gap-2">
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 shrink-0"
+            onClick={() => setNewestFirst((v) => !v)}
+            title={newestFirst ? "现在按时间逆序（最新在前），点击改成正序" : "现在按时间正序（最早在前），点击改成逆序"}
+          >
+            {newestFirst ? <SortDesc className="size-3.5" /> : <SortAsc className="size-3.5" />}
+            {newestFirst ? "最新在前" : "最早在前"}
+          </Button>
           <SessionPinControl sessionId={sessionId} pin={q.data.pin ?? null} />
           <Button
             size="sm"
@@ -270,7 +331,7 @@ function Timeline({
         </div>
 
         <div className="divide-y rounded-md border">
-          {entries.map((e) => (
+          {shown.map((e) => (
             <TimelineRow
               key={e.request_id}
               e={e}

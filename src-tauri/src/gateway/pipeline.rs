@@ -76,6 +76,10 @@ struct Recorder {
     record: RequestLogRecord,
     session: BillingSession,
     capture: Option<CaptureRecord>,
+    /// 这个对话的标题（用户第一条消息的第一句话），随日志一起落进 `session_titles`。
+    ///
+    /// 不放进 `record`：它是**会话级**的一行，不是这条请求的字段。
+    session_title: Option<String>,
     finished: bool,
     /// 收尾已经交给了流式那条路（`finalize_stream` + `StreamEmitter`）。
     ///
@@ -94,6 +98,7 @@ impl Recorder {
         self.record.thread_key = t.thread_key;
         self.record.message_count = t.message_count;
         self.record.has_tools = t.has_tools;
+        self.session_title = t.title;
     }
 
     /// 这个对话被固定了模型就改用它；返回改写后的模型名。
@@ -160,6 +165,7 @@ impl Recorder {
         let shell = self.shell.clone();
         let rec = self.record.clone();
         let capture = self.capture.take();
+        let session_title = self.session_title.take();
 
         // 「结束」信号同步发，不走下面那个后台任务：前端要立刻把这条从
         // 「进行中」移走，晚一个调度周期就看着像卡住了。负载极小。
@@ -181,6 +187,7 @@ impl Recorder {
             if let Err(e) = crate::storage::logs::insert(&shell.db, &rec).await {
                 tracing::warn!("写请求日志失败: {e}");
             }
+            save_session_title(&shell, &rec, session_title.as_deref()).await;
 
             if settings.capture_enabled {
                 if let Some(mut c) = capture {
@@ -206,6 +213,23 @@ impl Recorder {
         let _ = self.session.refund();
         self.record.error_message = Some(message.into());
         self.finish(status, UnifiedUsage::default(), None);
+    }
+}
+
+/// 把这个对话的标题落库（一个会话一行，谁先到谁说话）。
+///
+/// **两条收尾路都要调**：非流式在 `Recorder::finish` 里，流式在 `finalize_stream` 里 ——
+/// 后者自己造 record 落库、不走 `finish`（见那边的注释）。漏掉哪条，那类请求的对话
+/// 就永远没有标题：Claude Code 全是流式，漏的多半是它。
+///
+/// 取不出标题的请求（起标题任务、开场只有一张图）不写：宁可让列表回落成
+/// `客户端 #会话ID`，也不要凭空编一个。
+async fn save_session_title(shell: &Arc<AppShell>, rec: &RequestLogRecord, title: Option<&str>) {
+    let (Some(session_id), Some(title)) = (rec.session_id.as_deref(), title) else {
+        return;
+    };
+    if let Err(e) = crate::storage::sessions::save_title(&shell.db, session_id, title, rec.ts).await {
+        tracing::warn!("写对话标题失败: {e}");
     }
 }
 
@@ -267,6 +291,7 @@ pub async fn handle(
             ..Default::default()
         },
         session: BillingSession::deferred(),
+        session_title: None,
         capture: Some(CaptureRecord {
             request_id: request_id.clone(),
             ts: crate::util::now_ms(),
@@ -559,6 +584,7 @@ pub(crate) fn reject_body(
             ..Default::default()
         },
         session: BillingSession::deferred(),
+        session_title: None,
         capture: Some(CaptureRecord {
             request_id,
             ts: crate::util::now_ms(),
@@ -630,6 +656,7 @@ pub async fn handle_raw(
         },
         // 不预扣：这类请求没有可计费的产出，`deferred()` 本来就是 0。
         session: BillingSession::deferred(),
+        session_title: None,
         capture: Some(CaptureRecord {
             request_id: request_id.clone(),
             ts: crate::util::now_ms(),
@@ -1187,6 +1214,7 @@ async fn try_outbound(
                 thread_key: recorder.record.thread_key.clone(),
                 message_count: recorder.record.message_count,
                 has_tools: recorder.record.has_tools,
+                title: recorder.session_title.clone(),
             },
             provider_tag: outbound.tag().to_string(),
             provider_id: Some(outbound.provider().id),
@@ -1572,6 +1600,8 @@ fn finalize_stream(
         if let Err(e) = crate::storage::logs::insert(&shell.db, &rec).await {
             tracing::warn!("写流式请求日志失败: {e}");
         }
+        // 非流式那条路在 `Recorder::finish` 里，两处都要 —— 见 `save_session_title`。
+        save_session_title(&shell, &rec, session.title.as_deref()).await;
         shell.events.request(&rec);
 
         // 补捕获：入站字段沿用请求进来时建好的那份，再补上流式文本与出站追踪。

@@ -47,6 +47,9 @@ pub struct SessionTag {
     pub message_count: Option<i64>,
     /// 带没带工具。分主线 / 旁路要用（主 agent 不可能不带工具），见 [`classify_threads`]。
     pub has_tools: bool,
+    /// 给这个对话起的标题：用户第一条消息里的第一句话。取不到就是 `None`。
+    /// 见 [`first_user_line`] —— 直接取第一段文本拿到的是客户端的提醒块，不能那么取。
+    pub title: Option<String>,
 }
 
 /// 按请求头优先、body 兜底的顺序找会话 ID。
@@ -117,7 +120,106 @@ pub fn tag(headers: &HeaderMap, path: &str, body: &[u8]) -> SessionTag {
         thread_key: Some(thread_key(&json)),
         message_count,
         has_tools,
+        title: first_user_line(&json),
     }
+}
+
+/// 标题的长度上限（**字符**，不是字节）。
+///
+/// 列表里那一行显示不到这么多，留着是为了悬停时能看全；再长也没意义 ——
+/// 用户的第一句话常有整段粘进来的。
+const TITLE_MAX_CHARS: usize = 80;
+
+/// 这个对话的标题：用户第一条消息里的第一句话。
+///
+/// **不能直接取第一段文本。** 实测（Claude Code）用户消息的第一个块是
+/// `<system-reminder>`：CLAUDE.md、git 状态、署名要求各一段，真问题排在它们后面，
+/// 中间还可能夹一张图。取"第一段"得到的是这些噪声。
+///
+/// 另外，会话里**最早的一条**往往是客户端的**起标题请求**（`message_count=1`、
+/// `has_tools=0`），整条消息是 `<session>真问题</session>` 加一句英文指令。
+/// 那种请求直接放弃：标签删掉后剩下的半句会变成一条谁都不认识的假标题。
+///
+/// 只看**第一条** user 消息：往后翻就是对话内容了，不是开场白。
+pub fn first_user_line(body: &Value) -> Option<String> {
+    let messages = body
+        .get("messages")
+        .or_else(|| body.get("input"))
+        .and_then(Value::as_array)?;
+
+    for m in messages {
+        if m.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let blocks = user_texts(m.get("content"));
+        // 起标题请求的判据在**清洗之前**：那个 `<session>` 块正是要被删掉的东西。
+        if blocks.iter().any(|t| t.trim_start().starts_with("<session>")) {
+            return None;
+        }
+        return blocks.iter().find_map(|t| first_meaningful_line(t));
+    }
+    None
+}
+
+/// 一条 user 消息里的纯文本块。
+///
+/// Anthropic 的块是 `{"type":"text","text":…}`，Responses 的 `input` 是
+/// `{"type":"input_text","text":…}` —— 只认 `text` 字段，两种形状就都覆盖到了。
+/// 图片、工具结果之类没有 `text` 的块直接跳过。
+fn user_texts(content: Option<&Value>) -> Vec<&str> {
+    match content {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 清洗一段用户文本，取第一句像「人说的话」的。
+fn first_meaningful_line(text: &str) -> Option<String> {
+    let cleaned = strip_tag_blocks(text);
+    let line = cleaned
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("[Image:"))?;
+
+    if line.chars().count() <= TITLE_MAX_CHARS {
+        return Some(line.to_string());
+    }
+    let mut out: String = line.chars().take(TITLE_MAX_CHARS).collect();
+    out.push('…');
+    Some(out)
+}
+
+/// 删掉 `<tag …>…</tag>` 整块。
+///
+/// 这些块不套娃，所以「找到开标签的名字 → 找同名的闭标签」就够了。配不成对的
+/// `<` 原样留着：用户正文明明白白写着 `<3`，不能因为看着像标签就把它咬掉。
+fn strip_tag_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        let close = format!("</{name}>");
+        match after.find(&close).filter(|_| !name.is_empty()) {
+            Some(at) => {
+                out.push_str(&rest[..start]);
+                rest = &after[at + close.len()..];
+            }
+            None => {
+                out.push_str(&rest[..start + 1]);
+                rest = &rest[start + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 线的指纹：system 稳定部分的短哈希。
@@ -420,5 +522,95 @@ mod tests {
         assert!(!is_compaction(10, 12), "增长不是压缩");
         assert!(is_compaction(10, 1));
         assert!(is_compaction(901, 3));
+    }
+
+    /// 实测形状：提醒块在前、图在中间、真问题在最后。
+    fn cc_first_message(question: &str) -> Value {
+        json!({
+            "session": [{"type":"text","text":"You are an agent."}],
+            "tools": [{"name": "Bash"}],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "<system-reminder>\nContents of ~/CLAUDE.md:\n\n# CLAUDE.md\n\n本项目…\n</system-reminder>" },
+                    { "type": "text", "text": "<system-reminder>\n# gitStatus\nRecent commits:\nc7e26d4 fix: 上游回 200\n</system-reminder>" },
+                    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "…" } },
+                    { "type": "text", "text": question },
+                    { "type": "text", "text": "[Image: source: /tmp/1.png]" },
+                ],
+            }],
+        })
+    }
+
+    #[test]
+    fn title_skips_the_reminder_blocks_in_front_of_the_question() {
+        // 取第一段文本拿到的是 CLAUDE.md —— 那能当标题就怪了。
+        let body = cc_first_message("帮我生成一下上周的ReleaseNote\n");
+        assert_eq!(first_user_line(&body).as_deref(), Some("帮我生成一下上周的ReleaseNote"));
+
+        let t = tag(&headers(&[("x-claude-code-session-id", "s")]), "/v1/messages",
+                    &serde_json::to_vec(&body).unwrap());
+        assert_eq!(t.title.as_deref(), Some("帮我生成一下上周的ReleaseNote"));
+    }
+
+    #[test]
+    fn a_request_that_names_the_session_gets_no_title() {
+        // 会话里最早的那条往往是客户端的起标题请求：真问题被包在 `<session>` 里，
+        // 标签删掉后就只剩一句英文指令 —— 当成标题比没有标题更糟。
+        let body = json!({
+            "messages": [{ "role": "user", "content": [{
+                "type": "text",
+                "text": "<session>\n帮我生成一下上周的ReleaseNote\n</session>\n\nWrite the title in the predominant language of the session.",
+            }]}],
+        });
+        assert_eq!(first_user_line(&body), None);
+    }
+
+    #[test]
+    fn a_message_with_only_an_image_has_no_title_and_we_stop_there() {
+        // 往后翻就是对话内容了，不是开场白：开场白是图（或者只有提醒块）就是没有标题。
+        let body = json!({ "messages": [
+            { "role": "user", "content": [
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "…" } },
+                { "type": "text", "text": "[Image: source: /tmp/1.png]" },
+            ]},
+            { "role": "user", "content": "第二句" },
+        ]});
+        assert_eq!(first_user_line(&body), None);
+    }
+
+    #[test]
+    fn responses_input_shape_yields_a_title_too() {
+        let body = json!({ "input": [
+            { "type": "message", "role": "user", "content": [
+                { "type": "input_text", "text": "<system-reminder>\n# gitStatus\n</system-reminder>" },
+                { "type": "input_text", "text": "重构一下路由层" },
+            ]},
+        ]});
+        assert_eq!(first_user_line(&body).as_deref(), Some("重构一下路由层"));
+    }
+
+    #[test]
+    fn plain_string_content_yields_a_title_too() {
+        let body = json!({ "messages": [{ "role": "user", "content": "hi\nthere" }] });
+        assert_eq!(first_user_line(&body).as_deref(), Some("hi"), "只取第一句");
+        assert_eq!(first_user_line(&json!({ "messages": [{ "role": "assistant", "content": "x" }] })), None);
+        assert_eq!(first_user_line(&json!({ "model": "m" })), None);
+    }
+
+    #[test]
+    fn a_lone_angle_bracket_in_the_question_is_not_a_tag() {
+        // 配不成对就原样留着：正文里写 `<3` 很常见，咬掉它才是错的。
+        let body = json!({ "messages": [{ "role": "user", "content": "为什么 a < b 时出错？<3" }] });
+        assert_eq!(first_user_line(&body).as_deref(), Some("为什么 a < b 时出错？<3"));
+    }
+
+    #[test]
+    fn a_long_question_is_cut_by_characters_not_bytes() {
+        let long = "长".repeat(200);
+        let body = json!({ "messages": [{ "role": "user", "content": long }] });
+        let title = first_user_line(&body).unwrap();
+        assert_eq!(title.chars().count(), TITLE_MAX_CHARS + 1, "80 个字符 + 省略号");
+        assert!(title.ends_with('…'));
     }
 }

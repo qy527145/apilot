@@ -416,7 +416,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
 | `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站 / **发给客户端的响应头**）；`query`（动态过滤：时间、客户端、模型、协议、状态、是否流式）、`get_detail`、`facets`（筛选下拉的候选值）、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧 |
 | `session_pins.rs` | 对话级模型固定的读写（`session_model_pins` 表）。判定在 `routing/session_pin.rs` |
-| `sessions.rs` | **按对话聚合**：`list`（会话列表，模型按首次出现保序）/ `timeline`（一个会话的全部请求 + 各条线 + 压缩点）。「主线 / 子代理 / 旁路」与「哪里压缩过」**查询时现算**，不落库 —— 要看整个会话才定得下来 |
+| `sessions.rs` | **按对话聚合**：`list`（会话列表，带标题，模型按首次出现保序）/ `timeline`（一个会话的全部请求 + 各条线 + 压缩点）/ `save_title`（写 `session_titles`，会话级一行，谁先到谁说话；提取规则在 `traffic/session.rs::first_user_line`）。「主线 / 子代理 / 旁路」与「哪里压缩过」**查询时现算**，不落库 —— 要看整个会话才定得下来 |
 | `model_policies.rs` | 每模型的渠道选择策略读写。**没有行 = 交给 selector 与路由规则** |
 | `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` / `speed_averages`（按 token 加权的平均 TTFT / ITL / TPS，样本口径的唯一真源在 `logs::speed_sample`）。按模型汇总时额外返回 `request_models`（被折叠进该生效模型的客户端模型名），供统计页标出改写 |
 
@@ -515,7 +515,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 
 ## 数据库
 
-13 张表，SQLite（WAL 模式）。DDL 真源在 `storage/migrations.rs`。
+14 张表，SQLite（WAL 模式）。DDL 真源在 `storage/migrations.rs`。
 
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
@@ -527,6 +527,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `route_config` | 单行 `id=1` | 兜底 selector |
 | `request_logs` | `request_id` 唯一 | 请求明细：token、quota、耗时、**TTFB**、缓存命中、估算偏差；以及**方向信息**：入站 `path`、出站 `upstream_url` / `upstream_model` / `upstream_status`；**对话归属**（v11）：`session_id` / `thread_key` / `message_count` / `has_tools`，v11 之前的老行为 NULL。被对话固定改写过的请求在 `other.session_pin = {from, to}` 留痕 |
 | `session_model_pins` | `session_id` 主键 | 对话级模型固定（v12）：`model` + `scope`（`tools` 只改带工具的请求 / `all` 连旁路一起）。不随日志清理 |
+| `session_titles` | `session_id` 主键 | 对话标题（v13）：用户第一条消息的第一句话，列表里替代「客户端 #会话ID」。写入是 `INSERT OR IGNORE`（谁先到谁说话 —— 压缩后请求里带的"第一句"是摘要，不能覆盖）；**老会话不回填**，要等它再来一条请求。不随日志清理 |
 | `usage_hourly` | `(bucket_ts, client, provider_tag, model, request_model)` | 小时聚合，SUM 后 upsert。`model` 是**生效模型**（计费口径），`request_model` 是客户端原名 —— 两者一起进主键，统计页才答得出"我发的 gpt-6-sol 怎么算在 deepseek-flash 这行"。**`clear_logs` 不动它** —— 它是计费口径的历史账目。另有观感指标的**累加量**（`sample_requests` / `ttfb_sum_ms` / `decode_ms_sum` / `decode_tokens_sum`）：平均值不能相加，所以存分子分母、汇总时再相除 |
 | `model_pricing` | `model` | 单价系数。`source` 为 NULL = **用户手填**（批量导入一律不动），有值 = 由某份目录导入、可被同来源的下次导入覆盖 |
 | `model_capabilities` | `(provider_id, model, capability)` | 这个**渠道上这个模型**支不支持思考/工具/多模态。`verdict` 是三态（supported / unsupported / inconclusive）—— 探测「支不支持工具」时模型可能只是那一次没调工具，记成布尔就是撒谎。`source` 分 probe（实测，花 token）与 catalog（目录断言，零成本）；**覆盖优先级写在 `storage::capabilities` 的 upsert SQL 里**：实测且明确 > 目录 > 实测但不确定 |

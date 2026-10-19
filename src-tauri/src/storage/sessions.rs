@@ -25,6 +25,9 @@ pub struct SessionSummary {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub quota: i64,
+    /// 这个对话的标题（用户第一条消息的第一句话）。老会话或取不出时为 `None`，
+    /// 界面回落到 `客户端 #会话ID`。来源见 `traffic::session::first_user_line`。
+    pub title: Option<String>,
     /// 会话里用到过的生效模型，按首次出现排序。多个就说明中途换过模型。
     pub models: Vec<String>,
     /// 这个对话被固定到的模型。由命令层从内存快照里填，这里不查。
@@ -46,25 +49,28 @@ fn default_limit() -> i64 {
 
 /// 最近活跃的会话。按最后一条请求的时间倒序。
 pub async fn list(pool: &SqlitePool, f: &SessionFilter) -> AppResult<Vec<SessionSummary>> {
+    // 标题 JOIN 进来：`MAX(t.title)` 只是因为分组里所有行同值、SQLite 又不接受裸列，
+    // 不是在做"取某一行"。会话没有标题（老数据）时是 NULL，界面自己回落。
     let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
-        "SELECT session_id, \
-                MIN(client) AS client, MIN(ts) AS first_ts, MAX(ts) AS last_ts, \
+        "SELECT l.session_id AS session_id, MAX(t.title) AS title, \
+                MIN(l.client) AS client, MIN(l.ts) AS first_ts, MAX(l.ts) AS last_ts, \
                 COUNT(*) AS requests, \
-                SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS errors, \
-                SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, \
-                SUM(cache_read_tokens) AS cache_read_tokens, SUM(quota) AS quota \
-         FROM request_logs WHERE session_id IS NOT NULL",
+                SUM(CASE WHEN l.status_code >= 400 THEN 1 ELSE 0 END) AS errors, \
+                SUM(l.input_tokens) AS input_tokens, SUM(l.output_tokens) AS output_tokens, \
+                SUM(l.cache_read_tokens) AS cache_read_tokens, SUM(l.quota) AS quota \
+         FROM request_logs l LEFT JOIN session_titles t ON t.session_id = l.session_id \
+         WHERE l.session_id IS NOT NULL",
     );
     if let Some(c) = &f.client {
-        qb.push(" AND client = ").push_bind(c.clone());
+        qb.push(" AND l.client = ").push_bind(c.clone());
     }
     if let Some(from) = f.from {
-        qb.push(" AND ts >= ").push_bind(from);
+        qb.push(" AND l.ts >= ").push_bind(from);
     }
     if let Some(to) = f.to {
-        qb.push(" AND ts <= ").push_bind(to);
+        qb.push(" AND l.ts <= ").push_bind(to);
     }
-    qb.push(" GROUP BY session_id ORDER BY last_ts DESC LIMIT ")
+    qb.push(" GROUP BY l.session_id ORDER BY last_ts DESC LIMIT ")
         .push_bind(f.limit.clamp(1, 1000));
 
     let rows = qb.build().fetch_all(pool).await?;
@@ -81,6 +87,7 @@ pub async fn list(pool: &SqlitePool, f: &SessionFilter) -> AppResult<Vec<Session
             output_tokens: r.get("output_tokens"),
             cache_read_tokens: r.get("cache_read_tokens"),
             quota: r.get("quota"),
+            title: r.get("title"),
             models: Vec::new(),
             pin: None,
         })
@@ -118,6 +125,21 @@ pub async fn list(pool: &SqlitePool, f: &SessionFilter) -> AppResult<Vec<Session
         }
     }
     Ok(out)
+}
+
+/// 记下这个对话的标题。
+///
+/// **谁先到谁说话**（`INSERT OR IGNORE`）：同一个会话的每一条请求里都还带着那句
+/// 开场白，所以正常情况下先落的那条就是对的；反过来「后来者覆盖」会在上下文压缩
+/// 之后把标题改成摘要，那才是错的。取不出标题的请求（起标题任务、只有图）不写。
+pub async fn save_title(pool: &SqlitePool, session_id: &str, title: &str, ts: i64) -> AppResult<()> {
+    sqlx::query("INSERT OR IGNORE INTO session_titles (session_id, title, ts) VALUES (?1, ?2, ?3)")
+        .bind(session_id)
+        .bind(title)
+        .bind(ts)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// 时间线上的一条请求。
@@ -161,6 +183,8 @@ pub struct ThreadSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionTimeline {
     pub session_id: String,
+    /// 同 `SessionSummary::title`。
+    pub title: Option<String>,
     pub threads: Vec<ThreadSummary>,
     /// 全部请求，按时间正序。
     pub entries: Vec<TimelineEntry>,
@@ -256,7 +280,12 @@ pub async fn timeline(pool: &SqlitePool, session_id: &str) -> AppResult<SessionT
     // 主线在前，其余按出现先后 —— 和用户脑子里"先聊了什么、中途派了什么活"的顺序一致。
     threads.sort_by_key(|t| (t.kind != ThreadKind::Main, t.first_ts));
 
-    Ok(SessionTimeline { session_id: session_id.to_string(), threads, entries, pin: None })
+    let title = sqlx::query_scalar::<_, String>("SELECT title FROM session_titles WHERE session_id = ?1")
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(SessionTimeline { session_id: session_id.to_string(), title, threads, entries, pin: None })
 }
 
 #[cfg(test)]
@@ -307,6 +336,37 @@ mod tests {
         assert_eq!(list[0].requests, 2);
         assert_eq!(list[0].models, vec!["flash", "opus"], "先用后换的顺序要保住");
         assert_eq!(list[1].models, vec!["opus"]);
+    }
+
+    #[tokio::test]
+    async fn the_title_comes_back_with_both_the_list_and_the_timeline() {
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        seed(&pool, &[
+            rec("a1", 1, "A", "main", 1, true, "flash"),
+            rec("b1", 2, "B", "main", 1, true, "flash"),
+        ]).await;
+        save_title(&pool, "A", "帮我生成一下上周的ReleaseNote", 1).await.unwrap();
+
+        let list = list(&pool, &SessionFilter { limit: 10, ..Default::default() }).await.unwrap();
+        let a = list.iter().find(|s| s.session_id == "A").unwrap();
+        assert_eq!(a.title.as_deref(), Some("帮我生成一下上周的ReleaseNote"));
+        // 没标题的老会话照样出现，只是 `None` —— 界面回落到「客户端 #会话ID」。
+        assert_eq!(list.iter().find(|s| s.session_id == "B").unwrap().title, None);
+
+        assert_eq!(timeline(&pool, "A").await.unwrap().title.as_deref(), Some("帮我生成一下上周的ReleaseNote"));
+        assert_eq!(timeline(&pool, "B").await.unwrap().title, None);
+    }
+
+    #[tokio::test]
+    async fn the_first_title_wins_even_if_a_later_one_differs() {
+        // 压缩之后请求里带的"第一句话"是摘要 —— 那时再覆盖，标题就变成了摘要。
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        seed(&pool, &[rec("1", 1, "S", "main", 1, true, "m")]).await;
+        save_title(&pool, "S", "重构路由层", 1).await.unwrap();
+        save_title(&pool, "S", "This session is being continued…", 2).await.unwrap();
+
+        let list = list(&pool, &SessionFilter { limit: 10, ..Default::default() }).await.unwrap();
+        assert_eq!(list[0].title.as_deref(), Some("重构路由层"));
     }
 
     #[tokio::test]

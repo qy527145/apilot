@@ -436,6 +436,29 @@ CREATE TABLE IF NOT EXISTS session_model_pins (
   created_at  INTEGER NOT NULL
 );
 "#,
+    // --- v13: 对话标题 ---
+    //
+    // 动机：同开几个对话时，列表里只有「客户端 #会话ID」，分不清哪条是哪个对话。
+    // 标题取用户第一条消息里的第一句话（清洗规则见 `traffic::session::first_user_line`）。
+    //
+    // 想把它算出来的地方只有一个：请求体。而列表 3 秒刷新一次、每次要出 100 条，
+    // 现算等于每轮把上百个几百 KB 的请求体从磁盘读一遍 —— 落库，一个会话一行。
+    // 也不塞进 `request_logs`：那是每行都存一份同样的字符串。
+    //
+    // **不回填**老会话：得从捕获里重新解析，而捕获有条数上限（几百 KB 一份），
+    // 补出来也是残缺的 —— 与 v11 对 `session_id` 的取舍一样。老对话要等到它再来
+    // 一条请求才会有标题，在那之前列表照旧显示 `客户端 #会话ID`。
+    //
+    // **谁先到谁说话**：写入是 `INSERT OR IGNORE`。同一个会话的每一条请求都带着那句
+    // 开场白，所以正常情况先落的那条就是对的；会话 ID 客户端随机生成、不复用，
+    // 不会串到别的对话上。
+    r#"
+CREATE TABLE IF NOT EXISTS session_titles (
+  session_id  TEXT PRIMARY KEY,
+  title       TEXT NOT NULL,
+  ts          INTEGER NOT NULL
+);
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -447,7 +470,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(SCHEMA_VERSION, 13);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 
