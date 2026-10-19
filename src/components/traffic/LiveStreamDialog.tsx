@@ -34,6 +34,8 @@ export interface LiveRequest {
   upstream_url?: string | null;
   is_stream: boolean;
   session_id?: string | null;
+  /** 对话里的哪条线。对话视图靠它把"正在进行"的那条挂到对应线上。 */
+  thread_key?: string | null;
   frames: StreamFrame[];
   /** 流已结束（正常结束、出错或客户端断连）。 */
   done: boolean;

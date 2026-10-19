@@ -476,6 +476,7 @@ pub async fn handle(
         upstream_url: first.provider().endpoint_for(first.wire_for(protocol)),
         is_stream: req.stream,
         session_id: recorder.record.session_id.clone(),
+        thread_key: recorder.record.thread_key.clone(),
     };
     // 先写进行中快照，再广播事件：顺序保证前端任何时刻查询都不会漏掉刚进来的请求。
     shell.inflight.insert(started_payload.clone());

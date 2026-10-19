@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
+import type { LiveRequest } from "@/components/traffic/LiveStreamDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -48,13 +49,31 @@ interface Props {
   client: string | null;
   from: number | null;
   to: number | null;
+  /**
+   * 正在进行（还没落库）的请求。与请求列表同一份底账。
+   *
+   * 少了它，一条对话最要紧的那一轮 —— 正在跑的那一轮 —— 恰恰不在链路里：
+   * 流式请求在整条流结束前根本不落库，用户只能盯着一个"最后一条是五分钟前"的
+   * 列表猜。这里把它们按会话 ID 挑出来，挂在对应线上。
+   */
+  live: LiveRequest[];
+  /** 打开正在进行的流式请求的实时视图。 */
+  onOpenLive: (requestId: string) => void;
   /** 打开某一条请求的详情（复用监控页的详情弹窗）。 */
   onOpenRequest: (requestId: string) => void;
   /** 切回请求列表，只看这个对话。 */
   onFilterRequests: (sessionId: string) => void;
 }
 
-export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests }: Props) {
+export function SessionsView({
+  client,
+  from,
+  to,
+  live,
+  onOpenLive,
+  onOpenRequest,
+  onFilterRequests,
+}: Props) {
   const [selected, setSelected] = useState<string | null>(null);
   const [keyword, setKeyword] = useState("");
 
@@ -75,6 +94,12 @@ export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests
       [s.title, s.session_id, s.client].some((f) => f?.toLowerCase().includes(kw)),
     );
   }, [sessions.data, keyword]);
+
+  // 有请求正在跑的对话，在列表上一眼看得见 —— 否则"我现在这个对话"跟别的长得一样。
+  const liveSessions = useMemo(
+    () => new Set(live.map((r) => r.session_id).filter((id): id is string => !!id)),
+    [live],
+  );
 
   // 没选时默认看最近活跃的那个 —— 进来就能看到东西，而不是一块空白。
   // 选中的那条被搜掉时也回落：右边挂着一个列表里看不见的对话更让人发懵。
@@ -128,6 +153,7 @@ export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests
               key={s.session_id}
               s={s}
               active={s.session_id === current}
+              running={liveSessions.has(s.session_id)}
               onClick={() => setSelected(s.session_id)}
             />
           ))}
@@ -140,6 +166,8 @@ export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests
       {current && (
         <Timeline
           sessionId={current}
+          live={live}
+          onOpenLive={onOpenLive}
           onOpenRequest={onOpenRequest}
           onFilterRequests={onFilterRequests}
         />
@@ -148,7 +176,18 @@ export function SessionsView({ client, from, to, onOpenRequest, onFilterRequests
   );
 }
 
-function SessionRow({ s, active, onClick }: { s: SessionSummary; active: boolean; onClick: () => void }) {
+function SessionRow({
+  s,
+  active,
+  running,
+  onClick,
+}: {
+  s: SessionSummary;
+  active: boolean;
+  /** 这个对话此刻有请求在跑（还没落库，所以列表里的数字还没算上它）。 */
+  running: boolean;
+  onClick: () => void;
+}) {
   // 标题是主角：几个对话同时开着时，"claude-code #668fff86" 谁也认不出来。
   // 取不到标题（升级前的老对话、开场只有一张图）才回落到它 —— 那一行本来就是这个。
   const fallback = (
@@ -170,7 +209,12 @@ function SessionRow({ s, active, onClick }: { s: SessionSummary; active: boolean
         <span className="truncate text-sm font-medium" title={s.title ?? s.session_id}>
           {s.title ?? fallback}
         </span>
-        <span className="text-muted-foreground shrink-0 text-xs tabular-nums">{formatTime(s.last_ts)}</span>
+        <span className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-xs tabular-nums">
+          {running && (
+            <span className="inline-block size-1.5 animate-pulse rounded-full bg-emerald-500" title="有请求正在跑" />
+          )}
+          {formatTime(s.last_ts)}
+        </span>
       </div>
       <div className="text-muted-foreground mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
         {s.title && (
@@ -205,12 +249,101 @@ function SessionRow({ s, active, onClick }: { s: SessionSummary; active: boolean
   );
 }
 
+/** 时间线上的一行：已经落库的，或正在跑的。 */
+type Row = { kind: "entry"; e: TimelineEntry } | { kind: "live"; r: LiveRequest };
+
+const rowTs = (row: Row) => (row.kind === "entry" ? row.e.ts : row.r.ts);
+
+/**
+ * 正在进行的请求在链路里的样子。
+ *
+ * 只点得开**流式**的：非流式的进行中请求还没有可看的东西 —— 报文要等它落库，
+ * 而它在请求结束前根本不存在于数据库里。和请求列表里那条一样，点了不响应，
+ * 但这里给出为什么（悬停说明），免得用户以为是坏了。
+ */
+function LiveTimelineRow({
+  r,
+  label,
+  kind,
+  onOpen,
+}: {
+  r: LiveRequest;
+  label: string;
+  kind: ThreadKind | null;
+  onOpen: () => void;
+}) {
+  // 线还没分类（这条线的请求一条都没落库）时不当它是旁路 —— 那会把它压暗，
+  // 而它恰恰是列表里唯一一行。
+  const dim = kind !== null && kind !== "main";
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      disabled={!r.is_stream}
+      title={
+        r.is_stream
+          ? "流式请求：点开看实时事件流（还没落库，明细要等它结束）"
+          : "非流式请求要跑完才落库，在那之前没有可看的报文"
+      }
+      className={cn(
+        "grid w-full grid-cols-[96px_64px_minmax(150px,1fr)_52px_auto] items-center gap-3 px-3 py-2 text-left text-xs",
+        r.is_stream ? "hover:bg-emerald-500/5" : "cursor-default",
+        dim && "text-muted-foreground",
+      )}
+    >
+      {/* 绿点与请求列表里那个同一套语言：进行中。 */}
+      <span className="flex items-center gap-1.5 tabular-nums" title={formatTime(r.ts)}>
+        <span className="inline-block size-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500" />
+        {formatTime(r.ts).slice(6)}
+      </span>
+      <span>
+        {label ? (
+          <Badge variant={kind === "main" ? "default" : "secondary"} className="text-[11px]">
+            {label}
+          </Badge>
+        ) : (
+          <Badge variant="success" className="text-[11px]">
+            进行中
+          </Badge>
+        )}
+      </span>
+      <span className="flex min-w-0 items-baseline gap-2">
+        <span className="shrink-0 font-mono">{r.model || "—"}</span>
+        {r.request_model && r.request_model !== r.model && (
+          <span
+            className="text-muted-foreground min-w-0 truncate font-mono text-[11px]"
+            title={`客户端请求的模型：${r.request_model}`}
+          >
+            ← {r.request_model}
+          </span>
+        )}
+        {!r.is_stream && <span className="text-muted-foreground shrink-0">非流式</span>}
+      </span>
+      <span className="text-muted-foreground text-right" title="还没结束，轮数要等它落库才有">
+        —
+      </span>
+      <span className="flex items-center gap-3 tabular-nums">
+        <span className="text-muted-foreground whitespace-nowrap">
+          {r.is_stream ? `已收 ${formatNumber(r.frames.length)} 帧` : "等上游"}
+        </span>
+        <span className="w-16 text-right">—</span>
+        <span className="w-16 text-right">—</span>
+        <Badge variant="success">进行中</Badge>
+      </span>
+    </button>
+  );
+}
+
 function Timeline({
   sessionId,
+  live,
+  onOpenLive,
   onOpenRequest,
   onFilterRequests,
 }: {
   sessionId: string;
+  live: LiveRequest[];
+  onOpenLive: (id: string) => void;
   onOpenRequest: (id: string) => void;
   onFilterRequests: (sessionId: string) => void;
 }) {
@@ -256,9 +389,19 @@ function Timeline({
     }
   }
   const otherCount = q.data.entries.filter((e) => e.thread_key === null).length;
+  // 正在进行的请求按线的归属筛（和上面一样：不属于任何线的只在「全部」里出现）。
+  // 它们的起点天然晚于已落库的那些，所以并进来之后自己就排在最新那一头。
+  const liveHere = live.filter(
+    (r) => r.session_id === sessionId && (thread === "all" || r.thread_key === thread),
+  );
+  const rows: Row[] = [
+    ...entries.map((e) => ({ kind: "entry" as const, e })),
+    ...liveHere.map((r) => ({ kind: "live" as const, r })),
+  ].sort((a, b) => rowTs(a) - rowTs(b));
+
   // 只反转**展示**用的这一份：上面 `prevModelOf` 的"上一条"必须按时间正序算，
   // 「压缩横幅」也要跟在自己那条请求身上，倒着渲染不该改变它们的含义。
-  const shown = newestFirst ? [...entries].reverse() : entries;
+  const shown = newestFirst ? [...rows].reverse() : rows;
 
   return (
     <Card className="py-0">
@@ -331,16 +474,26 @@ function Timeline({
         </div>
 
         <div className="divide-y rounded-md border">
-          {shown.map((e) => (
-            <TimelineRow
-              key={e.request_id}
-              e={e}
-              prevModel={prevModelOf.get(e.request_id) ?? null}
-              label={e.thread_key ? labels.get(e.thread_key) ?? "" : "计数"}
-              kind={e.thread_key ? kindOf.get(e.thread_key) ?? null : null}
-              onClick={() => onOpenRequest(e.request_id)}
-            />
-          ))}
+          {shown.map((row) =>
+            row.kind === "live" ? (
+              <LiveTimelineRow
+                key={row.r.request_id}
+                r={row.r}
+                label={row.r.thread_key ? labels.get(row.r.thread_key) ?? "" : ""}
+                kind={row.r.thread_key ? kindOf.get(row.r.thread_key) ?? null : null}
+                onOpen={() => onOpenLive(row.r.request_id)}
+              />
+            ) : (
+              <TimelineRow
+                key={row.e.request_id}
+                e={row.e}
+                prevModel={prevModelOf.get(row.e.request_id) ?? null}
+                label={row.e.thread_key ? labels.get(row.e.thread_key) ?? "" : "计数"}
+                kind={row.e.thread_key ? kindOf.get(row.e.thread_key) ?? null : null}
+                onClick={() => onOpenRequest(row.e.request_id)}
+              />
+            ),
+          )}
         </div>
       </CardContent>
     </Card>

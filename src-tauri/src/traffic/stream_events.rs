@@ -164,6 +164,10 @@ pub struct RequestStarted {
     /// 所属对话。进行中的请求也要能按对话筛 —— 正在跑的那一轮往往就是要看的。
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 这条请求属于对话里的哪条线（主线 / 子代理 / 旁路）。判据见 [`crate::traffic::session`]。
+    /// 对话视图的每条线下面要显示"正在进行"的那一条，没有它就不知道往哪儿挂。
+    #[serde(default)]
+    pub thread_key: Option<String>,
 }
 
 /// 请求结束。与 `apilot://request` 分开：那个走的 `EventBus::request`
@@ -298,6 +302,10 @@ impl StreamEmitter {
         if frames.is_empty() && !done {
             return;
         }
+        // 底账里也留一份：前端是进监控页时才订阅的，一条早就在跑的流它只看得到
+        // 之后的帧 —— 而那样的请求常正卡在一次长工具调用上，界面就一直是空的。
+        // 进页时用 `get_inflight_requests` 把攒下的帧一起补回去。
+        self.inflight.append_frames(&self.request_id, &frames, self.batcher.truncated);
         self.sink.emit(&StreamEvent {
             request_id: self.request_id.clone(),
             frames,
@@ -372,6 +380,7 @@ mod tests {
             upstream_url: "https://api.example.com".into(),
             is_stream: true,
             session_id: None,
+            thread_key: None,
         }
     }
 
@@ -431,7 +440,34 @@ mod tests {
 
         let left = inflight.snapshot();
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].request_id, "other", "只摘自己那条");
+        assert_eq!(left[0].started.request_id, "other", "只摘自己那条");
+    }
+
+    #[test]
+    fn pushed_frames_are_left_in_the_ledger_for_late_subscribers() {
+        // 前端是进监控页时才订阅的：一条早就在跑的流，它只看得到进页之后的帧。
+        // 底账里留着已推的帧，进页时 `get_inflight_requests` 才补得回来 ——
+        // 少了它，正在跑长工具调用的请求在实时视图上一直转圈。
+        let inflight = store();
+        inflight.insert(started("r1"));
+        {
+            let mut e = StreamEmitter::with_caps(
+                Arc::new(RecordingSink::default()),
+                "r1".into(),
+                inflight.clone(),
+                caps(),
+            );
+            e.on_event("e1", &[]);
+            // 攒批的窗口没过，这一帧还在 pending 里 —— 底账也不该有：
+            // 补回来的那些必须与"已经推给前端的那批"逐帧对齐，多留就是重。
+            assert!(inflight.snapshot()[0].frames.is_empty(), "没推出去的帧不进底账");
+            e.on_event("e2", &[]);
+            e.on_event("e3", &[]);
+            assert_eq!(inflight.snapshot()[0].frames.len(), 3, "推出去的帧要留一份");
+        }
+
+        // `on_finish` 先摘底账再吐最后一帧：收尾后完整报文在数据库里，不必再留副本。
+        assert!(inflight.snapshot().is_empty());
     }
 
     impl RecordingSink {

@@ -147,10 +147,13 @@ pub struct ClearResult {
 ///
 /// 前端靠事件驱动维护「进行中」列表，但如果用户在请求开始后才打开监控页，
 /// 那些 `request-start` 事件已经发出去了、没有人收到。这个命令用于补查。
+///
+/// 连**已经推出去的帧**一起给（见 `InflightStore`）：只补元信息的话，
+/// 用户看到的是一条空白的实时视图，而那条流其实早就吐了几百个事件。
 #[tauri::command]
 pub async fn get_inflight_requests(
     shell: State<'_, Arc<AppShell>>,
-) -> AppResult<Vec<crate::traffic::stream_events::RequestStarted>> {
+) -> AppResult<Vec<crate::traffic::InflightEntry>> {
     Ok(shell.inflight.snapshot())
 }
 

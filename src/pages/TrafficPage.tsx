@@ -236,9 +236,12 @@ export default function TrafficPage() {
             upstream_url: r.upstream_url,
             is_stream: r.is_stream,
             session_id: r.session_id,
-            frames: [],
+            thread_key: r.thread_key,
+            // 连已经推出去的帧一起补回来：这条流可能在我们进页之前就跑了一大截
+            //（多半正卡在一次长工具调用上），只补元信息的话实时视图一片空白。
+            frames: r.frames ?? [],
             done: false,
-            truncated: false,
+            truncated: r.truncated ?? false,
           });
         }
       }
@@ -276,6 +279,7 @@ export default function TrafficPage() {
         upstream_url: p.upstream_url,
         is_stream: p.is_stream,
         session_id: p.session_id,
+        thread_key: p.thread_key,
         frames: [],
         done: false,
         truncated: false,
@@ -287,6 +291,9 @@ export default function TrafficPage() {
   useApilotEvent("apilot://stream", (batch) => {
     setInflight((prev) => {
       const cur = prev.get(batch.request_id);
+      // 进页那几毫秒里进来的帧会落在这里：底账还没补回来，就没有可以挂的地方。
+      // 不在这里凭空建一条 —— 占位行缺元信息，一旦补不上就变成永远挂在
+      // 「进行中」里的幽灵。丢的只是进页瞬间那一两批，后面的都会接上。
       if (!cur) return prev;
 
       const next = new Map(prev);
@@ -295,9 +302,14 @@ export default function TrafficPage() {
         return next;
       }
 
+      // 按序号去重，不盲接。进页时补回来的那批帧与"此刻正在路上"的这批可能重叠
+      //（`seq` 从 1 起单调递增，就是为这个留的），续上就行，别把同一帧显示两遍。
+      const lastSeq = cur.frames.length > 0 ? cur.frames[cur.frames.length - 1].seq : 0;
+      const fresh = batch.frames.filter((f) => f.seq > lastSeq);
+
       next.set(batch.request_id, {
         ...cur,
-        frames: [...cur.frames, ...batch.frames].slice(-MAX_LIVE_FRAMES),
+        frames: [...cur.frames, ...fresh].slice(-MAX_LIVE_FRAMES),
         truncated: cur.truncated || batch.truncated,
       });
       return next;
@@ -629,6 +641,9 @@ export default function TrafficPage() {
             client={client === ANY ? null : client}
             from={from}
             to={to}
+            /** 和请求列表同一份"进行中"底账（连筛选条件也一致），对话视图里也看得到。 */
+            live={inflightList}
+            onOpenLive={setLiveStream}
             onOpenRequest={setSelected}
             onFilterRequests={(sid) => {
               setSessionId(sid);

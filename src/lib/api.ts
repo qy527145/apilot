@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
+// 只借个类型：事件负载的形状本来就在 `events.ts` 里，那边也反过来借这里的
+// `StreamDelta`。两边都是 `import type`，编译后不留运行时依赖，不成环。
+import type { StreamFrame } from "@/lib/events";
+
 /* ================================================================== */
 /* 类型契约 —— 严格对齐后端 Rust 结构体（字段 snake_case）            */
 /* ================================================================== */
@@ -673,6 +677,17 @@ export interface InflightRequest {
   upstream_url: string;
   is_stream: boolean;
   session_id?: string | null;
+  /** 对话里的哪条线（主线 / 子代理 / 旁路）。对话视图靠它把进行中的那条挂到线上。 */
+  thread_key?: string | null;
+  /**
+   * 这条流**已经推给前端的帧**（最多 `MAX_LIVE_FRAMES` 条）。
+   *
+   * 前端是进监控页时才订阅事件的：一条早就跑起来的流，光有元信息补回来
+   * 就是一块空白的实时视图 —— 而"进行中"的请求常正卡在一次长工具调用上。
+   */
+  frames: StreamFrame[];
+  /** 补回来的这批不全（流的帧上限到了，或底账只留了最新的那些）。 */
+  truncated?: boolean;
 }
 
 export interface Page<T> {

@@ -36,6 +36,8 @@ export interface RequestStarted {
   is_stream: boolean;
   /** 所属对话（客户端给的会话 ID）。 */
   session_id?: string | null;
+  /** 对话里的哪条线（主线 / 子代理 / 旁路）。对话视图靠它把进行中的那条挂到线上。 */
+  thread_key?: string | null;
 }
 
 /** 请求结束。与 `apilot://request` 分开：那个会丢负载，当不了结束信号。 */

@@ -15,15 +15,41 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::traffic::stream_events::RequestStarted;
+use crate::traffic::stream_events::{RequestStarted, StreamFrame};
+
+/// 「进行中」底账里的一条：请求本身，加上**已经推出去的帧**。
+///
+/// 帧也要留一份，是因为前端进监控页时才建立订阅：一条早就跑起来的流，
+/// 它只看得到进页之后的帧。而"进行中"的请求恰恰常卡在一次长工具调用上
+///（上游几十秒不吐一个事件），于是实时视图上一片空白，用户只能干等 ——
+/// 明明上游早就在正常跑了。进页时用 `get_inflight_requests` 连帧一起补齐，
+/// 界面才是"现在的样子"。
+///
+/// 序列化给前端时与 `RequestStarted` 平铺（`flatten`），形状与推送的那份一致。
+#[derive(Debug, Clone, Serialize)]
+pub struct InflightEntry {
+    #[serde(flatten)]
+    pub started: RequestStarted,
+    pub frames: Vec<StreamFrame>,
+    /// 留着的不全（顶到帧上限，或者被下面的环形缓冲挤掉了最老的）。
+    /// 半路进页的人据此知道"上面还有内容"，而不是把这几百帧当成整条流。
+    pub truncated: bool,
+}
+
+/// 每条请求在底账里最多留多少帧。
+///
+/// 与前端 `MAX_LIVE_FRAMES` 同值：那是界面真正会显示的量，多留没有意义，
+/// 而每帧原文上限 8KB，留太多会把内存撑起来。超出就丢最老的 ——
+/// 实时视图看的是"当下"，更早的内容在请求结束后能从明细里完整看到。
+const MAX_RETAINED_FRAMES: usize = 500;
 
 /// 正在进行的请求快照，供「进入监控页时补齐遗漏的进行中请求」用。
 ///
 /// 只在内存里活着：进程重启之后请求也就结束了，不需要持久化。
-/// 数据量极小（并发数通常个位数），用简单的 Mutex<HashMap> 而不是更复杂的结构。
+/// 数据量小（并发数通常个位数），用简单的 Mutex<HashMap> 而不是更复杂的结构。
 #[derive(Debug, Default)]
 pub struct InflightStore {
-    entries: Mutex<HashMap<String, RequestStarted>>,
+    entries: Mutex<HashMap<String, InflightEntry>>,
 }
 
 impl InflightStore {
@@ -33,19 +59,46 @@ impl InflightStore {
 
     /// 请求开始时记录。
     pub fn insert(&self, r: RequestStarted) {
-        self.entries.lock().insert(r.request_id.clone(), r);
+        self.entries
+            .lock()
+            .insert(
+                r.request_id.clone(),
+                InflightEntry { started: r, frames: Vec::new(), truncated: false },
+            );
     }
 
-    /// 请求结束时移除。
+    /// 请求结束时移除。连带把攒着的帧一起丢掉 —— 收尾之后完整报文在数据库里。
     pub fn remove(&self, request_id: &str) {
         self.entries.lock().remove(request_id);
     }
 
+    /// 这条请求刚推出去了一批帧，底账里也留一份。
+    ///
+    /// `truncated` 是推这批时那条流的"已顶到帧上限"标记：上限是整条流的，
+    /// 底账上也要如实带着，否则半路进页的人会以为看到的就是全部。
+    pub fn append_frames(&self, request_id: &str, frames: &[StreamFrame], truncated: bool) {
+        let mut map = self.entries.lock();
+        let Some(entry) = map.get_mut(request_id) else {
+            // 已经收尾（`retire` 先跑）或者根本不是走这条路进来的，不补。
+            return;
+        };
+        entry.truncated |= truncated;
+        if frames.is_empty() {
+            return;
+        }
+        entry.frames.extend_from_slice(frames);
+        let excess = entry.frames.len().saturating_sub(MAX_RETAINED_FRAMES);
+        if excess > 0 {
+            entry.frames.drain(..excess);
+            entry.truncated = true;
+        }
+    }
+
     /// 返回当前所有进行中的请求，按开始时间升序。
-    pub fn snapshot(&self) -> Vec<RequestStarted> {
+    pub fn snapshot(&self) -> Vec<InflightEntry> {
         let map = self.entries.lock();
-        let mut v: Vec<RequestStarted> = map.values().cloned().collect();
-        v.sort_by_key(|r| r.ts);
+        let mut v: Vec<InflightEntry> = map.values().cloned().collect();
+        v.sort_by_key(|e| e.started.ts);
         v
     }
 }
@@ -198,6 +251,53 @@ impl Drop for ActiveRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(seq: u64) -> StreamFrame {
+        StreamFrame { seq, at_ms: seq as i64, raw: format!("e{seq}"), raw_truncated: false, deltas: vec![] }
+    }
+
+    fn started(id: &str, ts: i64) -> RequestStarted {
+        RequestStarted {
+            request_id: id.into(),
+            ts,
+            client: "claude-code".into(),
+            model: "m".into(),
+            request_model: "m".into(),
+            path: "/v1/messages".into(),
+            protocol_in: "anthropic".into(),
+            provider_tag: "t".into(),
+            provider_name: "test".into(),
+            upstream_url: "https://api.example.com".into(),
+            is_stream: true,
+            session_id: Some("s".into()),
+            thread_key: Some("main".into()),
+        }
+    }
+
+    #[test]
+    fn the_ledger_keeps_the_newest_frames_and_forgets_finished_requests() {
+        // 留着是为了让"半路才打开监控页"的人看到已经跑过的那些帧；但也不能无限留。
+        let store = InflightStore::new();
+        store.insert(started("r1", 1));
+        store.insert(started("other", 2));
+        // 还没登记的请求不补（多半是已经收尾了）。
+        store.append_frames("gone", &[frame(1)], false);
+
+        let many: Vec<StreamFrame> = (1..=(MAX_RETAINED_FRAMES as u64 + 20)).map(frame).collect();
+        store.append_frames("r1", &many, false);
+
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].started.request_id, "r1", "按开始时间升序");
+        assert_eq!(snap[0].frames.len(), MAX_RETAINED_FRAMES);
+        assert_eq!(snap[0].frames[0].seq, 21, "丢最老的、留最新的");
+        assert!(snap[0].truncated, "挤掉了最老的就得说，别让人以为这就是整条流");
+        assert_eq!(snap[1].frames.len(), 0, "只动自己那条");
+        assert!(!snap[1].truncated);
+
+        store.remove("r1");
+        assert_eq!(store.snapshot().len(), 1);
+    }
 
     #[test]
     fn counters_start_at_zero() {
