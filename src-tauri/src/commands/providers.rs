@@ -369,10 +369,15 @@ pub async fn fetch_provider_models(
     let provider = crate::storage::providers::get(&shell.db, id)
         .await?
         .ok_or_else(|| AppError::ProviderNotFound(id.to_string()))?;
+    fetch_models_for(shell.inner(), &provider).await
+}
 
+/// 向一个渠道的上游要模型清单。自动发现与手动拉取共用这一段，
+/// 免得两边的鉴权头 / 超时 / 解析口径慢慢分叉。
+async fn fetch_models_for(shell: &AppShell, provider: &Provider) -> AppResult<Vec<String>> {
     let url = provider.endpoint("/v1/models");
     let client = shell.registry.client_for(&provider.proxy);
-    let req = authed(client.get(&url), &provider);
+    let req = authed(client.get(&url), provider);
 
     let resp = req
         .timeout(std::time::Duration::from_secs(20))
@@ -395,6 +400,162 @@ pub async fn fetch_provider_models(
         .map_err(|e| AppError::msg(format!("读取模型列表响应失败：{e}")))?;
 
     parse_models_response(&body).map_err(AppError::msg)
+}
+
+/// 自动发现时，哪些上游模型值得**补进声明**。
+///
+/// 一个都没声明过的渠道返回空：那是「通吃」渠道，给它写死一份清单等于把它从
+/// "什么都接"偷偷改成"只接这些"（本地 ollama / LM Studio 这类场景会立刻坏掉）。
+/// 它的模型名照样会通过 `DiscoveredModels::available` 报给界面 —— 选中的话
+/// 请求确实能走它，只是不该在库里替它做决定。
+fn newly_declared(declared: &[String], upstream: &[String]) -> Vec<String> {
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let known: std::collections::HashSet<&str> =
+        declared.iter().map(String::as_str).collect();
+    upstream
+        .iter()
+        .filter(|m| !known.contains(m.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// 自动发现的结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredModels {
+    /// 本轮补进渠道声明的模型，按渠道分组（只有这些会改变路由行为）。
+    pub added: Vec<AddedModels>,
+    /// 上游此刻实际返回的模型全集。包含「通吃」渠道——它们不会被写进声明，
+    /// 但界面照样要能把这些名字列出来（选中之后确实能走那个渠道）。
+    pub available: Vec<String>,
+    /// 拉不到的渠道及原因。自动检测时只作诊断，不打断界面。
+    pub failures: Vec<ModelFetchFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddedModels {
+    pub provider_name: String,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelFetchFailure {
+    pub provider_name: String,
+    pub error: String,
+}
+
+/// 主动问一遍每个启用渠道：你现在到底有哪些模型。
+///
+/// 模型页「模型替换」的下拉只看 `provider_models`，而那份声明是渠道创建那一刻
+/// 拉一次就固定下来的 —— 上游后来加了模型，下拉里永远看不到，用户只能得出
+/// 「网关不认识这个模型」的结论。所以模型页会调这里重新发现一次。
+///
+/// 三条边界，都是故意的：
+///
+/// - **已经声明过模型的渠道**：把新名字补进声明。不补的话，下拉里选中的名字
+///   在路由阶段找不到渠道 —— 非通吃渠道只认声明名，选了也白选。
+/// - **一个模型都没声明的渠道**是「通吃」，原样不动。给它写死一份清单，等于
+///   把它从"什么都接"偷偷改成"只接这些"，本地 ollama 那类场景会立刻坏掉。
+/// - **只增不删**。上游下架一个名字不代表用户不该继续用它（中转的 /v1/models
+///   常常不全），删除权留给用户。
+#[tauri::command]
+pub async fn discover_upstream_models(
+    shell: State<'_, Arc<AppShell>>,
+) -> AppResult<DiscoveredModels> {
+    let shell = shell.inner().clone();
+    let providers = crate::storage::providers::list_enabled(&shell.db).await?;
+
+    // 并发问各个渠道：串行的话，一个有问题的渠道会把整轮拖到它的超时。
+    let fetched = futures::future::join_all(providers.into_iter().map(|p| {
+        let shell = shell.clone();
+        async move {
+            let result = fetch_models_for(&shell, &p).await;
+            (p, result)
+        }
+    }))
+    .await;
+
+    let mut added: Vec<AddedModels> = Vec::new();
+    let mut failures: Vec<ModelFetchFailure> = Vec::new();
+    let mut available: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // 补过声明的渠道，收尾时按各自来源同步一次目录价格。
+    let mut priced: Vec<(i64, crate::catalog::CatalogSource)> = Vec::new();
+
+    for (provider, result) in fetched {
+        let models = match result {
+            Ok(m) => m,
+            Err(e) => {
+                failures.push(ModelFetchFailure {
+                    provider_name: provider.name.clone(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
+        available.extend(models.iter().cloned());
+
+        // 单个渠道读写出错不该让整轮结果作废：其它渠道该发现的照样发现。
+        let declared = match crate::storage::providers::list_models(&shell.db, provider.id).await {
+            Ok(m) => m,
+            Err(e) => {
+                failures.push(ModelFetchFailure {
+                    provider_name: provider.name.clone(),
+                    error: format!("读取模型声明失败：{e}"),
+                });
+                continue;
+            }
+        };
+        let fresh = newly_declared(
+            &declared.iter().map(|m| m.model.clone()).collect::<Vec<_>>(),
+            &models,
+        );
+        if fresh.is_empty() {
+            continue; // 通吃渠道，或者上游没有新东西
+        }
+
+        let mut all: Vec<String> = declared.into_iter().map(|m| m.model).collect();
+        all.extend(fresh.iter().cloned());
+        if let Err(e) = crate::storage::providers::set_models(&shell.db, provider.id, &all).await {
+            failures.push(ModelFetchFailure {
+                provider_name: provider.name.clone(),
+                error: format!("写入模型声明失败：{e}"),
+            });
+            continue;
+        }
+
+        if let Some(source) = provider.metadata_source.catalog_source() {
+            priced.push((provider.id, source));
+        }
+        added.push(AddedModels {
+            provider_name: provider.name.clone(),
+            models: fresh,
+        });
+    }
+
+    if !added.is_empty() {
+        // 新名字要立刻进内存里的渠道快照，否则路由要等重启才认识它们。
+        let _ = shell.reload_providers().await;
+
+        // 新模型没有价格就一律走兜底倍率，而兜底倍率通常不等于真实价 ——
+        // 与手动勾选模型那条路一致，顺手按渠道来源补一次目录价。
+        for (provider_id, source) in priced {
+            let models = declared_models(&shell.db, provider_id).await.unwrap_or_default();
+            let tag = crate::storage::providers::get(&shell.db, provider_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.tag)
+                .unwrap_or_default();
+            sync_catalog_prices(&shell, &tag, source, &models).await;
+        }
+    }
+
+    Ok(DiscoveredModels {
+        added,
+        available: available.into_iter().collect(),
+        failures,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,5 +1229,38 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(PROBE_BODY).unwrap();
         let obj = v.as_object().unwrap();
         assert!(obj.is_empty(), "不能带任何参数：带一个就可能被真的执行");
+    }
+
+    #[test]
+    fn discovery_adds_only_models_that_are_not_declared_yet() {
+        let declared = vec!["deepseek-flash".to_string(), "deepseek-reasoner".to_string()];
+        let upstream = vec![
+            "deepseek-flash".to_string(),   // 已有
+            "deepseek-v4".to_string(),     // 新增
+            "deepseek-reasoner".to_string(), // 已有
+            "deepseek-v4-pro".to_string(), // 新增
+        ];
+
+        assert_eq!(
+            newly_declared(&declared, &upstream),
+            vec!["deepseek-v4", "deepseek-v4-pro"],
+            "只补新名字，已有的不能重复插入"
+        );
+    }
+
+    #[test]
+    fn discovery_never_turns_a_catch_all_channel_into_a_whitelist() {
+        // 没有任何声明的渠道是「通吃」。自动发现往它身上写一份清单，
+        // 等于把"什么都接"悄悄改成"只接这些"—— 本地模型服务会立刻坏掉。
+        let upstream = vec!["llama3".to_string(), "qwen2.5".to_string()];
+        assert!(newly_declared(&[], &upstream).is_empty());
+    }
+
+    #[test]
+    fn discovery_is_additive_not_authoritative() {
+        // 上游没广告的模型不能因此被删掉：中转的 /v1/models 经常不全，
+        // 而用户可能正依赖那个没被列出来的名字。
+        let declared = vec!["custom-alias".to_string()];
+        assert!(newly_declared(&declared, &[]).is_empty());
     }
 }

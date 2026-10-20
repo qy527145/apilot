@@ -83,6 +83,7 @@ pub fn run() {
             commands::providers::list_provider_models,
             commands::providers::set_provider_models,
             commands::providers::fetch_provider_models,
+            commands::providers::discover_upstream_models,
             commands::providers::set_provider_enabled,
             commands::providers::detect_provider_protocols,
             commands::providers::sync_provider_metadata,

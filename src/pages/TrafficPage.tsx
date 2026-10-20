@@ -205,6 +205,11 @@ export default function TrafficPage() {
     queryKey: qk.logs("facets"),
     queryFn: api.listLogFacets,
     staleTime: 30_000,
+    // 候选值来自最近这些请求的实际情况：新客户端 / 新模型名出现之后，
+    // 下拉里必须能选到它们。以前只在挂载时取一次（staleTime 30s 又不重取），
+    // 用户得刷新页面才看得到。实时状态下跟着日志列表一起刷新，代价是有界的
+    // （后端只扫最近 2000 行）。
+    refetchInterval: live ? 5000 : false,
     retry: 1,
   });
 

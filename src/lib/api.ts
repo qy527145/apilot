@@ -1027,6 +1027,31 @@ export interface ProviderModel {
   upstream_model?: string | null;
 }
 
+/* --------------------------- 上游模型自动发现 --------------------------- */
+
+/** 本轮补进某个渠道声明的模型。 */
+export interface AddedModels {
+  provider_name: string;
+  models: string[];
+}
+
+/** 拉不到模型清单的渠道。 */
+export interface ModelFetchFailure {
+  provider_name: string;
+  error: string;
+}
+
+export interface DiscoveredModels {
+  /** 新写进声明的模型（只有这些会改变路由行为）。 */
+  added: AddedModels[];
+  /**
+   * 上游此刻实际返回的模型全集。包含「通吃」渠道（没有任何声明的渠道）——
+   * 那些名字不会被写进库，但界面照样要能列出来：选中之后确实能走它们。
+   */
+  available: string[];
+  failures: ModelFetchFailure[];
+}
+
 /* --------------------------- 模型能力探测 --------------------------- */
 
 /** Apilot 关心的能力维度。与后端 `storage::capabilities::Capability` 一一对应。 */
@@ -1225,6 +1250,14 @@ export const api = {
   /** 拉取上游 `GET {base_url}/v1/models`，返回模型 id 列表。 */
   fetchProviderModels: (id: number) =>
     call<string[]>("fetch_provider_models", { id }),
+  /**
+   * 自动发现各启用渠道此刻到底有哪些模型。
+   *
+   * 会给「已经声明过模型」的渠道补上新出现的名字（否则选中也用不了：非通吃渠道
+   * 只认声明名）；没有任何声明的「通吃」渠道保持原样。只增不删。
+   */
+  discoverUpstreamModels: () =>
+    call<DiscoveredModels>("discover_upstream_models"),
   /**
    * 就地启用 / 停用。只改这一个字段，**不要**用 `upsertProvider` 代替：
    * 那条路要求把密钥等整套回传，而密钥不回显，改个开关就会把它抹掉。
