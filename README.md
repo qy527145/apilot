@@ -111,13 +111,13 @@ src/            前端（React 19 + Tailwind v4 + shadcn/ui）
 ## 开发
 
 ```bash
-# Windows：让 MSVC 工具链对 cargo 可见（本机 MSVC 来自 uv 的 msvclib 包）
-source scripts/msvc-env.sh
-
 cd src-tauri
-cargo test            # 1122 个测试
+cargo test            # 1174 个测试
 cargo build           # 构建二进制
 ```
+
+Windows 上如果 `which link` 指向 Git Bash 的 `/usr/bin/link`（而不是 MSVC 的 `link.exe`），
+再用 `source scripts/msvc-env.sh` 兜底；本机环境已在 shell 启动时配置好，不需要每次执行。
 
 测试覆盖到了协议转换的字段等价性、SSE 跨 chunk 的 UTF-8 边界、规则链求值顺序、计费公式、接管补丁的解析失败拒绝写入，以及**真实 HTTP 的端到端链路**（起一个假上游，跑通出站 → 流式转码 → 下游）。
 
@@ -156,7 +156,8 @@ brew install llvm makensis     # clang-cl / llvm-rc / lld-link 与 NSIS 的 make
 缓存在 `~/Library/Caches/cargo-xwin`（首次约 1 GB，之后复用）。
 
 这条路由 Tauri 官方标注为**实验性**：链接走 lld-link，最后一步交给 makensis，产物只有一个 nsis 的 `.exe`。
-从 Windows 本机构建时若用 Git Bash，先 `source scripts/msvc-env.sh`，否则会在链接阶段失败。
+从 Windows 本机构建时如果 `which link` 指向 MSYS 的 `/usr/bin/link`，用 `source scripts/msvc-env.sh` 兜底；
+本机环境已在 shell 启动时配置好。
 
 平台判定、交叉工具链预检与参数透传都在 [scripts/build.mjs](scripts/build.mjs)：
 `bun run build -- --debug` 这类额外参数原样转给 `tauri build`。
@@ -203,7 +204,7 @@ bun run upgrade patch --push   # 连提交带标签推到远端，直接触发�
 本机有两处特殊配置，已在仓库里处理好：
 
 - `.cargo/config.toml` 关闭了证书吊销检查（本机 schannel 访问不到吊销服务器，会让 cargo 的一切 HTTPS 请求失败）。
-- `scripts/msvc-env.sh` 把 MSVC 链接器接进 PATH（Git Bash 自带的 `/usr/bin/link` 会抢占 MSVC 的 `link.exe`）。
+- 本机 shell 已在启动时配置好 MSVC（PATH / LIB / INCLUDE 指向 uv 的 msvclib）；`scripts/msvc-env.sh` 仅作为换机器/换 shell 后 `link` 解析到 MSYS 时的兜底。
 
 ## 数据与隐私
 

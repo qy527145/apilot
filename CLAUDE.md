@@ -11,15 +11,18 @@ Tauri 2 + React 19，后端约 21k 行 Rust。
 
 ## 构建与测试
 
-**本机必须先加载 MSVC 环境**，否则链接阶段会失败（Git Bash 自带的 `/usr/bin/link` 会抢占 MSVC 的 `link.exe`）：
+本机 shell 已经全局配置好 MSVC（PATH / LIB / INCLUDE 指向 uv 的 msvclib，`link` 直接解析到
+MSVC 的 `link.exe`），直接运行：
 
 ```bash
-source scripts/msvc-env.sh     # 每个新 shell 都要执行一次
 cd src-tauri
 cargo test                     # 1174 个测试
 cargo check --all-targets      # 期望零警告
 cargo build
 ```
+
+只有换机器/换 shell 后发现 `which link` 指向 Git Bash 的 `/usr/bin/link` 时，才用
+`source scripts/msvc-env.sh` 兜底（脚本保留，不再需要每次执行）。
 
 前端在仓库根目录：`bun run build:web`（即 `tsc && vite build`）。打包安装包用 `bun run build`（按当前系统自选）、
 `build:win` / `build:mac` / `build:linux`。**命令名指目标平台**，入口 [scripts/build.mjs](scripts/build.mjs)

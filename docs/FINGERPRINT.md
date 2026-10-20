@@ -116,7 +116,7 @@ detect_model_fingerprint
 ```bash
 bun run fingerprint:vendor      # 从 ../lm-detector（或 LM_DETECTOR_DIR）重新生成内置资产
 bun run fingerprint:fixtures    # 重新生成 golden fixtures
-source scripts/msvc-env.sh && cd src-tauri && cargo test
+cd src-tauri && cargo test
 ```
 
 运行时的「检查更新」会从

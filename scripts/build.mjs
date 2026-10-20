@@ -152,12 +152,6 @@ const BUNDLE_DIR = join(
 
 console.log(`[build] 产物目录：${BUNDLE_DIR}`);
 
-// Git Bash 的 /usr/bin/link 会抢占 MSVC 的 link.exe，问题要等到链接阶段才暴露且报错费解。
-// 只在 MSYS 环境下提醒（MSYSTEM 由 Git Bash 注入）：PowerShell/cmd 里没有这个冲突。
-if (HOST === 'win' && process.env.MSYSTEM && !process.env.APILOT_MSVC_READY) {
-  console.warn('[build] 警告：Git Bash 未加载 MSVC 环境，链接阶段可能失败。先执行 `source scripts/msvc-env.sh`。');
-}
-
 const result = spawnSync('bun', [...args, ...argv], { cwd: ROOT, stdio: 'inherit', env });
 
 if (result.error) fail(`无法启动 tauri：${result.error.message}`);

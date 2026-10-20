@@ -149,7 +149,7 @@ async function main() {
 1. 更新 \`../lm-detector\`（或设置 \`LM_DETECTOR_DIR\` 指向新的 checkout）。
 2. 运行 \`bun scripts/vendor-fingerprint.mjs\`。
 3. 运行 \`bun scripts/generate-fingerprint-fixtures.mjs\` 重新生成 golden fixtures。
-4. \`source scripts/msvc-env.sh && cd src-tauri && cargo test\`。
+4. \`cd src-tauri && cargo test\`。
 5. 提交生成物与 fixtures。
 
 \`unified_reference.jsonl\` 不随包分发：它只用于离线重建检测器，运行时不需要。

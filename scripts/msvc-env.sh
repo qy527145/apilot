@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# 让 MSVC 链接器与 Windows SDK 对 cargo/rustc 可见。
+# 兜底脚本：让 MSVC 链接器与 Windows SDK 对 cargo/rustc 可见。
 #
-# 本机的 MSVC 工具链来自 uv 安装的 `msvclib` 包，没有走 Visual Studio 安装器，
-# 因此没有全局的 vcvars 环境。而 Git Bash 的 /usr/bin/link.exe（MSYS 的 coreutils link）
-# 会抢占 MSVC 的 link.exe，导致链接阶段报 "extra operand ... Try 'link --help'"。
+# 本机 shell 已经在启动时配置好 PATH / LIB / INCLUDE（uv 的 msvclib），
+# `link` 默认就解析到 MSVC 的 link.exe，正常情况下**不需要**运行本脚本。
+# 只有在换机器/换 shell 后发现 `which link` 指向 Git Bash 的 /usr/bin/link.exe
+# （MSYS 的 coreutils link，会抢占 MSVC link.exe，链接阶段报
+# "extra operand ... Try 'link --help'"）时，才 source 一次。
 #
 # 用法：
 #   source scripts/msvc-env.sh
