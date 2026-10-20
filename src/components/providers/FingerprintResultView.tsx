@@ -319,6 +319,16 @@ export function FingerprintResultView({ result }: { result: FingerprintDetection
                       回包预览：{attempt.text_preview}
                     </p>
                   )}
+                  {attempt.numbers && attempt.numbers.length > 0 && (
+                    <details>
+                      <summary className="text-muted-foreground cursor-pointer">
+                        查看解析后的数字（{attempt.numbers.length} 个）
+                      </summary>
+                      <p className="mt-1 font-mono break-all">
+                        {attempt.numbers.join(", ")}
+                      </p>
+                    </details>
+                  )}
                 </div>
               </details>
             </div>
