@@ -198,9 +198,6 @@ pub(super) async fn finish_buffered(
         }
     }
 
-    // 非流式没有独立的 TTFB，用整体耗时近似（对客户端而言等价）。
-    recorder.finish(status.as_u16() as i32, usage.clone(), Some(latency));
-
     // 客户端要流式，但上游给的是完整响应（有些中转会无视 stream=true）：
     // 用编码器把结果"假装"成流，客户端的解码路径就不必区分这两种情况。
     if recorder.record.is_stream {
@@ -217,16 +214,17 @@ pub(super) async fn finish_buffered(
         if let Some(c) = recorder.capture.as_mut() {
             c.response_headers = headers_to_json(&sse_headers);
         }
+        // 非流式没有独立的 TTFB，用整体耗时近似（对客户端而言等价）。
+        //
+        // `finish` 会把 capture take 走交给后台落库，**必须放在捕获填完之后**。
+        // 顺序反了就永远只落得下上游那一份，「Apilot → 客户端」在监控里全空。
+        recorder.finish(status.as_u16() as i32, usage.clone(), Some(latency));
         return Ok((
             status,
             sse_headers,
             crate::gateway::stream::stream_from_response(decoded, usage, encoder, |_| {}),
         )
             .into_response());
-    }
-
-    if let Some(c) = recorder.capture.as_mut() {
-        c.response_headers = headers_to_json(&headers);
     }
 
     let out_bytes = if needs_conversion {
@@ -241,9 +239,10 @@ pub(super) async fn finish_buffered(
         body.clone()
     };
 
-    if let Some(c) = recorder.capture.as_mut() {
-        c.response_body = Some(out_bytes.to_vec());
-    }
+    // 回给客户端的那份报文要在结账之前记完 —— 理由同上：`finish` 里 capture 会被 take。
+    record_client_response(recorder.capture.as_mut(), &headers, &out_bytes);
+    // 非流式没有独立的 TTFB，用整体耗时近似（对客户端而言等价）。
+    recorder.finish(status.as_u16() as i32, usage, Some(latency));
 
     Ok(build_response(status, headers, out_bytes))
 }

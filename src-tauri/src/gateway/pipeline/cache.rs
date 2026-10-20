@@ -15,7 +15,7 @@ use crate::protocol::dto::{Protocol, UnifiedRequest};
 use crate::shell::AppShell;
 
 use super::recorder::Recorder;
-use super::reply::{build_response, fail_response, headers_to_json};
+use super::reply::{build_response, fail_response, headers_to_json, record_client_response};
 
 /// 命中缓存时直接构造响应。
 pub(super) async fn serve_from_cache(
@@ -104,14 +104,16 @@ pub(super) async fn serve_from_cache(
         }
     };
 
-    recorder.finish(200, usage, Some(0));
-
     let mut headers = HeaderMap::new();
     headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
     headers.insert("x-apilot-cache", http::HeaderValue::from_static("hit"));
+
+    // 先记客户端报文再结账：`finish` 会把 capture take 走落库，顺序反了这份就丢了。
+    record_client_response(recorder.capture.as_mut(), &headers, &body);
+    recorder.finish(200, usage, Some(0));
 
     build_response(http::StatusCode::OK, headers, body)
 }

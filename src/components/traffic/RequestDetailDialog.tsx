@@ -501,7 +501,6 @@ function DirectionPane({
   unavailable: string;
 }) {
   const [activeKey, setActiveKey] = useState(directions[0].key);
-  const active = directions.find((d) => d.key === activeKey) ?? directions[0];
 
   // 两侧都没有报文时不必让人做无意义的选择。
   const hasAny = directions.some((d) => d.formatted || d.raw || d.decoded);
@@ -512,6 +511,13 @@ function DirectionPane({
       </p>
     );
   }
+
+  // 选中的一侧没有报文时，落到第一个有报文的一侧。响应页签默认选「Apilot → 客户端」，
+  // 而老日志与非对话请求可能只记得下上游那份 —— 不回落的话，用户明明有原文可看，
+  // 却先撞上一句「未捕获报文」，以为这次什么都没抓到。
+  const usable = directions.filter((d) => d.formatted || d.raw || d.decoded);
+  const active =
+    usable.find((d) => d.key === activeKey) ?? usable[0] ?? directions[0];
 
   // 流式响应没有完整响应体，可视化与用量都来自增量重建的那份。
   const decoded = active.streamed?.value ?? active.decoded;
