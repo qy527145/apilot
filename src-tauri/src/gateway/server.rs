@@ -64,7 +64,7 @@ impl GatewayServer {
     /// 启动网关。重复调用是幂等的 —— 已在运行就原样返回当前状态。
     pub async fn start(&self, shell: Arc<AppShell>) -> AppResult<GatewayStatus> {
         let settings = shell.settings();
-        let (host, port) = (settings.listen_host.clone(), settings.listen_port);
+        let (host, port) = (settings.bind_host().to_string(), settings.listen_port);
         self.start_at(shell, &host, port).await
     }
 
@@ -188,7 +188,7 @@ impl GatewayServer {
         }
 
         let settings = shell.settings();
-        let (new_host, new_port) = (settings.listen_host.clone(), settings.listen_port);
+        let (new_host, new_port) = (settings.bind_host().to_string(), settings.listen_port);
         let (new_addr, old_addr) = (
             format!("{new_host}:{new_port}"),
             format!("{old_host}:{old_port}"),
@@ -364,8 +364,10 @@ mod tests {
     }
 
     fn with_addr(host: &str, port: u16) -> AppSettings {
+        // 非回环地址只有在局域网访问打开时才真的会绑 —— 与 `normalized` 一致。
         AppSettings {
             listen_host: host.to_string(),
+            allow_lan: host != "127.0.0.1",
             listen_port: port,
             ..Default::default()
         }

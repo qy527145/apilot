@@ -360,6 +360,33 @@ fn is_valid_regex(pattern: &str) -> bool {
     regex::Regex::new(pattern).is_ok()
 }
 
+/// 回环或 `localhost`（含 `[::1]` 这种带方括号的写法）。
+///
+/// 只用来判断「这个地址是不是只对本机可见」。局域网 IP、`0.0.0.0` 都不算。
+fn is_loopback_host(host: &str) -> bool {
+    let h = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    h == "localhost"
+        || h
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// 存档里有没有这个键。
+///
+/// 用来区分「用户明确关掉了某个开关」和「这个字段是本次新加的、老存档里没有」——
+/// 两者反序列化出来都是 `false`，但该做的事情相反（前者尊重，后者要迁移）。
+fn has_key(json: &str, key: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get(key).map(|_| ()))
+        .is_some()
+}
+
 /// 全局出站代理怎么选。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -418,11 +445,29 @@ impl ProxySettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
-    /// 网关监听地址。默认仅本机可见。
+    /// 实际绑定的地址。**由 [`Self::allow_lan`] 决定**，不要直接当作用户意图读：
+    /// 关了局域网访问时它恒为 `127.0.0.1`。
     pub listen_host: String,
     pub listen_port: u16,
     /// 应用启动时自动拉起网关。
     pub autostart_gateway: bool,
+
+    /// 局域网访问。默认关 —— 关着只绑回环，别的机器连不上。
+    ///
+    /// 单独一个开关而不是让用户自己把地址填成 `0.0.0.0`：这是在扩大暴露面，
+    /// 应该是一次看得见、能收回的选择。打开后绑 `0.0.0.0`（`listen_host`
+    /// 若是某个具体的非回环地址，就只绑那张网卡）。
+    #[serde(default)]
+    pub allow_lan: bool,
+
+    /// 允许任意源站的网页调用网关（CORS）。默认关。
+    ///
+    /// 关着时 [`crate::gateway::guard`] 会把跨源网页请求挡回去：用户访问的
+    /// 任意页面都能向回环发 POST，花掉他的渠道额度。要把部署在公网上的网页
+    /// 客户端（`https://lm.example.com` → `http://127.0.0.1:8787`）接进来，
+    /// 只能显式打开这个开关 —— 打开后那道防线对这些页面就是敞开的。
+    #[serde(default)]
+    pub allow_browser_origins: bool,
 
     /// 上游首字节超时：连接建立后多久没收到第一个字节就判失败。
     pub first_byte_timeout_ms: u64,
@@ -667,6 +712,8 @@ impl Default for AppSettings {
             listen_host: "127.0.0.1".to_string(),
             listen_port: DEFAULT_PORT,
             autostart_gateway: true,
+            allow_lan: false,            // 默认只服务本机
+            allow_browser_origins: false, // 默认挡住外来网页，见 guard.rs 的说明
 
             first_byte_timeout_ms: 60_000,
             idle_timeout_ms: 300_000,
@@ -748,7 +795,24 @@ impl AppSettings {
         Some(cfg)
     }
     pub fn listen_addr(&self) -> String {
-        format!("{}:{}", self.listen_host, self.listen_port)
+        format!("{}:{}", self.bind_host(), self.listen_port)
+    }
+
+    /// 真正要绑的地址。
+    ///
+    /// 开关关着就只绑回环 —— 哪怕存档里 `listen_host` 还留着旧的非回环地址。
+    /// 开关开着、而地址仍是回环（或没填）时绑 `0.0.0.0`：用户说的是"允许局域网
+    /// 访问"，不是"只允许本机"。
+    pub fn bind_host(&self) -> &str {
+        let h = self.listen_host.trim();
+        if !self.allow_lan {
+            return "127.0.0.1";
+        }
+        if h.is_empty() || is_loopback_host(h) {
+            "0.0.0.0"
+        } else {
+            h
+        }
     }
 
     /// 把用户输入夹到合法区间。
@@ -759,9 +823,18 @@ impl AppSettings {
         if self.listen_port < 1024 {
             self.listen_port = DEFAULT_PORT;
         }
-        if self.listen_host.trim().is_empty() {
-            self.listen_host = "127.0.0.1".to_string();
-        }
+        // 让存下来的地址与真正绑定的地址一致：界面上的输入框显示的是它，
+        // 对不上的话用户会以为自己配的是 127.0.0.1。
+        let host = self.listen_host.trim().to_string();
+        self.listen_host = if self.allow_lan {
+            if host.is_empty() || is_loopback_host(&host) {
+                "0.0.0.0".to_string()
+            } else {
+                host
+            }
+        } else {
+            "127.0.0.1".to_string()
+        };
         self.first_byte_timeout_ms = self.first_byte_timeout_ms.clamp(1_000, 600_000);
         self.idle_timeout_ms = self.idle_timeout_ms.clamp(1_000, 3_600_000);
         self.request_timeout_ms = self.request_timeout_ms.clamp(1_000, 3_600_000);
@@ -787,6 +860,12 @@ impl AppSettings {
                     // 永远带着一条分支，而且不折算的话，用户在下次「保存」之前的
                     // 行为跟之后不一致。
                     s.model_policy = s.model_policy.normalized();
+                    // 新增 `allow_lan` 之前的存档：用户当年把地址填成了非回环，
+                    // 就是明确要局域网访问。不折算的话升级后它会静默失效，而那
+                    // 是一个已经能用的配置突然坏掉。
+                    if !has_key(&json, "allow_lan") && !is_loopback_host(&s.listen_host) {
+                        s.allow_lan = true;
+                    }
                     s
                 }
                 Err(e) => {
@@ -901,6 +980,73 @@ mod tests {
         assert_eq!(s.listen_port, 9999, "一个旧模式串不该把端口一起打回默认值");
         assert_eq!(s.listen_host, "0.0.0.0");
         assert_eq!(s.model_policy.mode, ModelPolicyMode::Passthrough);
+        assert!(s.allow_lan, "老存档里的非回环地址应当折算成「局域网访问已打开」");
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_disabled_lan_switch_is_respected() {
+        // 有 `allow_lan` 这个键就说明是用户自己选的「关」，不能按老存档去迁就
+        // 那个残留的非回环地址 —— 否则开关永远关不上。
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        sqlx::query("INSERT INTO settings_kv (key, value, updated_at) VALUES (?1, ?2, 0)")
+            .bind(SETTINGS_KEY)
+            .bind(r#"{"listen_host":"0.0.0.0","allow_lan":false}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let s = AppSettings::load(&pool).await.unwrap();
+        assert!(!s.allow_lan);
+        assert_eq!(s.bind_host(), "127.0.0.1");
+    }
+
+    #[test]
+    fn lan_off_only_binds_loopback() {
+        // 哪怕存档里残留着旧的非回环地址，开关关着就只绑回环。
+        let s = AppSettings {
+            listen_host: "192.168.1.5".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.bind_host(), "127.0.0.1");
+    }
+
+    #[test]
+    fn lan_on_binds_all_interfaces_when_the_host_is_loopback() {
+        // 用户选的是"允许局域网"，不是"只允许本机"。
+        let s = AppSettings {
+            allow_lan: true,
+            ..Default::default()
+        };
+        assert_eq!(s.bind_host(), "0.0.0.0");
+    }
+
+    #[test]
+    fn lan_on_keeps_an_explicit_interface() {
+        let s = AppSettings {
+            allow_lan: true,
+            listen_host: "192.168.1.5".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.bind_host(), "192.168.1.5");
+    }
+
+    #[test]
+    fn normalized_makes_the_stored_host_match_the_real_binding() {
+        // 界面上的地址栏显示的就是它，对不上的话用户会以为绑的是 127.0.0.1。
+        let off = AppSettings {
+            allow_lan: false,
+            listen_host: "0.0.0.0".into(),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(off.listen_host, "127.0.0.1");
+
+        let on = AppSettings {
+            allow_lan: true,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(on.listen_host, "0.0.0.0");
     }
 
     #[test]

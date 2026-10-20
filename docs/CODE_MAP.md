@@ -132,6 +132,8 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | `pipeline/` | **核心编排**，按职责分文件，见下表 |
 | `server.rs` | `GatewayServer`：`start` / `start_at` / `stop` / `status` / `base_url`，用 oneshot + graceful shutdown。**`rebind` 负责"改了监听地址要真的换过去"**：端口变了先绑新的探路（绑不上就原样退回，绝不先停再试），新地址起不来则退回老地址；`needs_rebind` 是它的纯函数判据 |
 | `router.rs` | axum 路由表、`/health`、`/v1/models`、路径兜底。兜底按**后缀**判：是三种对话入口之一就交给 `handle`，**其余一律交给 `handle_raw` 原样转发** —— 客户端会发 `/v1/messages/count_tokens` 这类非对话接口，硬解成对话再编码回去会把它改坏 |
+| `guard.rs` | 入站防护（`from_fn_with_state`，最外层）：挡外来网页的 Origin 与 DNS rebinding 的 Host。`allow_browser_origins` 只豁免 Origin 判据，Host 判据不让路 |
+| `cors.rs` | 跨源放行，`allow_browser_origins` 打开时才生效：预检在防护之前直接回 204，实际请求回程补 `Access-Control-Allow-Origin`（被防护拒绝的响应也要能读） |
 
 **`pipeline/` 内部**（大致按请求流经顺序；`mod.rs` 的文档注释里也列了同一份清单）：
 

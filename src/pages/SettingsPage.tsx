@@ -121,6 +121,9 @@ export default function SettingsPage() {
                     value={form.listen_host}
                     onChange={(e) => set("listen_host", e.target.value)}
                     placeholder="127.0.0.1"
+                    // 关着局域网访问时，保存时会被收回 127.0.0.1 —— 与其让用户
+                    // 填一个存不下的地址，不如直接锁住。
+                    disabled={!form.allow_lan}
                   />
                 </div>
                 <div className="space-y-2">
@@ -142,6 +145,33 @@ export default function SettingsPage() {
                 <Switch
                   checked={form.autostart_gateway}
                   onCheckedChange={(v) => set("autostart_gateway", v)}
+                />
+              </div>
+              <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                <div>
+                  <Label>允许局域网访问</Label>
+                  <p className="text-muted-foreground text-xs">
+                    关闭时只绑定本机（127.0.0.1），同一局域网内的其他设备连不上。
+                    打开后绑定 0.0.0.0，也可以在地址栏里指定某一张网卡。
+                  </p>
+                </div>
+                <Switch
+                  checked={form.allow_lan}
+                  onCheckedChange={(v) => set("allow_lan", v)}
+                />
+              </div>
+              <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                <div>
+                  <Label>允许任意网页调用（CORS）</Label>
+                  <p className="text-muted-foreground text-xs">
+                    默认只服务本机客户端。要把部署在公网上的网页客户端（如
+                    https://lm.example.com）指向本网关时才打开 ——
+                    打开后任何网页都能花掉你的渠道额度。
+                  </p>
+                </div>
+                <Switch
+                  checked={form.allow_browser_origins}
+                  onCheckedChange={(v) => set("allow_browser_origins", v)}
                 />
               </div>
             </CardContent>

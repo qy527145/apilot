@@ -70,7 +70,7 @@ pub async fn update_settings(
     if rebind {
         let shell = shell.inner().clone();
         let gateway = shell.gateway.clone();
-        let (host, port) = (before.listen_host.clone(), before.listen_port);
+        let (host, port) = (before.bind_host().to_string(), before.listen_port);
         tauri::async_runtime::spawn(async move {
             if let Err(e) = gateway.rebind(shell, &host, port).await {
                 tracing::warn!("换监听地址未生效: {e}");

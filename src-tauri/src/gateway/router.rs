@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::middleware::from_fn;
+use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 use axum::Router as AxumRouter;
 use http::{HeaderMap, StatusCode};
@@ -34,7 +34,11 @@ pub fn build(shell: Arc<AppShell>) -> AxumRouter {
         .fallback(fallback)
         // 入站防护必须在最外层：被拒的请求一个字节都不该进管线（不记日志、不捕获、
         // 不计费）——否则用户的监控里会混进别人的请求。
-        .layer(from_fn(super::guard::guard))
+        .layer(from_fn_with_state(shell.clone(), super::guard::guard))
+        // CORS 又包在防护外面：预检不带正文、不花钱，应该在防护之前就答掉；
+        // 实际请求被防护拒绝时，回程也要补上跨源头，否则浏览器只报一句笼统的
+        // "CORS error"，用户看不到 403 里那句人话。开关关着时这一层是透明的。
+        .layer(from_fn_with_state(shell.clone(), super::cors::cors))
         .with_state(shell)
 }
 

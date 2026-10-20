@@ -14,11 +14,21 @@
 //! 这里只管浏览器。局域网里另一台机器上的 Agent 客户端两点都不满足（它不发
 //! Origin，Host 是网关的 IP），所以这条防线对它是透明的 —— 那台机器的准入是
 //! 另一个问题，见后续的网关密钥。
+//!
+//! 设置里的 [`crate::config::settings::AppSettings::allow_browser_origins`] 是**明确的逃生门**：用户要把
+//! 部署在公网上的网页客户端指向本机网关时（`https://lm.example.com` →
+//! `http://127.0.0.1:8787`），Origin 判据必须让路。打开后任何网页都能花掉他的
+//! 渠道额度，所以默认关闭。Host 那条判据**不让路** —— 合法跨域请求的 Host 就是
+//! 网关自己的地址，而 rebinding 页面带的是它自己的域名，仍旧拦得住。
 
-use axum::extract::Request;
+use std::sync::Arc;
+
+use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, StatusCode};
+
+use crate::shell::AppShell;
 
 /// 本地容器运行时给宿主的名字。
 ///
@@ -41,8 +51,14 @@ const BROWSER_HEADERS: &[&str] = &["origin", "sec-fetch-site", "sec-fetch-mode"]
 
 /// 中间件入口。判为不放行时直接回 403，不进管线 —— 被拒的请求不该产生
 /// 请求日志、捕获或任何计费痕迹，否则用户的历史里会混进别人的请求。
-pub async fn guard(req: Request, next: Next) -> Response {
-    match refusal(req.headers()) {
+pub async fn guard(
+    State(shell): State<Arc<AppShell>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // 每请求读一次：这个开关改完立刻生效，不用重启网关（路由表是启动时建的）。
+    let allow_any_origin = shell.settings().allow_browser_origins;
+    match refusal(req.headers(), allow_any_origin) {
         None => next.run(req).await,
         Some(reason) => {
             tracing::warn!(path = %req.uri().path(), "{reason}");
@@ -68,10 +84,14 @@ fn refuse_response(reason: &str) -> Response {
 }
 
 /// 该拒绝吗？`None` = 放行；`Some(原因)` 会原样展示给用户。
-fn refusal(headers: &HeaderMap) -> Option<String> {
-    if let Some(origin) = header(headers, "origin") {
-        if let Some(reason) = judge_origin(&origin, headers) {
-            return Some(reason);
+///
+/// `allow_any_origin` 只豁免 Origin 判据；Host 判据照旧（见模块注释）。
+fn refusal(headers: &HeaderMap, allow_any_origin: bool) -> Option<String> {
+    if !allow_any_origin {
+        if let Some(origin) = header(headers, "origin") {
+            if let Some(reason) = judge_origin(&origin, headers) {
+                return Some(reason);
+            }
         }
     }
 
@@ -293,7 +313,12 @@ mod tests {
     }
 
     fn denied(host: &str, extra: &[(&str, &str)]) -> bool {
-        refusal(&req_headers(host, extra)).is_some()
+        refusal(&req_headers(host, extra), false).is_some()
+    }
+
+    /// 打开「允许任意网页调用」后的判定。
+    fn denied_when_open(host: &str, extra: &[(&str, &str)]) -> bool {
+        refusal(&req_headers(host, extra), true).is_some()
     }
 
     #[test]
@@ -314,6 +339,29 @@ mod tests {
         assert!(denied(
             "127.0.0.1:8787",
             &[("origin", "http://192.168.1.9:3000")]
+        ));
+    }
+
+    #[test]
+    fn allowing_any_origin_lets_a_public_web_client_in() {
+        // 部署在公网上的网页客户端指向本机网关：Host 仍是网关自己的地址。
+        assert!(!denied_when_open(
+            "127.0.0.1:8787",
+            &[("origin", "https://lm.example.com")]
+        ));
+        assert!(!denied_when_open(
+            "127.0.0.1:8787",
+            &[("origin", "null")]
+        ));
+    }
+
+    #[test]
+    fn allowing_any_origin_keeps_dns_rebinding_out() {
+        // 放行的是"源站"，不是"任何 Host"。rebinding 页面带的是它自己的域名，
+        // 仍旧拦得住 —— 这条是打开开关后唯一还站得住的判据。
+        assert!(denied_when_open(
+            "evil.example:8787",
+            &[("origin", "https://evil.example")]
         ));
     }
 

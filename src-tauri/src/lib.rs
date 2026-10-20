@@ -52,7 +52,7 @@ pub fn run() {
                         tracing::warn!("自动启动网关失败: {e}");
                         let status = crate::gateway::server::GatewayStatus {
                             running: false,
-                            host: shell_for_start.settings().listen_host.clone(),
+                            host: shell_for_start.settings().bind_host().to_string(),
                             port: 0,
                             error: Some(e.to_string()),
                         };

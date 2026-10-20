@@ -322,9 +322,20 @@ export type ClientModelMode = "off" | "rename" | "catalog" | "both";
  */
 export type ThinkingMode = "off" | "disabled" | "low" | "medium" | "high" | "xhigh";
 
-export interface AppSettings {  listen_host: string;
+export interface AppSettings {
+  /** 实际绑定地址。由 `allow_lan` 决定：关着时恒为 127.0.0.1。 */
+  listen_host: string;
   listen_port: number;
   autostart_gateway: boolean;
+  /** 局域网访问。默认关 —— 关着只绑回环。 */
+  allow_lan: boolean;
+  /**
+   * 允许任意源站的网页调用网关（CORS）。默认关。
+   *
+   * 关着时跨源网页请求会被网关挡回去：任意页面都能向本机发请求、花掉渠道额度。
+   * 把公网上的网页客户端接到本机网关时才需要打开。
+   */
+  allow_browser_origins: boolean;
   first_byte_timeout_ms: number;
   idle_timeout_ms: number;
   request_timeout_ms: number;
