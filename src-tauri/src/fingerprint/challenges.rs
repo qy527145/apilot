@@ -4,6 +4,8 @@
 //! 采集的。用自己的话改写提示词当然也能让模型写数字，但输入分布会偏离参考库，
 //! 所以这里原样沿用。
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,36 @@ pub fn pick_challenges(challenges: &[Challenge], count: usize, seed: u64) -> Vec
         .collect()
 }
 
+/// 用户可手动指定挑战；`None` 表示随机抽 3 条（默认）。
+///
+/// 手动模式必须正好 3 条、互不重复且都存在于当前挑战库。保留用户给的顺序，
+/// 这样结果里的三条回答与界面上的选择顺序一致。
+pub fn select_challenges(
+    challenges: &[Challenge],
+    requested: Option<&[String]>,
+    seed: u64,
+) -> Result<Vec<Challenge>, String> {
+    let Some(ids) = requested else {
+        return Ok(pick_challenges(challenges, 3, seed));
+    };
+    if ids.len() != 3 {
+        return Err("手动选择挑战时必须正好选择 3 条".into());
+    }
+    let mut seen = HashSet::new();
+    let mut selected = Vec::with_capacity(3);
+    for id in ids {
+        if !seen.insert(id.as_str()) {
+            return Err("手动选择的挑战不能重复".into());
+        }
+        let challenge = challenges
+            .iter()
+            .find(|challenge| &challenge.challenge_id == id)
+            .ok_or_else(|| format!("找不到挑战 {id}"))?;
+        selected.push(challenge.clone());
+    }
+    Ok(selected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +117,30 @@ mod tests {
             .map(|challenge| challenge.challenge_id.as_str())
             .collect();
         assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn manual_selection_requires_three_distinct_known_challenges() {
+        let challenges = embedded().unwrap();
+        let ids: Vec<String> = challenges
+            .iter()
+            .take(3)
+            .map(|challenge| challenge.challenge_id.clone())
+            .collect();
+        let selected = select_challenges(&challenges, Some(&ids), 0).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|challenge| &challenge.challenge_id)
+                .collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+
+        assert!(select_challenges(&challenges, Some(&ids[..2]), 0).is_err());
+        let duplicated = vec![ids[0].clone(), ids[0].clone(), ids[2].clone()];
+        assert!(select_challenges(&challenges, Some(&duplicated), 0).is_err());
+        let unknown = vec![ids[0].clone(), ids[1].clone(), "does-not-exist".into()];
+        assert!(select_challenges(&challenges, Some(&unknown), 0).is_err());
+        assert_eq!(select_challenges(&challenges, None, 7).unwrap().len(), 3);
     }
 }

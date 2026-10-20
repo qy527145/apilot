@@ -8,21 +8,26 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use tauri::State;
+use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::fingerprint::analyze::analyze_shared_outputs;
-use crate::fingerprint::challenges::pick_challenges;
+use crate::fingerprint::challenges::{select_challenges, Challenge};
 use crate::fingerprint::local;
 use crate::fingerprint::parse::parse_numbers;
 use crate::fingerprint::types::{
-    Analysis, AttemptResult, Candidate, Conclusion, DeclaredRank, FingerprintDetection,
-    FingerprintLibraryInfo, FingerprintLocalLabel, FingerprintLocalSample, LibraryInfoLite,
+    Analysis, AttemptResult, Candidate, Conclusion, DeclaredRank, FingerprintChallenge,
+    FingerprintDetection, FingerprintDetectionSummary, FingerprintLibraryInfo,
+    FingerprintLocalLabel, FingerprintLocalSample, FingerprintProgress, LibraryInfoLite,
     LocalResult, OfficialResult, Output,
 };
-use crate::fingerprint::ActiveLibrary;use crate::protocol::dto::{ContentBlock, UnifiedMessage, UnifiedRequest};
+use crate::fingerprint::ActiveLibrary;
+use crate::protocol::dto::{ContentBlock, UnifiedMessage, UnifiedRequest};
 use crate::shell::AppShell;
 use crate::storage::fingerprint as store;
+use crate::storage::models::Provider;
 use crate::storage::providers as provider_store;
 use crate::upstream::oneshot;
 use crate::util::now_ms;
@@ -37,12 +42,15 @@ fn minimum_numbers(expected_count: u32) -> usize {
     ((expected_count as f64) * 0.55).ceil().max(80.0) as usize
 }
 
-/// 单次检测：串行发 3 条挑战，官方排名 + 本地证据，最后落一条检测记录。
+/// 单次检测：默认随机抽 3 条挑战，也可以由用户手动指定；官方排名 + 本地证据，
+/// 最后落一条检测记录。`parallel` 默认 true；串行模式留给容易限流的渠道。
 #[tauri::command]
 pub async fn detect_model_fingerprint(
     shell: State<'_, Arc<AppShell>>,
     provider_id: i64,
     model: String,
+    parallel: Option<bool>,
+    challenge_ids: Option<Vec<String>>,
 ) -> AppResult<FingerprintDetection> {
     let shell = shell.inner().clone();
     let declared = model.trim().to_string();
@@ -57,50 +65,126 @@ pub async fn detect_model_fingerprint(
         .fingerprint
         .active()
         .map_err(|error| AppError::msg(error.to_string()))?;
-    let challenges = pick_challenges(&library.challenges, 3, now_ms() as u64);
-
+    let challenges = select_challenges(
+        &library.challenges,
+        challenge_ids.as_deref(),
+        now_ms() as u64,
+    )
+    .map_err(AppError::msg)?;
+    let parallel = parallel.unwrap_or(true);
+    let total = challenges.len();
+    let run_id = Uuid::new_v4().to_string();
     let started = Instant::now();
-    let mut attempts: Vec<AttemptResult> = Vec::with_capacity(challenges.len());
-    let mut outputs: Vec<Output> = Vec::with_capacity(challenges.len());
 
-    // 串行发送。并发对一条渠道没有意义（耗时由单次生成决定），却更容易撞上
-    // 限流；限流会让结论变成"有效回答不足"，等于白测。同一理由见
-    // `detect_provider_protocols`。
-    for (index, challenge) in challenges.iter().enumerate() {
-        let mut request = UnifiedRequest::new(&upstream);
-        request.max_tokens = Some(FINGERPRINT_MAX_TOKENS);
-        request.messages = vec![UnifiedMessage::user_text(challenge.prompt.clone())];
-        if !challenge.system.trim().is_empty() {
-            request.system = vec![ContentBlock::text(challenge.system.clone())];
+    let base = FingerprintProgress {
+        run_id: run_id.clone(),
+        phase: "started".into(),
+        provider_id,
+        provider_tag: provider.tag.clone(),
+        declared_model: declared.clone(),
+        upstream_model: upstream.clone(),
+        total,
+        completed: 0,
+        accepted: 0,
+        parallel,
+        challenge_index: None,
+        challenge_id: None,
+        expected_count: None,
+        challenge_prompt: None,
+        message: format!(
+            "开始检测：{total} 条挑战（{}）",
+            if parallel { "并行" } else { "串行" }
+        ),
+        ok: None,
+        status: None,
+        latency_ms: None,
+        parsed_numbers: None,
+        minimum_numbers: None,
+        wire: None,
+        url: None,
+        error: None,
+        preview: None,
+        detection_id: None,
+        result_status: None,
+    };
+    shell.events.fingerprint(&base);
+
+    let mut attempts: Vec<Option<AttemptResult>> = (0..total).map(|_| None).collect();
+    let mut outputs: Vec<Output> = challenges
+        .iter()
+        .map(|challenge| Output {
+            text: String::new(),
+            expected_count: challenge.expected_count,
+        })
+        .collect();
+    let mut completed = 0usize;
+    let mut accepted_count = 0usize;
+
+    if parallel {
+        // 并行用 FuturesUnordered 而不是 join_all：谁先回来就先推进度，
+        // 用户能看到"第 2 条已完成、第 1 条还在跑"，而不是三条一起转圈。
+        let mut pending = FuturesUnordered::new();
+        for (index, challenge) in challenges.iter().cloned().enumerate() {
+            let task_shell = shell.clone();
+            let task_provider = provider.clone();
+            let task_upstream = upstream.clone();
+            let task_base = base.clone();
+            pending.push(async move {
+                task_shell
+                    .events
+                    .fingerprint(&requesting_event(&task_base, index, &challenge));
+                let outcome =
+                    send_challenge(&task_shell, &task_provider, &task_upstream, &challenge)
+                        .await;
+                (index, challenge, outcome)
+            });
         }
-
-        let outcome = oneshot::send(&shell, &provider, &request).await;
-        let numbers = parse_numbers(&outcome.text);
-        let minimum = minimum_numbers(challenge.expected_count);
-        let accepted = numbers.len() >= minimum;
-        let preview: String = outcome.preview.chars().take(PREVIEW_CHARS).collect();
-
-        attempts.push(AttemptResult {
-            index,
-            challenge_id: challenge.challenge_id.clone(),
-            expected_count: challenge.expected_count,
-            ok: outcome.ok,
-            status: outcome.status,
-            latency_ms: outcome.latency_ms,
-            wire: outcome.wire.as_str().to_string(),
-            url: outcome.url.clone(),
-            error: outcome.error.clone(),
-            parsed_numbers: numbers.len(),
-            minimum_numbers: minimum,
-            accepted,
-            text_preview: preview,
-            numbers,
-        });
-        outputs.push(Output {
-            text: outcome.text,
-            expected_count: challenge.expected_count,
-        });
+        while let Some((index, challenge, outcome)) = pending.next().await {
+            let (attempt, output) = attempt_and_output(index, &challenge, &outcome);
+            completed += 1;
+            if attempt.accepted {
+                accepted_count += 1;
+            }
+            shell
+                .events
+                .fingerprint(&answered_event(&base, completed, accepted_count, &attempt));
+            attempts[index] = Some(attempt);
+            outputs[index] = output;
+        }
+    } else {
+        for (index, challenge) in challenges.iter().enumerate() {
+            shell
+                .events
+                .fingerprint(&requesting_event(&base, index, challenge));
+            let outcome = send_challenge(&shell, &provider, &upstream, challenge).await;
+            let (attempt, output) = attempt_and_output(index, challenge, &outcome);
+            completed += 1;
+            if attempt.accepted {
+                accepted_count += 1;
+            }
+            shell
+                .events
+                .fingerprint(&answered_event(&base, completed, accepted_count, &attempt));
+            attempts[index] = Some(attempt);
+            outputs[index] = output;
+        }
     }
+
+    let attempts: Vec<AttemptResult> = attempts
+        .into_iter()
+        .enumerate()
+        .map(|(index, attempt)| {
+            attempt.unwrap_or_else(|| fallback_attempt(index, &challenges[index], "请求未完成".into()))
+        })
+        .collect();
+
+    shell.events.fingerprint(&phase_event(
+        &base,
+        "analyzing",
+        completed,
+        accepted_count,
+        format!("{total} 条请求完成，正在计算排名…"),
+    ));
 
     let analysis =
         analyze_shared_outputs(&outputs, &library.metadata, &library.artifact, true)
@@ -156,7 +240,148 @@ pub async fn detect_model_fingerprint(
     )
     .await?;
     result.id = id;
+
+    let mut done = phase_event(&base, "done", completed, accepted_count, "检测完成".into());
+    done.detection_id = Some(id);
+    done.result_status = Some(result.status.clone());
+    shell.events.fingerprint(&done);
     Ok(result)
+}
+
+async fn send_challenge(
+    shell: &Arc<AppShell>,
+    provider: &Provider,
+    upstream: &str,
+    challenge: &Challenge,
+) -> oneshot::OneshotOutcome {
+    let mut request = UnifiedRequest::new(upstream);
+    request.max_tokens = Some(FINGERPRINT_MAX_TOKENS);
+    request.messages = vec![UnifiedMessage::user_text(challenge.prompt.clone())];
+    if !challenge.system.trim().is_empty() {
+        request.system = vec![ContentBlock::text(challenge.system.clone())];
+    }
+    oneshot::send(shell, provider, &request).await
+}
+
+fn attempt_and_output(
+    index: usize,
+    challenge: &Challenge,
+    outcome: &oneshot::OneshotOutcome,
+) -> (AttemptResult, Output) {
+    let numbers = parse_numbers(&outcome.text);
+    let minimum = minimum_numbers(challenge.expected_count);
+    let accepted = numbers.len() >= minimum;
+    let preview: String = outcome.preview.chars().take(PREVIEW_CHARS).collect();
+    let attempt = AttemptResult {
+        index,
+        challenge_id: challenge.challenge_id.clone(),
+        challenge_prompt: challenge.prompt.clone(),
+        expected_count: challenge.expected_count,
+        ok: outcome.ok,
+        status: outcome.status,
+        latency_ms: outcome.latency_ms,
+        wire: outcome.wire.as_str().to_string(),
+        url: outcome.url.clone(),
+        error: outcome.error.clone(),
+        parsed_numbers: numbers.len(),
+        minimum_numbers: minimum,
+        accepted,
+        text_preview: preview,
+        numbers,
+    };
+    let output = Output {
+        text: outcome.text.clone(),
+        expected_count: challenge.expected_count,
+    };
+    (attempt, output)
+}
+
+fn fallback_attempt(index: usize, challenge: &Challenge, error: String) -> AttemptResult {
+    let minimum = minimum_numbers(challenge.expected_count);
+    AttemptResult {
+        index,
+        challenge_id: challenge.challenge_id.clone(),
+        challenge_prompt: challenge.prompt.clone(),
+        expected_count: challenge.expected_count,
+        ok: false,
+        status: None,
+        latency_ms: 0,
+        wire: String::new(),
+        url: String::new(),
+        error: Some(error),
+        parsed_numbers: 0,
+        minimum_numbers: minimum,
+        accepted: false,
+        text_preview: String::new(),
+        numbers: Vec::new(),
+    }
+}
+
+fn phase_event(
+    base: &FingerprintProgress,
+    phase: &str,
+    completed: usize,
+    accepted: usize,
+    message: String,
+) -> FingerprintProgress {
+    let mut event = base.clone();
+    event.phase = phase.to_string();
+    event.completed = completed;
+    event.accepted = accepted;
+    event.challenge_index = None;
+    event.challenge_id = None;
+    event.expected_count = None;
+    event.challenge_prompt = None;
+    event.message = message;
+    event
+}
+
+fn requesting_event(
+    base: &FingerprintProgress,
+    index: usize,
+    challenge: &Challenge,
+) -> FingerprintProgress {
+    let mut event = phase_event(
+        base,
+        "requesting",
+        base.completed,
+        base.accepted,
+        format!("正在请求挑战 {}/{}", index + 1, base.total),
+    );
+    event.challenge_index = Some(index);
+    event.challenge_id = Some(challenge.challenge_id.clone());
+    event.expected_count = Some(challenge.expected_count);
+    event.challenge_prompt = Some(challenge.prompt.clone());
+    event
+}
+
+fn answered_event(
+    base: &FingerprintProgress,
+    completed: usize,
+    accepted: usize,
+    attempt: &AttemptResult,
+) -> FingerprintProgress {
+    let mut event = phase_event(
+        base,
+        "answered",
+        completed,
+        accepted,
+        format!("挑战 {} 完成", attempt.index + 1),
+    );
+    event.challenge_index = Some(attempt.index);
+    event.challenge_id = Some(attempt.challenge_id.clone());
+    event.expected_count = Some(attempt.expected_count);
+    event.challenge_prompt = Some(attempt.challenge_prompt.clone());
+    event.ok = Some(attempt.ok);
+    event.status = attempt.status;
+    event.latency_ms = Some(attempt.latency_ms);
+    event.parsed_numbers = Some(attempt.parsed_numbers);
+    event.minimum_numbers = Some(attempt.minimum_numbers);
+    event.wire = Some(attempt.wire.clone());
+    event.url = Some(attempt.url.clone());
+    event.error = attempt.error.clone();
+    event.preview = Some(attempt.text_preview.clone());
+    event
 }
 
 fn build_official(analysis: &Analysis, declared: &str, upstream: &str) -> Option<OfficialResult> {
@@ -333,6 +558,109 @@ pub fn fingerprint_library_info(shell: State<'_, Arc<AppShell>>) -> FingerprintL
     shell.fingerprint.info()
 }
 
+/// 挑战库全文，供前端手动选择。随机模式不需要它，但手动模式要看到提示词。
+#[tauri::command]
+pub fn list_fingerprint_challenges(
+    shell: State<'_, Arc<AppShell>>,
+) -> AppResult<Vec<FingerprintChallenge>> {
+    let library = shell
+        .fingerprint
+        .active()
+        .map_err(|error| AppError::msg(error.to_string()))?;
+    Ok(library
+        .challenges
+        .iter()
+        .map(|challenge| FingerprintChallenge {
+            challenge_id: challenge.challenge_id.clone(),
+            condition: challenge.condition.clone(),
+            expected_count: challenge.expected_count,
+            prompt: challenge.prompt.clone(),
+            system: challenge.system.clone(),
+        })
+        .collect())
+}
+
+fn summary_from_row(row: store::DetectionRow) -> FingerprintDetectionSummary {
+    let parsed: Option<FingerprintDetection> = serde_json::from_str(&row.result_json).ok();
+    let official = parsed.as_ref().and_then(|result| result.official.as_ref());
+    let local = parsed.as_ref().and_then(|result| result.local.as_ref());
+    let official_top = official
+        .and_then(|result| result.candidates.first())
+        .map(|candidate| candidate.model.clone());
+    let official_probability = official
+        .and_then(|result| result.candidates.first())
+        .and_then(|candidate| candidate.probability);
+    let local_top = local
+        .and_then(|result| result.candidates.first())
+        .map(|candidate| candidate.label.clone());
+    let local_probability = local
+        .and_then(|result| result.candidates.first())
+        .and_then(|candidate| candidate.probability);
+    let conclusion = parsed
+        .as_ref()
+        .map(|result| result.conclusion.clone())
+        .unwrap_or_else(|| Conclusion {
+            model: None,
+            display_name: None,
+            basis: "insufficient".into(),
+            level: "low".into(),
+            note: "检测记录的结果无法解析。".into(),
+        });
+
+    FingerprintDetectionSummary {
+        id: row.id,
+        provider_id: row.provider_id,
+        provider_tag: row.provider_tag,
+        declared_model: row.declared_model,
+        upstream_model: row.upstream_model,
+        wire: row.wire,
+        library_source: row.library_source,
+        library_built_at: row.library_built_at,
+        status: row.status,
+        created_at: row.created_at,
+        official_top,
+        official_probability,
+        local_top,
+        local_probability,
+        conclusion,
+    }
+}
+
+/// 最近的检测记录。完整结果用 `get_fingerprint_detection` 按 id 取。
+#[tauri::command]
+pub async fn list_fingerprint_detections(
+    shell: State<'_, Arc<AppShell>>,
+    limit: Option<i64>,
+) -> AppResult<Vec<FingerprintDetectionSummary>> {
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let rows = store::list_detections(&shell.db, limit).await?;
+    Ok(rows.into_iter().map(summary_from_row).collect())
+}
+
+#[tauri::command]
+pub async fn get_fingerprint_detection(
+    shell: State<'_, Arc<AppShell>>,
+    detection_id: i64,
+) -> AppResult<FingerprintDetection> {
+    let row = store::get_detection(&shell.db, detection_id)
+        .await?
+        .ok_or_else(|| AppError::msg("找不到该检测记录"))?;
+    let mut result: FingerprintDetection = serde_json::from_str(&row.result_json)
+        .map_err(|_| AppError::msg("该检测记录的结果已损坏"))?;
+    // 落库时还不知道自增 id，存储的 JSON 里是 0；回读时补上真实 id，
+    // 这样历史记录里的「加入样本库」也能按 id 回查原始回答。
+    result.id = row.id;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn delete_fingerprint_detection(
+    shell: State<'_, Arc<AppShell>>,
+    detection_id: i64,
+) -> AppResult<()> {
+    store::delete_detection(&shell.db, detection_id).await
+}
+
 #[tauri::command]
 pub async fn update_fingerprint_library(
     shell: State<'_, Arc<AppShell>>,
@@ -444,16 +772,21 @@ pub async fn add_fingerprint_samples(
                 attempt.challenge_id
             )));
         }
-        let prompt = library
-            .as_ref()
-            .and_then(|library| {
-                library
-                    .challenges
-                    .iter()
-                    .find(|challenge| challenge.challenge_id == attempt.challenge_id)
-            })
-            .map(|challenge| challenge.prompt.clone())
-            .unwrap_or_default();
+        // 新记录直接带提示词；老记录（这个字段加之前落库的）回查挑战库兜底。
+        let prompt = if attempt.challenge_prompt.is_empty() {
+            library
+                .as_ref()
+                .and_then(|library| {
+                    library
+                        .challenges
+                        .iter()
+                        .find(|challenge| challenge.challenge_id == attempt.challenge_id)
+                })
+                .map(|challenge| challenge.prompt.clone())
+                .unwrap_or_default()
+        } else {
+            attempt.challenge_prompt.clone()
+        };
         let numbers = attempt.numbers.clone();
         samples.push(store::SampleInput {
             challenge_id: attempt.challenge_id.clone(),

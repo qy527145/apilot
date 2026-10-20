@@ -26,12 +26,17 @@ pub struct NewDetection {
 
 #[derive(Debug, Clone)]
 pub struct DetectionRow {
+    pub id: i64,
     pub provider_id: Option<i64>,
     pub provider_tag: String,
     pub declared_model: String,
     pub upstream_model: String,
+    pub wire: String,
+    pub library_source: String,
+    pub library_built_at: String,
     pub status: String,
     pub result_json: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -68,19 +73,23 @@ pub struct LocalLabelSummary {
     pub last_added_at: i64,
 }
 
-const DETECTION_COLUMNS: &str =
-    "provider_id, provider_tag, declared_model, upstream_model, status, result_json";
+const DETECTION_COLUMNS: &str = "id, provider_id, provider_tag, declared_model, upstream_model, wire, library_source, library_built_at, status, result_json, created_at";
 const SAMPLE_COLUMNS: &str =
     "id, label, challenge_id, expected_count, numbers, provider_tag, declared_model, created_at, note";
 
 fn detection_from_row(row: &sqlx::sqlite::SqliteRow) -> DetectionRow {
     DetectionRow {
+        id: row.get("id"),
         provider_id: row.get("provider_id"),
         provider_tag: row.get("provider_tag"),
         declared_model: row.get("declared_model"),
         upstream_model: row.get("upstream_model"),
+        wire: row.get("wire"),
+        library_source: row.get("library_source"),
+        library_built_at: row.get("library_built_at"),
         status: row.get("status"),
         result_json: row.get("result_json"),
+        created_at: row.get("created_at"),
     }
 }
 
@@ -162,6 +171,26 @@ pub async fn get_detection(pool: &SqlitePool, id: i64) -> AppResult<Option<Detec
     let query = format!("SELECT {DETECTION_COLUMNS} FROM fingerprint_detections WHERE id = ?1");
     let row = sqlx::query(&query).bind(id).fetch_optional(pool).await?;
     Ok(row.as_ref().map(detection_from_row))
+}
+
+/// 最近的检测记录，新的在前。上限在调用方收敛（命令层限制 1..=200）。
+pub async fn list_detections(pool: &SqlitePool, limit: i64) -> AppResult<Vec<DetectionRow>> {
+    let query = format!(
+        "SELECT {DETECTION_COLUMNS} FROM fingerprint_detections
+         ORDER BY created_at DESC, id DESC LIMIT ?1"
+    );
+    let rows = sqlx::query(&query).bind(limit).fetch_all(pool).await?;
+    Ok(rows.iter().map(detection_from_row).collect())
+}
+
+pub async fn delete_detection(pool: &SqlitePool, id: i64) -> AppResult<()> {
+    // 本地样本没有外键，删除检测记录不会连带删掉用户收进样本库的数据；
+    // 这是有意的：样本的价值高于一次检测的审计记录。
+    sqlx::query("DELETE FROM fingerprint_detections WHERE id = ?1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn list_labels(pool: &SqlitePool) -> AppResult<Vec<LocalLabelSummary>> {
@@ -391,5 +420,31 @@ mod tests {
         assert_eq!(only_b.len(), 1);
         assert_eq!(only_b[0].numbers, vec![2]);
         assert_eq!(list_samples(&pool, None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn detections_are_listed_newest_first_and_deletion_keeps_samples() {
+        let pool = pool().await;
+        let first = insert_detection(&pool, &detection()).await.unwrap();
+        let mut second = detection();
+        second.declared_model = "claude-opus-5.5".into();
+        second.created_at = 2;
+        let second_id = insert_detection(&pool, &second).await.unwrap();
+        insert_samples(&pool, first, "gpt-5.5", &[sample("q1", vec![1, 2, 3])])
+            .await
+            .unwrap();
+
+        let rows = list_detections(&pool, 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, second_id);
+        assert_eq!(rows[0].result_json, "{}");
+
+        delete_detection(&pool, first).await.unwrap();
+        assert!(get_detection(&pool, first).await.unwrap().is_none());
+        assert_eq!(
+            list_all_samples(&pool).await.unwrap().len(),
+            1,
+            "删除检测记录不应连带删除本地样本"
+        );
     }
 }

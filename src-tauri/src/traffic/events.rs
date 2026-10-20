@@ -103,6 +103,12 @@ impl EventBus {
     pub fn request_finished<T: serde::Serialize + Clone>(&self, payload: &T) {
         let _ = self.app.emit(event_names::REQUEST_END, payload);
     }
+
+    /// 指纹检测进度。一次检测只有几条，不需要节流；节流反而会让
+    /// "第 2 条请求结束了"这种事件丢失，用户看到的进度就会跳。
+    pub fn fingerprint<T: serde::Serialize + Clone>(&self, payload: &T) {
+        let _ = self.app.emit(event_names::FINGERPRINT, payload);
+    }
 }
 
 impl crate::traffic::stream_events::StreamEventSink for EventBus {

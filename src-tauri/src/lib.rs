@@ -98,6 +98,10 @@ pub fn run() {
             // --- 指纹检测与样本库 ---
             commands::fingerprint::detect_model_fingerprint,
             commands::fingerprint::fingerprint_library_info,
+            commands::fingerprint::list_fingerprint_challenges,
+            commands::fingerprint::list_fingerprint_detections,
+            commands::fingerprint::get_fingerprint_detection,
+            commands::fingerprint::delete_fingerprint_detection,
             commands::fingerprint::update_fingerprint_library,
             commands::fingerprint::reset_fingerprint_library,
             commands::fingerprint::list_fingerprint_labels,

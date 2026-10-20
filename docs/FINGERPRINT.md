@@ -32,14 +32,28 @@ leave-one-out 离散度`。比值约 1 表示"和这个 label 自己的样本一
 
 ```
 detect_model_fingerprint
-  → 从 36 条固定挑战中抽 3 条
-  → 串行 oneshot::send（不写日志、不计费、不查缓存）
+  → 挑战：默认从 36 条里随机抽 3 条，也可以手动指定 3 条
+  → 默认并行发送 3 条请求（可切串行，避免限流）
+       每条开始/完成都推 apilot://fingerprint 事件
+  → oneshot::send（不写日志、不计费、不查缓存）
   → parse_numbers → 有效数字门槛 max(80, ceil(expected_count × 0.55))
   → 序列形态门槛（lag-1 自相关 ≤ -0.23，小步占比 ≤ 0.05）
   → 官方 ranker（LDA + kNN + nuisance baseline + 位置头）→ 温度 softmax
   → 本地 kNN 证据层（≥3 条/类）
   → 结论层 + 落库 fingerprint_detections
 ```
+
+## 挑战、进度与检测记录
+
+- **随机（默认）**：每次从 36 条固定挑战中抽 3 条；同一模型多测几轮会用不同
+  提示词，比固定三条更稳。
+- **手动**：在对话框里从完整挑战库挑 3 条，能直接看到每条提示词与期望数字。
+- **进度**：`apilot://fingerprint` 事件按挑战推送 `requesting` / `answered`；
+  并行模式下谁先回来就先更新哪张卡片，卡片里有提示词、解析数字/门槛、耗时、
+  线协议、URL、错误与回包预览。
+- **检测记录**：每次检测落一条 `fingerprint_detections`，完整结果（含原始回答）
+  在 `result_json`。在「指纹样本 → 检测记录」里可以回看、删除，或从历史结果
+  继续加入本地样本库。关闭对话框不会取消后端请求，但结果会出现在这里。
 
 状态：
 
@@ -94,7 +108,8 @@ source scripts/msvc-env.sh && cd src-tauri && cargo test
 - **本地标注由用户负责**：错误 label 会污染本地层；UI 要求显式确认，并支持删除。
 - **渠道不一定配合**：拒绝、写代码、用工具、思考吃满额度、强制 SSE 都会让某条
   回答无效；`oneshot` 目前只处理缓冲响应，强制流式的渠道会报"拿不到文本"。
-- **成本**：3 次真实请求，每次最多 8192 output token；检测前必须确认。
+- **成本**：3 次真实请求，每次最多 8192 output token；默认并行，可在对话框切串行。
+  检测前必须确认。
 - **数据漂移**：上游库会更新，模型版本替换也可能让旧参考库排名下降；结果里
   记录了参考库 `built_at` 与 SHA-256。
 
@@ -104,5 +119,8 @@ source scripts/msvc-env.sh && cd src-tauri && cargo test
   `ranker` → `analyze`；本地层 `local.rs`；引擎/远端 `mod.rs`）
 - 存储：`src-tauri/src/storage/fingerprint.rs`（v17 两张表）
 - 命令：`src-tauri/src/commands/fingerprint.rs`
-- 前端：`src/pages/SamplesPage.tsx`、`src/components/providers/FingerprintDialog.tsx`
+- 前端：`src/pages/SamplesPage.tsx`（远端 / 本地 / 检测记录三个页签）、
+  `FingerprintDialog.tsx`（检测确认、并行开关、挑战选择、实时进度）、
+  `FingerprintResultView.tsx`（结果与加入样本库）、
+  `FingerprintHistoryDialog.tsx`（历史记录详情）
 - 许可见根目录 `THIRD_PARTY_NOTICES.md`

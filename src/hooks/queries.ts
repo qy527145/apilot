@@ -30,6 +30,9 @@ export const qk = {
   billingSummary: (key: string) => ["billing_summary", key] as const,
   billingSeries: (key: string) => ["billing_series", key] as const,
   fingerprintLibrary: ["fingerprint_library"] as const,
+  fingerprintChallenges: ["fingerprint_challenges"] as const,
+  fingerprintDetections: ["fingerprint_detections"] as const,
+  fingerprintDetection: (id: number) => ["fingerprint_detection", id] as const,
   fingerprintLabels: ["fingerprint_labels"] as const,
   fingerprintSamples: (label: string | null) =>
     ["fingerprint_samples", label ?? "all"] as const,

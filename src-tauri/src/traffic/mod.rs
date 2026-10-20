@@ -160,6 +160,8 @@ pub mod event_names {
     pub const REQUEST_END: &str = "apilot://request-end";
     /// 流式请求的实时事件批次。
     pub const STREAM: &str = "apilot://stream";
+    /// 指纹检测的逐条请求进度。
+    pub const FINGERPRINT: &str = "apilot://fingerprint";
 }
 
 impl TrafficStats {

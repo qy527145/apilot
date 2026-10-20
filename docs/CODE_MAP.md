@@ -15,7 +15,7 @@
   - [gateway — 反向代理与请求管线](#gateway--反向代理与请求管线7598-行)
   - [routing — 模型选择、规则链与热切换](#routing--模型选择规则链与热切换4197-行)
   - [upstream — 上游渠道](#upstream--上游渠道1852-行)
-  - [fingerprint — 模型指纹检测](#fingerprint--模型指纹检测3453-行)
+  - [fingerprint — 模型指纹检测](#fingerprint--模型指纹检测3578-行)
   - [catalog — 上游模型目录](#catalog--上游模型目录价格--能力)
   - [codex — 发给客户端的模型目录](#codex--发给客户端的模型目录)
   - [billing — 计费](#billing--计费859-行)
@@ -44,10 +44,10 @@
 |---|---:|---|
 | `protocol/` | 8925 | `dto.rs`（IR）→ `codec.rs`（注册表）→ 各协议 `mod.rs` |
 | `gateway/` | 7598 | `pipeline/mod.rs`（编排）→ `pipeline/outbound.rs`（出站）→ `stream.rs`（转发） |
-| `storage/` | 10395 | `migrations.rs`（表结构）→ `logs.rs`（监控）/ `providers.rs`（渠道） |
+| `storage/` | 10450 | `migrations.rs`（表结构）→ `logs.rs`（监控）/ `providers.rs`（渠道） |
 | `routing/` | 4197 | `model_policy.rs`（模型名）→ `engine.rs`（规则链）→ `model_select.rs`（渠道） |
 | `traffic/` | 3094 | `session.rs`（对话归属）→ `stream_events.rs`（实时事件）→ `log_filter.rs`（表达式） |
-| `commands/` | 3190 | `<域>.rs`，与前端 `src/lib/api.ts` 一一对应 |
+| `commands/` | 3529 | `<域>.rs`，与前端 `src/lib/api.ts` 一一对应 |
 | `takeover/` | 2423 | `clients.rs`（各客户端补丁）→ `engine.rs`（保序写入） |
 | `upstream/` | 1852 | `channel.rs`（拼 URL / 鉴权 / 发出） |
 | `config/` | 1596 | `settings.rs`（全部设置）→ `paths.rs` |
@@ -55,7 +55,7 @@
 | `billing/` | 859 | `engine.rs::settle`（唯一结算公式） |
 | `catalog/` | 686 | 上游模型目录（价格 + 能力） |
 | `replay.rs` | 445 | 请求回放 / A-B 对比 |
-| `fingerprint/` | 3453 | `mod.rs`（引擎/远端）→ `codec.rs`（检测器解码）→ `ranker.rs` → `local.rs` |
+| `fingerprint/` | 3578 | `mod.rs`（引擎/远端）→ `codec.rs`（检测器解码）→ `ranker.rs` → `local.rs` |
 | `codex/` | 378 | 发给 Codex 的模型目录 |
 | `shell.rs` | 338 | `AppShell`：全部共享状态的装配与热重载 |
 | `lib.rs` | 261 | Tauri 启动 + `generate_handler!` |
@@ -276,7 +276,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 目标渠道显式参数优先；选「自动」时由 `resolve_provider` 按**模型策略 > 原渠道（若它声明了目标模型）> 候选渠道**选 —— 只改目标模型时不会傻乎乎地沿用原渠道。模型显式参数优先，否则用日志里的生效模型。兼容口是 `commands/replay.rs::replay_request`，对比 UI 在 `src/components/traffic/ReplayDialog.tsx`。
 
-### `fingerprint/` — 模型指纹检测（3453 行）
+### `fingerprint/` — 模型指纹检测（3578 行）
 
 移植自 [lm-detector](https://github.com/Ikaleio/lm-detector)（MIT，声明见根目录
 `THIRD_PARTY_NOTICES.md`）。`codec.rs` 解 `shared_detector.bin`（u32 头长 + JSON 头 +
@@ -487,7 +487,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 
 ---
 
-### `storage/` — 持久化（10395 行）
+### `storage/` — 持久化（10450 行）
 
 | 文件 | 内容 |
 |---|---|
@@ -563,7 +563,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 
 ---
 
-### `commands/` — Tauri 命令层（3190 行）
+### `commands/` — Tauri 命令层（3529 行）
 
 | 文件 | 命令数 | 内容 |
 |---|---|---|
@@ -577,7 +577,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `models.rs` | 8 | 模型视角：`list_model_catalog` / `list_model_options`、`get_model_policy`（模型替换，与 `app.rs` 的 `set_model_policy` 一对）、`upsert_model_policy` / `reset_model_policy` / `switch_model_channel`（每模型选渠道）、`set_model_candidates`、`probe_model_candidates` |
 | `logs.rs` | 11 | `query_logs`、`list_log_facets`（筛选下拉的候选值）、`get_request_detail`、`clear_logs` / `delete_log`（只清明细与捕获，不动 `usage_hourly`；单条删除只是多一个 `request_id` 条件）、会话相关命令 |
 | `replay.rs` | 1 | `replay_request`：把捕获的请求重发到指定渠道 / 模型。**不写日志、不计费** |
-| `fingerprint.rs` | 9 | `detect_model_fingerprint`（串行 3 条挑战，官方排名 + 本地证据 + 结论，落一条检测记录）、`fingerprint_library_info` / `update_fingerprint_library` / `reset_fingerprint_library`、本地样本的 `list_fingerprint_labels` / `list_fingerprint_samples` / `add_fingerprint_samples` / `delete_fingerprint_sample` / `delete_fingerprint_label`。检测走 `oneshot`，**不写日志、不计费、不查缓存** |
+| `fingerprint.rs` | 13 | `detect_model_fingerprint`（默认并行 3 条挑战，可手动指定/切串行；逐条推 `apilot://fingerprint` 进度；官方排名 + 本地证据 + 结论，落一条检测记录）、`fingerprint_library_info` / `list_fingerprint_challenges` / `update_fingerprint_library` / `reset_fingerprint_library`、检测记录的 `list_fingerprint_detections` / `get_fingerprint_detection` / `delete_fingerprint_detection`、本地样本的 `list_fingerprint_labels` / `list_fingerprint_samples` / `add_fingerprint_samples` / `delete_fingerprint_sample` / `delete_fingerprint_label`。检测走 `oneshot`，**不写日志、不计费、不查缓存** |
 
 **命令注册**：全部在 `lib.rs` 的 `generate_handler!` 里，用**完整路径**。
 `#[tauri::command]` 生成的 `__cmd__*` 宏项不参与 re-export，不能用 `pub use` 转发。
@@ -633,16 +633,16 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 | 位置 | 内容 |
 |---|---|
-| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 74 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
+| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 78 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/logExpr.ts` | 监控页自定义表达式筛选的**前端那一半**：为「进行中」请求组装内置对象并求值（已落库的走后端 QuickJS）。两边必须同语义，改一个就要改另一个 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
-| `src/pages/*.tsx` | 10 个页面：Overview / Clients / Providers / Models / Samples / Routing / Traffic / Billing / Cache / Settings。**两页分工**：Models 只管**模型名**（全局 + 客户端两级替换、模型并集列表只读）；Routing 管**渠道**（selector 热切换、规则链、每个模型走哪个渠道、以及该渠道上的**上游模型名**）。Providers 是渠道视角 —— 同一份 `provider_models` 的三个方向。**Samples** 管指纹参考库与本地样本（远端更新 / 本地标签 / 样本增删） |
+| `src/pages/*.tsx` | 10 个页面：Overview / Clients / Providers / Models / Samples / Routing / Traffic / Billing / Cache / Settings。**两页分工**：Models 只管**模型名**（全局 + 客户端两级替换、模型并集列表只读）；Routing 管**渠道**（selector 热切换、规则链、每个模型走哪个渠道、以及该渠道上的**上游模型名**）。Providers 是渠道视角 —— 同一份 `provider_models` 的三个方向。**Samples** 管指纹参考库、本地样本与检测记录（远端更新 / 本地标签 / 历史回看与入库） |
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
 | `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择 + 每渠道的上游模型名，挂在路由页） |
 | `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
-| `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明与**自动检测** —— 逐个协议探一次，只补勾不取消；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选；每行还有**单次模型测试**、**指纹检测**与三枚**能力徽标**，点徽标即实测一项）；`CatalogCapabilitiesDialog` / `CatalogPriceDialog` 是两个目录导入入口；`FingerprintDialog` 是检测结果与「加入本地样本库」表单 |
+| `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明与**自动检测** —— 逐个协议探一次，只补勾不取消；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选；每行还有**单次模型测试**、**指纹检测**与三枚**能力徽标**，点徽标即实测一项）；`CatalogCapabilitiesDialog` / `CatalogPriceDialog` 是两个目录导入入口；`FingerprintDialog` 负责确认、并行开关、随机/手动挑战与实时进度；`FingerprintResultView` 展示结果并处理入库；`FingerprintHistoryDialog` 回看历史检测 |
 | `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库）；`FilterExprPanel`（监控页的**自定义表达式**筛选：编辑框 + 后端行内校验 + 示例 + 内置对象结构说明）；`TimeRangePicker`（监控页的**自定义时间范围**：按钮上直接显示所选区间，弹层里两个时间框 + 常用区间；与预设页签互斥）；**`SessionsView`**（监控页「对话」视图：左会话列表、右时间线，按线筛、压缩点横条、换模型高亮，点行复用 `RequestDetailDialog`，「在请求列表中查看」带 `session_id` 筛选切回去）；**`ReplayDialog`**（回放 / A-B 对比：选目标渠道与模型，并排显示原始与回放的回答、耗时、token；回放是真实出站请求，**不写日志、不计费**） |
 
 **改后端 API 时同步 `src/lib/api.ts`** —— 它是前后端契约的落点，两边不一致不会有编译错误，
@@ -652,7 +652,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 ## 测试
 
-1171 个测试，**与实现同文件**（`#[cfg(test)] mod tests`），`cargo test` 全量运行。
+1173 个测试，**与实现同文件**（`#[cfg(test)] mod tests`），`cargo test` 全量运行。
 
 | 层次 | 代表 |
 |---|---|

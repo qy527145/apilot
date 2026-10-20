@@ -3,7 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CloudDownload,
+  Eye,
   Fingerprint,
+  History,
   Loader2,
   RefreshCw,
   RotateCcw,
@@ -14,6 +16,7 @@ import { toast } from "sonner";
 import { CopyButton } from "@/components/common/CopyButton";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PageShell } from "@/components/layout/PageShell";
+import { FingerprintHistoryDialog } from "@/components/providers/FingerprintHistoryDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -46,7 +49,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { qk } from "@/hooks/queries";
 import {
   api,
+  FINGERPRINT_BASIS_LABEL,
   FINGERPRINT_REMOTE_BASE,
+  FINGERPRINT_STATUS_LABEL,
   type FingerprintLibraryInfo,
   type FingerprintLocalLabel,
 } from "@/lib/api";
@@ -60,6 +65,10 @@ function sourceLabel(source: string) {
   return source === "remote" ? "远端更新" : "内置快照";
 }
 
+function probabilityText(value?: number | null) {
+  return value == null ? "—" : `${(value * 100).toFixed(1)}%`;
+}
+
 export default function SamplesPage() {
   return (
     <PageShell
@@ -70,12 +79,16 @@ export default function SamplesPage() {
         <TabsList>
           <TabsTrigger value="remote">远端参考库</TabsTrigger>
           <TabsTrigger value="local">本地样本库</TabsTrigger>
+          <TabsTrigger value="history">检测记录</TabsTrigger>
         </TabsList>
         <TabsContent value="remote" className="mt-2">
           <RemoteLibrary />
         </TabsContent>
         <TabsContent value="local" className="mt-2">
           <LocalLibrary />
+        </TabsContent>
+        <TabsContent value="history" className="mt-2">
+          <DetectionHistory />
         </TabsContent>
       </Tabs>
     </PageShell>
@@ -496,5 +509,153 @@ function LabelRow({
         <span>最后加入 {formatTime(label.last_added_at)}</span>
       </div>
     </button>
+  );
+}
+
+function DetectionHistory() {
+  const qc = useQueryClient();
+  const [selected, setSelected] = useState<number | null>(null);
+  const { data, isLoading } = useQuery({
+    queryKey: qk.fingerprintDetections,
+    queryFn: () => api.listFingerprintDetections(100),
+    retry: 1,
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: number) => api.deleteFingerprintDetection(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.fingerprintDetections });
+      toast.success("已删除该检测记录");
+    },
+  });
+
+  if (isLoading) {
+    return <Skeleton className="h-64 w-full" />;
+  }
+
+  if (!data || data.length === 0) {
+    return (
+      <EmptyState
+        icon={History}
+        title="还没有检测记录"
+        description="在「渠道管理」里对模型点指纹图标。检测完成后，即使关闭对话框，结果也会出现在这里；记录里保留原始回答，可以随时加入本地样本库。"
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <History className="size-4" />
+            最近检测
+          </CardTitle>
+          <CardDescription className="text-xs">
+            记录保存在本机 SQLite。点「查看」可以回看完整结果、提示词、请求详情，
+            也可以从历史记录继续加入本地样本库。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>时间</TableHead>
+                <TableHead>渠道</TableHead>
+                <TableHead>模型</TableHead>
+                <TableHead>状态</TableHead>
+                <TableHead>官方 Top</TableHead>
+                <TableHead>本地 Top</TableHead>
+                <TableHead>结论</TableHead>
+                <TableHead className="w-24" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.map((item) => (
+                <TableRow key={item.id}>
+                  <TableCell className="text-xs whitespace-nowrap">
+                    {formatTime(item.created_at)}
+                  </TableCell>
+                  <TableCell className="text-xs">{item.provider_tag || "—"}</TableCell>
+                  <TableCell className="text-xs whitespace-normal">
+                    <div className="font-mono">{item.declared_model}</div>
+                    <div className="text-muted-foreground font-mono text-[11px]">
+                      {item.upstream_model}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Badge
+                      variant={
+                        item.status === "ok"
+                          ? "success"
+                          : item.status === "partial"
+                            ? "warning"
+                            : "destructive"
+                      }
+                    >
+                      {FINGERPRINT_STATUS_LABEL[item.status] ?? item.status}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-xs whitespace-normal">
+                    <div className="font-mono">{item.official_top ?? "—"}</div>
+                    <div className="text-muted-foreground tabular-nums">
+                      {probabilityText(item.official_probability)}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-xs whitespace-normal">
+                    <div className="font-mono">{item.local_top ?? "—"}</div>
+                    <div className="text-muted-foreground tabular-nums">
+                      {probabilityText(item.local_probability)}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-xs whitespace-normal">
+                    <Badge variant="outline">
+                      {FINGERPRINT_BASIS_LABEL[item.conclusion.basis] ??
+                        item.conclusion.basis}
+                    </Badge>
+                    <div className="text-muted-foreground mt-1 line-clamp-2">
+                      {item.conclusion.note}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        title="查看完整结果"
+                        onClick={() => setSelected(item.id)}
+                      >
+                        <Eye className="size-4" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        title="删除这条检测记录"
+                        disabled={remove.isPending}
+                        onClick={() => {
+                          if (confirm("删除这条检测记录？已加入本地样本库的数据不受影响。")) {
+                            remove.mutate(item.id);
+                          }
+                        }}
+                      >
+                        <Trash2 className="size-4 text-destructive" />
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+
+      <FingerprintHistoryDialog
+        open={selected !== null}
+        onOpenChange={(open) => {
+          if (!open) setSelected(null);
+        }}
+        detectionId={selected}
+      />
+    </div>
   );
 }

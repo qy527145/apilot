@@ -67,6 +67,36 @@ export interface StreamBatch {
   error?: string | null;
 }
 
+/** 指纹检测的逐条请求进度。 */
+export interface FingerprintProgress {
+  run_id: string;
+  phase: string;
+  provider_id: number;
+  provider_tag: string;
+  declared_model: string;
+  upstream_model: string;
+  total: number;
+  completed: number;
+  accepted: number;
+  parallel: boolean;
+  challenge_index?: number | null;
+  challenge_id?: string | null;
+  expected_count?: number | null;
+  challenge_prompt?: string | null;
+  message: string;
+  ok?: boolean | null;
+  status?: number | null;
+  latency_ms?: number | null;
+  parsed_numbers?: number | null;
+  minimum_numbers?: number | null;
+  wire?: string | null;
+  url?: string | null;
+  error?: string | null;
+  preview?: string | null;
+  detection_id?: number | null;
+  result_status?: string | null;
+}
+
 export interface ApilotEventMap {
   "apilot://gateway": GatewayStatus;
   "apilot://traffic": TrafficSnapshot;
@@ -75,6 +105,7 @@ export interface ApilotEventMap {
   "apilot://request-start": RequestStarted;
   "apilot://request-end": RequestFinished;
   "apilot://stream": StreamBatch;
+  "apilot://fingerprint": FingerprintProgress;
 }
 
 export type ApilotEventName = keyof ApilotEventMap;

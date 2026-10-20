@@ -1307,6 +1307,8 @@ export interface FingerprintOfficialResult {
 export interface FingerprintAttempt {
   index: number;
   challenge_id: string;
+  /** 实际发送给模型的提示词。 */
+  challenge_prompt?: string;
   expected_count: number;
   ok: boolean;
   status?: number | null;
@@ -1371,6 +1373,32 @@ export interface FingerprintLocalLabel {
   samples: number;
   last_added_at: number;
   official: boolean;
+}
+
+export interface FingerprintDetectionSummary {
+  id: number;
+  provider_id?: number | null;
+  provider_tag: string;
+  declared_model: string;
+  upstream_model: string;
+  wire: string;
+  library_source: string;
+  library_built_at: string;
+  status: string;
+  created_at: number;
+  official_top?: string | null;
+  official_probability?: number | null;
+  local_top?: string | null;
+  local_probability?: number | null;
+  conclusion: FingerprintConclusion;
+}
+
+export interface FingerprintChallenge {
+  challenge_id: string;
+  condition: string;
+  expected_count: number;
+  prompt: string;
+  system: string;
 }
 
 export interface FingerprintLocalSample {
@@ -1493,10 +1521,30 @@ export const api = {
    * 检测这个渠道背后的实际模型：串行发 3 条挑战，返回官方排名、本地样本
    * 证据和一致性结论。**会消耗 3 次真实请求的额度**。
    */
-  detectModelFingerprint: (providerId: number, model: string) =>
-    call<FingerprintDetection>("detect_model_fingerprint", { providerId, model }),
+  detectModelFingerprint: (
+    providerId: number,
+    model: string,
+    parallel = true,
+    challengeIds?: string[] | null,
+  ) =>
+    call<FingerprintDetection>("detect_model_fingerprint", {
+      providerId,
+      model,
+      parallel,
+      challengeIds: challengeIds ?? null,
+    }),
   fingerprintLibraryInfo: () =>
     call<FingerprintLibraryInfo>("fingerprint_library_info"),
+  /** 36 条固定挑战的全文，供手动选择提示词。 */
+  listFingerprintChallenges: () =>
+    call<FingerprintChallenge[]>("list_fingerprint_challenges"),
+  listFingerprintDetections: (limit = 50) =>
+    call<FingerprintDetectionSummary[]>("list_fingerprint_detections", { limit }),
+  /** 读取一次历史检测的完整结果；返回的 id 可用于加入样本库。 */
+  getFingerprintDetection: (detectionId: number) =>
+    call<FingerprintDetection>("get_fingerprint_detection", { detectionId }),
+  deleteFingerprintDetection: (detectionId: number) =>
+    call<null>("delete_fingerprint_detection", { detectionId }),
   /** 从 GitHub（或镜像）拉检测器和指纹库；base_url 省略用默认地址。 */
   updateFingerprintLibrary: (baseUrl?: string | null) =>
     call<FingerprintLibraryInfo>("update_fingerprint_library", {

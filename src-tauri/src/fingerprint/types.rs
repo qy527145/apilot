@@ -184,6 +184,9 @@ pub struct LibraryInfoLite {
 pub struct AttemptResult {
     pub index: usize,
     pub challenge_id: String,
+    /// 实际发送给模型的提示词，供结果详情与"加入样本库"回溯。
+    #[serde(default)]
+    pub challenge_prompt: String,
     pub expected_count: u32,
     pub ok: bool,
     pub status: Option<u16>,
@@ -270,6 +273,71 @@ pub struct FingerprintDetection {
     pub local: Option<LocalResult>,
     pub conclusion: Conclusion,
     pub elapsed_ms: i64,
+}
+
+/// 挑战库对前端展示的形态。用户手动选择时用它渲染完整提示词。
+#[derive(Debug, Clone, Serialize)]
+pub struct FingerprintChallenge {
+    pub challenge_id: String,
+    pub condition: String,
+    pub expected_count: u32,
+    pub prompt: String,
+    pub system: String,
+}
+
+/// 检测过程中的实时进度，经 `apilot://fingerprint` 推给前端。
+///
+/// 一次检测只有 3 条请求；前端按 `challenge_index` 把每条请求的状态挂到对应
+/// 卡片上。`phase` 依次是 `started` → `requesting` → `answered` →
+/// `analyzing` → `done`。`run_id` 用来过滤上一次检测的迟到事件。
+#[derive(Debug, Clone, Serialize)]
+pub struct FingerprintProgress {
+    pub run_id: String,
+    pub phase: String,
+    pub provider_id: i64,
+    pub provider_tag: String,
+    pub declared_model: String,
+    pub upstream_model: String,
+    pub total: usize,
+    pub completed: usize,
+    pub accepted: usize,
+    pub parallel: bool,
+    pub challenge_index: Option<usize>,
+    pub challenge_id: Option<String>,
+    pub expected_count: Option<u32>,
+    pub challenge_prompt: Option<String>,
+    pub message: String,
+    pub ok: Option<bool>,
+    pub status: Option<u16>,
+    pub latency_ms: Option<i64>,
+    pub parsed_numbers: Option<usize>,
+    pub minimum_numbers: Option<usize>,
+    pub wire: Option<String>,
+    pub url: Option<String>,
+    pub error: Option<String>,
+    pub preview: Option<String>,
+    pub detection_id: Option<i64>,
+    pub result_status: Option<String>,
+}
+
+/// 检测记录列表里的一行。完整结果在 `result_json`，这里只放列表需要的摘要。
+#[derive(Debug, Clone, Serialize)]
+pub struct FingerprintDetectionSummary {
+    pub id: i64,
+    pub provider_id: Option<i64>,
+    pub provider_tag: String,
+    pub declared_model: String,
+    pub upstream_model: String,
+    pub wire: String,
+    pub library_source: String,
+    pub library_built_at: String,
+    pub status: String,
+    pub created_at: i64,
+    pub official_top: Option<String>,
+    pub official_probability: Option<f64>,
+    pub local_top: Option<String>,
+    pub local_probability: Option<f64>,
+    pub conclusion: Conclusion,
 }
 
 #[derive(Debug, Clone, Serialize)]
