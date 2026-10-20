@@ -13,6 +13,7 @@ import {
 import { toast } from "sonner";
 
 import { CatalogCapabilitiesDialog } from "@/components/providers/CatalogCapabilitiesDialog";
+import { FingerprintBatchDialog } from "@/components/providers/FingerprintBatchDialog";
 import { FingerprintDialog } from "@/components/providers/FingerprintDialog";
 import { ModelPickerDialog } from "@/components/providers/ModelPickerDialog";
 import { Badge } from "@/components/ui/badge";
@@ -86,6 +87,8 @@ export function ProviderModelsPanel({
   const [tests, setTests] = useState<Record<string, OneshotOutcome | "loading">>({});
   /** 正在做指纹检测的模型；非空即打开检测对话框。 */
   const [fingerprintModel, setFingerprintModel] = useState<string | null>(null);
+  /** 批量指纹检测对话框。 */
+  const [batchOpen, setBatchOpen] = useState(false);
 
   useEffect(() => {
     if (data) {
@@ -155,6 +158,18 @@ export function ProviderModelsPanel({
 
   const selectedUpstreams = useMemo(
     () => rows.map(effectiveUpstream).filter(Boolean),
+    [rows],
+  );
+
+  /** 批量指纹检测的候选：当前面板里已填写的声明模型（含未保存的编辑）。 */
+  const batchModels = useMemo(
+    () =>
+      rows
+        .map((row) => ({
+          model: row.model.trim(),
+          upstream: effectiveUpstream(row),
+        }))
+        .filter((item) => item.model.length > 0),
     [rows],
   );
 
@@ -276,6 +291,15 @@ export function ProviderModelsPanel({
           >
             <CloudDownload className="size-4" />
             从上游获取
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={batchModels.length === 0}
+            onClick={() => setBatchOpen(true)}
+          >
+            <Fingerprint className="size-4" />
+            批量指纹检测
           </Button>
           <Button
             size="sm"
@@ -410,6 +434,14 @@ export function ProviderModelsPanel({
         providerId={providerId}
         providerName={providerName}
         model={fingerprintModel ?? ""}
+      />
+
+      <FingerprintBatchDialog
+        open={batchOpen}
+        onOpenChange={setBatchOpen}
+        providerId={providerId}
+        providerName={providerName}
+        models={batchModels}
       />
     </div>
   );

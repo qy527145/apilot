@@ -3,17 +3,19 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Fingerprint,
-  ListChecks,
   Loader2,
   Play,
   RefreshCw,
-  Shuffle,
   XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  FingerprintChallengePicker,
+  type ChallengeMode,
+} from "@/components/providers/FingerprintChallengePicker";
+import { FingerprintProgressCards } from "@/components/providers/FingerprintProgressCards";
 import { FingerprintResultView } from "@/components/providers/FingerprintResultView";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -24,7 +26,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { qk } from "@/hooks/queries";
 import { api, type FingerprintDetection } from "@/lib/api";
@@ -37,8 +38,6 @@ interface FingerprintDialogProps {
   providerName: string;
   model: string;
 }
-
-type ChallengeMode = "random" | "manual";
 
 /**
  * 指纹检测对话框：确认花费 → 选择挑战/并行 → 逐条显示请求进度 → 结果与样本入库。
@@ -59,7 +58,6 @@ export function FingerprintDialog({
   const [parallel, setParallel] = useState(true);
   const [mode, setMode] = useState<ChallengeMode>("random");
   const [selectedChallenges, setSelectedChallenges] = useState<string[]>([]);
-  const [search, setSearch] = useState("");
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<FingerprintDetection | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -75,7 +73,6 @@ export function FingerprintDialog({
     setParallel(true);
     setMode("random");
     setSelectedChallenges([]);
-    setSearch("");
     setRunning(false);
     setResult(null);
     setError(null);
@@ -131,15 +128,6 @@ export function FingerprintDialog({
   };
 
   const challenges = challengesQuery.data ?? [];
-  const filteredChallenges = challenges.filter((challenge) => {
-    const keyword = search.trim().toLowerCase();
-    if (!keyword) return true;
-    return (
-      challenge.challenge_id.toLowerCase().includes(keyword) ||
-      challenge.condition.toLowerCase().includes(keyword) ||
-      challenge.prompt.toLowerCase().includes(keyword)
-    );
-  });
 
   const toggleChallenge = (id: string) => {
     setSelectedChallenges((current) => {
@@ -205,102 +193,14 @@ export function FingerprintDialog({
                 </span>
               </label>
 
-              <div className="space-y-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs font-medium">挑战</span>
-                  <div className="flex gap-1">
-                    <Button
-                      size="sm"
-                      variant={mode === "random" ? "default" : "outline"}
-                      onClick={() => setMode("random")}
-                    >
-                      <Shuffle className="size-4" />
-                      随机抽取
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant={mode === "manual" ? "default" : "outline"}
-                      onClick={() => setMode("manual")}
-                    >
-                      <ListChecks className="size-4" />
-                      手动选择
-                    </Button>
-                  </div>
-                </div>
-                {mode === "random" ? (
-                  <p className="text-muted-foreground text-[11px]">
-                    默认从 36 条固定挑战中随机抽 3 条。同一模型多测几轮会用到不同提示词，
-                    覆盖更稳；参考库就是用这 36 条采集的。
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    <p className="text-muted-foreground text-[11px]">
-                      自己挑 3 条。提示词原样发送；选择顺序会保留在结果里。
-                      已选{" "}
-                      <span className="text-foreground font-medium">
-                        {selectedChallenges.length}/3
-                      </span>
-                      {selectedChallenges.length >= 3 && "（先取消一条才能换）"}
-                    </p>
-                    <Input
-                      value={search}
-                      onChange={(event) => setSearch(event.target.value)}
-                      placeholder="搜索挑战 ID / 条件 / 提示词"
-                      className="h-8 text-xs"
-                    />
-                    {challengesQuery.isLoading ? (
-                      <div className="text-muted-foreground py-4 text-xs">
-                        正在加载挑战库…
-                      </div>
-                    ) : (
-                      <div className="max-h-72 space-y-1 overflow-y-auto rounded border p-1">
-                        {filteredChallenges.map((challenge) => {
-                          const checked = selectedChallenges.includes(
-                            challenge.challenge_id,
-                          );
-                          return (
-                            <label
-                              key={challenge.challenge_id}
-                              className={`flex cursor-pointer items-start gap-2 rounded px-2 py-1.5 text-xs hover:bg-accent/50 ${
-                                checked ? "bg-accent/40" : ""
-                              }`}
-                            >
-                              <Checkbox
-                                checked={checked}
-                                onCheckedChange={() =>
-                                  toggleChallenge(challenge.challenge_id)
-                                }
-                                className="mt-0.5"
-                              />
-                              <div className="min-w-0 space-y-0.5">
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <span className="font-mono font-medium">
-                                    {challenge.challenge_id}
-                                  </span>
-                                  <Badge variant="outline">
-                                    {challenge.condition}
-                                  </Badge>
-                                  <span className="text-muted-foreground">
-                                    期望 {challenge.expected_count} 个整数
-                                  </span>
-                                </div>
-                                <p className="text-muted-foreground whitespace-pre-wrap text-[11px]">
-                                  {challenge.prompt}
-                                </p>
-                              </div>
-                            </label>
-                          );
-                        })}
-                        {filteredChallenges.length === 0 && (
-                          <p className="text-muted-foreground px-2 py-3 text-xs">
-                            没有匹配的挑战。
-                          </p>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
+              <FingerprintChallengePicker
+                challenges={challenges}
+                loading={challengesQuery.isLoading}
+                mode={mode}
+                onModeChange={setMode}
+                selected={selectedChallenges}
+                onToggle={toggleChallenge}
+              />
 
               <label className="flex items-start gap-2 text-xs">
                 <Checkbox
@@ -330,67 +230,10 @@ export function FingerprintDialog({
                 </div>
               </div>
 
-              <div className="space-y-2">
-                {Array.from({ length: total }, (_, index) => {
-                  const item = challengeProgress[index];
-                  return (
-                    <div key={index} className="rounded border px-2 py-2 text-xs">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-mono font-medium">
-                          {item?.challenge_id ?? `挑战 ${index + 1}`}
-                        </span>
-                        {!item && (
-                          <Badge variant="outline">等待中</Badge>
-                        )}
-                        {item?.phase === "requesting" && (
-                          <Badge variant="secondary">
-                            <Loader2 className="mr-1 size-3 animate-spin" />
-                            请求中
-                          </Badge>
-                        )}
-                        {item?.phase === "answered" && (
-                          <Badge
-                            variant={item.ok ? "success" : "destructive"}
-                          >
-                            {item.ok ? "已返回" : "失败"}
-                          </Badge>
-                        )}
-                        {item?.challenge_id && (
-                          <span className="text-muted-foreground">
-                            期望 {item.expected_count} 个整数
-                          </span>
-                        )}
-                        {item?.phase === "answered" && (
-                          <span className="text-muted-foreground tabular-nums">
-                            {item.parsed_numbers}/{item.minimum_numbers} 个数字 ·{" "}
-                            {item.latency_ms} ms · {item.wire || "—"}
-                          </span>
-                        )}
-                      </div>
-                      {item?.challenge_prompt && (
-                        <details className="mt-1">
-                          <summary className="text-muted-foreground cursor-pointer text-[11px]">
-                            查看提示词
-                          </summary>
-                          <p className="mt-1 whitespace-pre-wrap text-[11px]">
-                            {item.challenge_prompt}
-                          </p>
-                        </details>
-                      )}
-                      {item?.error && (
-                        <p className="text-destructive mt-1 whitespace-pre-wrap text-[11px]">
-                          {item.error}
-                        </p>
-                      )}
-                      {item?.preview && (
-                        <p className="text-muted-foreground mt-1 whitespace-pre-wrap text-[11px]">
-                          回包预览：{item.preview}
-                        </p>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+              <FingerprintProgressCards
+                total={total}
+                challenges={challengeProgress}
+              />
 
               <p className="text-muted-foreground text-[11px]">
                 关闭对话框不会取消后端请求；完成后会写入「指纹样本 → 检测记录」。

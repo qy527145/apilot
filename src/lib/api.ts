@@ -1210,12 +1210,14 @@ function normalizeError(err: unknown): ApiError {
 async function call<T>(
   cmd: string,
   args?: Record<string, unknown>,
+  options?: { silent?: boolean },
 ): Promise<T> {
   try {
     return await invoke<T>(cmd, args);
   } catch (err) {
     const e = normalizeError(err);
-    toast.error(e.message);
+    // 批量操作逐条失败时由行内展示错误，逐条 toast 会刷屏。
+    if (!options?.silent) toast.error(e.message);
     throw e;
   }
 }
@@ -1528,13 +1530,18 @@ export const api = {
     model: string,
     parallel = true,
     challengeIds?: string[] | null,
+    silent = false,
   ) =>
-    call<FingerprintDetection>("detect_model_fingerprint", {
-      providerId,
-      model,
-      parallel,
-      challengeIds: challengeIds ?? null,
-    }),
+    call<FingerprintDetection>(
+      "detect_model_fingerprint",
+      {
+        providerId,
+        model,
+        parallel,
+        challengeIds: challengeIds ?? null,
+      },
+      { silent },
+    ),
   fingerprintLibraryInfo: () =>
     call<FingerprintLibraryInfo>("fingerprint_library_info"),
   /** 36 条固定挑战的全文，供手动选择提示词。 */

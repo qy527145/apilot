@@ -24,6 +24,7 @@ import {
   FINGERPRINT_STATUS_LABEL,
   type FingerprintDetection,
 } from "@/lib/api";
+import { candidateShares } from "@/lib/fingerprint";
 
 function probabilityText(value?: number | null) {
   return value == null ? "—" : `${(value * 100).toFixed(1)}%`;
@@ -45,7 +46,14 @@ function levelVariant(level: string) {
  * 检测对话框与历史记录详情共用这个组件；「加入样本库」按检测 id 回查
  * 后端落库的原始回答，所以历史记录里的按钮同样可用。
  */
-export function FingerprintResultView({ result: initial }: { result: FingerprintDetection }) {
+export function FingerprintResultView({
+  result: initial,
+  onUpdated,
+}: {
+  result: FingerprintDetection;
+  /** 单条挑战重试后通知父级（批量列表需要同步摘要）。 */
+  onUpdated?: (result: FingerprintDetection) => void;
+}) {
   const qc = useQueryClient();
   /** 单条挑战重试后要原地更新结果，所以这里保留一份可变状态。 */
   const [result, setResult] = useState(initial);
@@ -73,6 +81,7 @@ export function FingerprintResultView({ result: initial }: { result: Fingerprint
     mutationFn: (index: number) => api.retryFingerprintAttempt(result.id, index),
     onSuccess: (updated) => {
       setResult(updated);
+      onUpdated?.(updated);
       qc.invalidateQueries({ queryKey: qk.fingerprintDetections });
       qc.invalidateQueries({ queryKey: qk.fingerprintDetection(updated.id) });
       toast.success("已重试该挑战并更新检测结果");
@@ -122,25 +131,11 @@ export function FingerprintResultView({ result: initial }: { result: Fingerprint
     return rows;
   })();
 
-  /**
-   * 分数占比：对**全部候选**的分数做 τ=1 的 softmax。
-   *
-   * 它只是把分数压到 0–100% 方便直观比较，不是校准概率：校准温度是按三条
-   * 有效回答拟合的，部分有效时不可用。三条有效时以「置信度」列为准。
-   */
-  const scoreShares = useMemo(() => {
-    const candidates = result.official?.candidates ?? [];
-    if (candidates.length === 0) return new Map<string, number>();
-    const maximum = Math.max(...candidates.map((item) => item.score));
-    const weights = candidates.map((item) => Math.exp(item.score - maximum));
-    const total = weights.reduce((sum, weight) => sum + weight, 0);
-    return new Map(
-      candidates.map((item, index) => [
-        item.model,
-        total > 0 ? weights[index] / total : 0,
-      ]),
-    );
-  }, [result.official]);
+  /** 分数占比；与批量列表共用同一个 τ=1 换算。 */
+  const scoreShares = useMemo(
+    () => candidateShares(result.official?.candidates ?? []),
+    [result.official],
+  );
 
   const acceptedAttempts = result.attempts.filter((attempt) => attempt.accepted);
   const canAdd =
