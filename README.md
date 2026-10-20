@@ -115,7 +115,7 @@ src/            前端（React 19 + Tailwind v4 + shadcn/ui）
 source scripts/msvc-env.sh
 
 cd src-tauri
-cargo test            # 1106 个测试
+cargo test            # 1112 个测试
 cargo build           # 构建二进制
 ```
 

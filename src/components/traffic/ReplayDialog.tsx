@@ -37,6 +37,17 @@ interface Props {
   onOpenChange: (open: boolean) => void;
 }
 
+/**
+ * 「自动」在 Select 里的哨兵值。
+ *
+ * Radix 不接受空字符串作为 `SelectItem` 的值，而 `null` 又表达不了"这个选项
+ * 本身是有效的"。后端把某个值当"未指定"处理即可 —— 真正的判定在
+ * `replay.rs::resolve_provider`。
+ */
+const AUTO_PROVIDER = "__auto__";
+
+const AUTO_HINT = "自动：按模型策略与渠道声明选择；只改模型时会自动换到支持它的渠道。";
+
 /** 内容块里只取能直接读的文字；工具调用给一行占位。 */
 function textOf(content: ContentBlock[] | undefined): string {
   return (content ?? [])
@@ -100,14 +111,16 @@ function Metrics({ items }: { items: [string, string][] }) {
  * 另一个渠道），需要用户先明确选择目标；而详情页是只读视图，不该混进副作用。
  */
 export function ReplayDialog({ detail, open, onOpenChange }: Props) {
-  const [providerTag, setProviderTag] = useState(detail.provider_tag ?? "");
+  // 默认「自动」而不是原渠道：用户最常见的操作是改目标模型，此时原渠道未必
+  // 服务新模型。显式选渠道仍然保留，只是不再是默认。
+  const [providerTag, setProviderTag] = useState(AUTO_PROVIDER);
   const [model, setModel] = useState(detail.model);
 
-  // 换一条请求就把目标恢复成它自己的渠道 / 模型，别把上一条的选择带过来。
+  // 换一条请求就把目标恢复成默认值，别把上一条的选择带过来。
   useEffect(() => {
-    setProviderTag(detail.provider_tag ?? "");
+    setProviderTag(AUTO_PROVIDER);
     setModel(detail.model);
-  }, [detail.request_id, detail.provider_tag, detail.model]);
+  }, [detail.request_id, detail.model]);
 
   const providers = useQuery({
     queryKey: qk.providers,
@@ -127,7 +140,7 @@ export function ReplayDialog({ detail, open, onOpenChange }: Props) {
     mutationFn: () =>
       api.replayRequest(
         detail.request_id,
-        providerTag || null,
+        providerTag === AUTO_PROVIDER ? null : providerTag || null,
         model || null,
       ),
   });
@@ -156,6 +169,7 @@ export function ReplayDialog({ detail, open, onOpenChange }: Props) {
                 <SelectValue placeholder="选择渠道" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value={AUTO_PROVIDER}>自动（按模型选择）</SelectItem>
                 {/* 停用的渠道不在注册表里，选了也只会得到"渠道不存在" ——
                     直接在列表里排除，别让用户先踩一脚。 */}
                 {(providers.data ?? [])
@@ -167,6 +181,11 @@ export function ReplayDialog({ detail, open, onOpenChange }: Props) {
                   ))}
               </SelectContent>
             </Select>
+            <p className="text-muted-foreground text-xs">
+              {providerTag === AUTO_PROVIDER
+                ? AUTO_HINT
+                : "已手动指定渠道；这里不会替你检查它是否声明了目标模型。"}
+            </p>
           </div>
           <div className="space-y-2">
             <Label>目标模型</Label>
@@ -188,7 +207,7 @@ export function ReplayDialog({ detail, open, onOpenChange }: Props) {
           <Button
             size="sm"
             onClick={() => run.mutate()}
-            disabled={run.isPending || !providerTag || !model.trim()}
+            disabled={run.isPending || !model.trim()}
           >
             {run.isPending ? (
               <Loader2 className="size-4 animate-spin" />

@@ -222,8 +222,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 按日志里的入站协议解码 → 换模型（按渠道 `model_mapping` 映射）→ 强制非流式 →
 `oneshot::send_on`。**不写日志、不计费、不查缓存**，所以走的是脱离管线的 oneshot 路径。
 
-目标渠道显式参数优先，否则沿用日志里那条；模型同理。兼容口是 `commands/replay.rs::replay_request`，
-对比 UI 在 `src/components/traffic/ReplayDialog.tsx`。
+目标渠道显式参数优先；选「自动」时由 `resolve_provider` 按**模型策略 > 原渠道（若它声明了目标模型）> 候选渠道**选 —— 只改目标模型时不会傻乎乎地沿用原渠道。模型显式参数优先，否则用日志里的生效模型。兼容口是 `commands/replay.rs::replay_request`，对比 UI 在 `src/components/traffic/ReplayDialog.tsx`。
 
 ### `catalog/` — 上游模型目录（价格 + 能力）
 

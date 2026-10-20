@@ -16,7 +16,7 @@ Tauri 2 + React 19，后端约 21k 行 Rust。
 ```bash
 source scripts/msvc-env.sh     # 每个新 shell 都要执行一次
 cd src-tauri
-cargo test                     # 1106 个测试
+cargo test                     # 1112 个测试
 cargo check --all-targets      # 期望零警告
 cargo build
 ```
@@ -75,7 +75,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **改「渠道的元数据来源 / 自动价格」** | 来源枚举在 `storage/models.rs::MetadataSource`（`auto` = models.dev、`litellm`、`off`）→ 保存渠道/模型声明后由 `commands/providers.rs::upsert_provider` 触发同步 → 实际写价在 `commands/catalog.rs::apply_catalog_prices_for`（**手填价格 `source = NULL` 一律不覆盖**）。手动补同步走 `sync_provider_metadata` |
 | **改「请求 / 响应改写脚本」** | 执行器在 `routing/rewrite_script.rs`，复用 `routing/model_script.rs` 的 QuickJS 引擎（无第二个 runtime）。请求脚本生效点在 `pipeline.rs::handle` 路由之后、**缓存键之前**；改过请求会 `force_encode` 放弃同协议直通。响应脚本只在 `finish_buffered` 里、计费之后生效 —— **真正的流式改不了**。配置是 `AppSettings::request_script` / `response_script` |
 | **改「Anthropic prompt cache 断点注入」** | `protocol/shared/prompt_cache.rs`（纯 JSON 处理，客户端已有断点就整体不碰）→ 只在 `pipeline.rs::try_outbound` 的**跨协议转 Anthropic** 分支调用，开关是 `AppSettings::prompt_cache_injection` |
-| **改「请求回放 / A-B 对比」** | `replay.rs`（解码捕获 → 换渠道/模型 → 非流式重发）+ `commands/replay.rs`。走 `upstream/oneshot.rs::send_on`，**不写日志、不计费、不查缓存**；对比 UI 在 `src/components/traffic/ReplayDialog.tsx` |
+| **改「请求回放 / A-B 对比」** | `replay.rs`（解码捕获 → 换渠道/模型 → 非流式重发）+ `commands/replay.rs`。走 `upstream/oneshot.rs::send_on`，**不写日志、不计费、不查缓存**；目标渠道选「自动」时由 `resolve_provider` 按**模型策略 > 原渠道（若声明了该模型）> 候选渠道**选，别退回"无脑沿用原渠道"——只改目标模型时那会打到一个不服务它的地址上。对比 UI 在 `src/components/traffic/ReplayDialog.tsx` |
 | **改「捕获存储 / 保留条数 / 空间回收」** | 压缩格式与读写都在 `storage/pack.rs`（`APZ1` 魔数 + zstd，旧行无魔数原样读）；`storage/logs.rs` 的 `save_capture` / `get_detail` / `fetch_payloads` 负责压/解；`payload_bytes` 记解压后大小供表达式预算用。保留条数在**流式与非流式两条收尾**都要调 `prune_captures`；数据库用 `auto_vacuum=incremental`，删除后 `db::reclaim_space` 才真正缩文件 |
 | **加一种路由匹配条件** | `routing/rule_item.rs` 加 `RuleItem` 变体（`matches` + `describe` + 测试）→ 前端 `src/components/routing/RuleEditor.tsx` |
 | **加一种路由动作** | `routing/rule.rs::RouteAction`（注意 `is_final` 的归类）→ `routing/engine.rs::route` 的 match → 前端 `ruleSummary.ts` |
