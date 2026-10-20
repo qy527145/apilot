@@ -11,9 +11,11 @@ use crate::error::{AppError, AppResult};
 use crate::protocol::dto::Protocol;
 use crate::shell::AppShell;
 use crate::storage::models::{
-    AuthStyle, ChannelProxy, ProtocolEndpoint, Provider, ProviderKind, ProviderModel,
+    AuthStyle, ChannelProxy, MetadataSource, ProtocolEndpoint, Provider, ProviderKind,
+    ProviderModel,
 };
 use crate::storage::providers::ProviderInput;
+use crate::storage::pricing;
 
 /// 连通性探测结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +36,18 @@ pub async fn upsert_provider(
     shell: State<'_, Arc<AppShell>>,
     input: ProviderInput,
 ) -> AppResult<Provider> {
+    // 保存前的快照：判断"这次保存有没有改变元数据来源 / 模型集合"要用它，
+    // 保存之后旧值就没了。取不到（新建、或并发删除）时按新建处理。
+    let is_new = input.id.is_none();
+    let old = match input.id {
+        Some(id) => crate::storage::providers::get(&shell.db, id).await?,
+        None => None,
+    };
+    let old_models = match &old {
+        Some(p) => declared_models(&shell.db, p.id).await?,
+        None => Vec::new(),
+    };
+
     let saved = crate::storage::providers::upsert(&shell.db, &input).await?;
 
     // 记下用的是哪个密钥（打码）—— 排查"为什么 401"时，
@@ -71,7 +85,97 @@ pub async fn upsert_provider(
     }
     let _ = sel_inputs;
 
+    // 渠道绑定的目录来源变了、或者模型集合变了，才去同步价格。
+    // 每次都同步意味着改个名字也要联网拉一次几千条的目录 —— 用户在离线环境
+    // 里编辑渠道会莫名其妙卡上几十秒。失败只 warn：网络问题不该让保存失败。
+    let saved_models = declared_models(&shell.db, saved.id).await?;
+    let old_source = old.as_ref().map(|p| p.metadata_source).unwrap_or_default();
+    if should_sync_catalog(is_new, old_source, saved.metadata_source, &old_models, &saved_models) {
+        if let Some(source) = saved.metadata_source.catalog_source() {
+            sync_catalog_prices(shell.inner(), &saved.tag, source, &saved_models).await;
+        }
+    }
+
     Ok(saved)
+}
+
+/// 该渠道声明过的模型名。读的是 `provider_models`（真源），不是派生列。
+async fn declared_models(
+    pool: &sqlx::SqlitePool,
+    provider_id: i64,
+) -> AppResult<Vec<String>> {
+    Ok(crate::storage::providers::list_models(pool, provider_id)
+        .await?
+        .into_iter()
+        .map(|m| m.model)
+        .collect())
+}
+
+/// 这次保存要不要顺带同步目录价格。
+///
+/// 判据刻意收得很窄：
+/// - 来源是 `Off` / `Unknown` 时永远不同步（用户明确说"别碰我的价格"）；
+/// - 新建渠道同步一次，让预设渠道天然带上目录价格；
+/// - 更新时只在来源或模型集合真的变了才同步 —— 改个名字不该触发下载。
+fn should_sync_catalog(
+    is_new: bool,
+    old_source: MetadataSource,
+    saved_source: MetadataSource,
+    old_models: &[String],
+    saved_models: &[String],
+) -> bool {
+    if saved_source.catalog_source().is_none() {
+        return false;
+    }
+    is_new || old_source != saved_source || old_models != saved_models
+}
+
+/// 同步一次目录价格，失败只记日志。
+///
+/// 自动同步（保存渠道 / 保存模型声明）走这条路：目录拉不下来是网络问题，
+/// 不该让"改个渠道"整个失败 —— 用户看到保存按钮报错，会以为配置本身有问题。
+/// 需要把错误呈现给用户时走显式的 `sync_provider_metadata` 命令。
+async fn sync_catalog_prices(
+    shell: &Arc<AppShell>,
+    tag: &str,
+    source: crate::catalog::CatalogSource,
+    models: &[String],
+) {
+    let started = Instant::now();
+
+    // **不能让保存动作陪着下载目录一起等**。目录请求本身有 45 秒超时，离线或
+    // 代理不通时保存按钮就会转上大半天 —— 用户会以为配置写错了。这里最多等 5 秒，
+    // 超时就放弃这次自动同步；渠道已经保存成功，价格可以稍后点「同步价格」补。
+    let synced = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::commands::catalog::apply_catalog_prices_for(shell, source, models),
+    )
+    .await;
+
+    match synced {
+        Ok(Ok(stats)) => tracing::info!(
+            tag = %tag,
+            source = source.label(),
+            inserted = stats.inserted,
+            updated = stats.updated,
+            kept_user_owned = stats.kept_user_owned,
+            elapsed_ms = started.elapsed().as_millis() as i64,
+            "目录价格已同步"
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            tag = %tag,
+            source = source.label(),
+            elapsed_ms = started.elapsed().as_millis() as i64,
+            error = %e,
+            "目录价格同步失败（渠道本身已保存）"
+        ),
+        Err(_) => tracing::warn!(
+            tag = %tag,
+            source = source.label(),
+            elapsed_ms = started.elapsed().as_millis() as i64,
+            "目录价格同步超时，已跳过（渠道本身已保存；可在渠道行点「同步价格」重试）"
+        ),
+    }
 }
 
 #[tauri::command]
@@ -414,6 +518,8 @@ impl ProtocolDetectInput {
             enabled: true,
             timeout_ms: PROBE_TIMEOUT.as_millis() as i64,
             proxy: self.proxy.clone(),
+            // 只是拿去拼 URL / 塞鉴权头，不落库也不触发目录同步。
+            metadata_source: MetadataSource::Auto,
             created_at: 0,
             updated_at: 0,
         }
@@ -610,19 +716,59 @@ pub async fn set_provider_models(
     models: Vec<String>,
 ) -> AppResult<()> {
     // 先确认渠道存在，否则外键会在写入时才报错，错误信息不够直白。
-    if crate::storage::providers::get(&shell.db, provider_id)
-        .await?
-        .is_none()
-    {
+    // 顺带把来源取出来：模型集合变了之后要按它决定同不同步价格。
+    let Some(provider) = crate::storage::providers::get(&shell.db, provider_id).await? else {
         return Err(AppError::ProviderNotFound(provider_id.to_string()));
-    }
+    };
 
     crate::storage::providers::set_models(&shell.db, provider_id, &models).await?;
 
     // 映射会同步进 providers.model_mapping，而请求改写读的是内存里 Channel 持有的
     // Provider 快照 —— 不重载的话新映射要等重启才生效。
     shell.reload_providers().await?;
+
+    // 声明了新模型 = 新增了"需要价格"的模型。没声明过价格的会一直走兜底倍率，
+    // 而兜底倍率通常不等于该模型的真实价 —— 这正是用户勾完模型最想避免的情况。
+    if let Some(source) = provider.metadata_source.catalog_source() {
+        let saved_models = declared_models(&shell.db, provider_id).await?;
+        sync_catalog_prices(shell.inner(), &provider.tag, source, &saved_models).await;
+    }
     Ok(())
+}
+
+/// 按渠道绑定的来源立刻同步一次目录价格。
+///
+/// 与保存时的自动同步分开：这个是用户显式点的"立即同步"，所以错误要往上抛
+/// （界面需要告诉用户这次没成功），而 `Off` 渠道不联网、直接回全零统计 ——
+/// 界面按"没有可同步的东西"处理，比弹一个红字错误更贴切。
+#[tauri::command]
+pub async fn sync_provider_metadata(
+    shell: State<'_, Arc<AppShell>>,
+    id: i64,
+) -> AppResult<pricing::PriceImportStats> {
+    let provider = crate::storage::providers::get(&shell.db, id)
+        .await?
+        .ok_or_else(|| AppError::ProviderNotFound(id.to_string()))?;
+
+    let Some(source) = provider.metadata_source.catalog_source() else {
+        tracing::info!(tag = %provider.tag, "该渠道的元数据来源为 off，跳过目录同步");
+        return Ok(pricing::PriceImportStats::default());
+    };
+
+    let models = declared_models(&shell.db, provider.id).await?;
+    let started = Instant::now();
+    let stats = crate::commands::catalog::apply_catalog_prices_for(shell.inner(), source, &models)
+        .await?;
+    tracing::info!(
+        tag = %provider.tag,
+        source = source.label(),
+        inserted = stats.inserted,
+        updated = stats.updated,
+        kept_user_owned = stats.kept_user_owned,
+        elapsed_ms = started.elapsed().as_millis() as i64,
+        "目录价格已按渠道来源同步"
+    );
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -631,6 +777,70 @@ mod tests {
 
     fn parse(s: &str) -> Result<Vec<String>, String> {
         parse_models_response(s.as_bytes())
+    }
+
+    // ---- 保存渠道时要不要同步目录价格 ----
+
+    #[test]
+    fn a_new_channel_bound_to_a_catalog_syncs_its_prices() {
+        // 预设渠道天然和目录绑定：建完就该有价格，用户不必再去找"更新价格"。
+        assert!(should_sync_catalog(
+            true,
+            MetadataSource::Auto,
+            MetadataSource::Auto,
+            &[],
+            &["m".into()]
+        ));
+    }
+
+    #[test]
+    fn a_channel_marked_off_never_syncs_even_when_its_models_change() {
+        // Off 是明确指令："价格我自己填"。自动同步覆盖不了用户手填的行（source=None），
+        // 但白拉一次几千条的目录仍然是浪费，而且会让人以为它"会跟着变"。
+        assert!(!should_sync_catalog(
+            true,
+            MetadataSource::Off,
+            MetadataSource::Off,
+            &[],
+            &["m".into()]
+        ));
+        assert!(!should_sync_catalog(
+            false,
+            MetadataSource::Auto,
+            MetadataSource::Off,
+            &["a".into()],
+            &["b".into()]
+        ));
+    }
+
+    #[test]
+    fn saving_without_changing_the_source_or_models_does_not_hit_the_network() {
+        // 改个名字、改个超时都会走 upsert_provider；每次都下载目录会让离线编辑卡住。
+        assert!(!should_sync_catalog(
+            false,
+            MetadataSource::Auto,
+            MetadataSource::Auto,
+            &["a".into(), "b".into()],
+            &["a".into(), "b".into()]
+        ));
+    }
+
+    #[test]
+    fn changing_either_the_source_or_the_model_set_triggers_a_sync() {
+        assert!(should_sync_catalog(
+            false,
+            MetadataSource::Auto,
+            MetadataSource::LiteLlm,
+            &["a".into()],
+            &["a".into()]
+        ));
+        assert!(should_sync_catalog(
+            false,
+            MetadataSource::Auto,
+            MetadataSource::Auto,
+            &["a".into()],
+            &["a".into(), "b".into()]
+        ));
     }
 
     #[test]
@@ -720,6 +930,7 @@ mod tests {
             enabled: true,
             timeout_ms: 60_000,
             proxy: Default::default(),
+            metadata_source: MetadataSource::Auto,
             created_at: 0,
             updated_at: 0,
         };

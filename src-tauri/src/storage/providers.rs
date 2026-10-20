@@ -6,7 +6,8 @@ use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
 use super::models::{
-    AuthStyle, ChannelProxy, ProtocolEndpoint, Provider, ProviderKind, ProviderModel,
+    AuthStyle, ChannelProxy, MetadataSource, ProtocolEndpoint, Provider, ProviderKind,
+    ProviderModel,
 };
 use crate::error::{AppError, AppResult};
 use crate::util::now_ms;
@@ -40,6 +41,10 @@ pub struct ProviderInput {
     /// 该渠道走不走代理。省略表示跟随全局。
     #[serde(default)]
     pub proxy: ChannelProxy,
+    /// 模型元数据（含价格）的来源。省略表示 `auto`（models.dev）——
+    /// 预设渠道、以及不认识这个字段的旧前端都走这条路。
+    #[serde(default)]
+    pub metadata_source: MetadataSource,
 }
 
 fn default_auth_style() -> AuthStyle {
@@ -139,7 +144,7 @@ async fn unique_tag(pool: &SqlitePool, base: &str) -> AppResult<String> {
 
 const SELECT_COLUMNS: &str = "id, tag, name, kind, base_url, api_key, auth_style, \
      protocols, extra_headers, param_override, model_mapping, weight, priority, enabled, \
-     timeout_ms, proxy, created_at, updated_at";
+     timeout_ms, proxy, metadata_source, created_at, updated_at";
 
 fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Provider {
     let json_map = |s: String| -> IndexMap<String, String> {
@@ -170,6 +175,13 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Provider {
         proxy: row
             .get::<Option<String>, _>("proxy")
             .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        // 列上有 NOT NULL DEFAULT 'auto'，但读侧不依赖它：手工改库、或以后换枚举
+        // 都可能留下认不出的值。`parse` 把非法值折回 Auto，比整条渠道读不出来好。
+        metadata_source: row
+            .get::<Option<String>, _>("metadata_source")
+            .as_deref()
+            .map(MetadataSource::parse)
             .unwrap_or_default(),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
@@ -236,8 +248,8 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
                      api_key = COALESCE(?4, api_key), auth_style=?5, protocols=?6,
                      extra_headers=?7, param_override=?8, weight=?9,
                      priority=?10, enabled=?11, timeout_ms=?12, updated_at=?13,
-                     proxy=?14
-                 WHERE id=?15",
+                     proxy=?14, metadata_source=?15
+                 WHERE id=?16",
             )
             .bind(&input.name)
             .bind(input.kind.as_str())
@@ -253,6 +265,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(input.timeout_ms)
             .bind(now)
             .bind(&proxy)
+            .bind(input.metadata_source.as_str())
             .bind(id)
             .execute(pool)
             .await?;
@@ -267,8 +280,8 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             let result = sqlx::query(
                 "INSERT INTO providers (tag, name, kind, base_url, api_key, auth_style,
                      protocols, extra_headers, param_override, weight, priority,
-                     enabled, timeout_ms, created_at, updated_at, proxy)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,?15)",
+                     enabled, timeout_ms, created_at, updated_at, proxy, metadata_source)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,?15,?16)",
             )
             .bind(&tag)
             .bind(&input.name)
@@ -285,6 +298,7 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(input.timeout_ms)
             .bind(now)
             .bind(&proxy)
+            .bind(input.metadata_source.as_str())
             .execute(pool)
             .await
             .map_err(|e| {
@@ -719,6 +733,7 @@ mod tests {
             enabled: true,
             timeout_ms: 600_000,
             proxy: Default::default(),
+            metadata_source: MetadataSource::Auto,
         }
     }
 
@@ -1174,6 +1189,61 @@ mod tests {
             .unwrap();
 
         assert_eq!(all_declared_models(&p).await.unwrap(), vec!["a", "z"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 元数据来源
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn metadata_source_roundtrips_through_the_database() {
+        let p = pool().await;
+        let mut i = input("meta");
+        i.metadata_source = MetadataSource::LiteLlm;
+        let created = upsert(&p, &i).await.unwrap();
+        assert_eq!(created.metadata_source, MetadataSource::LiteLlm);
+
+        let read = get(&p, created.id).await.unwrap().unwrap();
+        assert_eq!(
+            read.metadata_source,
+            MetadataSource::LiteLlm,
+            "重新读出来必须还是那个来源，否则重启后渠道会悄悄改回 models.dev"
+        );
+
+        // 更新也要写这一列：切到 Off 之后再读回来必须还是 Off。
+        let mut upd = input("meta");
+        upd.id = Some(created.id);
+        upd.metadata_source = MetadataSource::Off;
+        let saved = upsert(&p, &upd).await.unwrap();
+        assert_eq!(saved.metadata_source, MetadataSource::Off);
+        assert_eq!(
+            get(&p, created.id).await.unwrap().unwrap().metadata_source,
+            MetadataSource::Off
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_created_without_a_metadata_source_defaults_to_auto() {
+        // 预设渠道、以及不认识这个字段的旧前端都不传它 —— 必须落到 auto。
+        let p = pool().await;
+        let created = upsert(&p, &input("legacy")).await.unwrap();
+        assert_eq!(created.metadata_source, MetadataSource::Auto);
+    }
+
+    #[tokio::test]
+    async fn an_unrecognized_metadata_source_in_the_database_reads_as_auto() {
+        // 手工改库 / 未来枚举变更都可能留下认不出的值。读不出来会让整条渠道
+        // 从列表里消失；折回 auto 至少保住渠道本身。
+        let p = pool().await;
+        let created = upsert(&p, &input("dirty")).await.unwrap();
+        sqlx::query("UPDATE providers SET metadata_source = 'garbage' WHERE id = ?1")
+            .bind(created.id)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        let read = get(&p, created.id).await.unwrap().unwrap();
+        assert_eq!(read.metadata_source, MetadataSource::Auto);
     }
 
     // -----------------------------------------------------------------------

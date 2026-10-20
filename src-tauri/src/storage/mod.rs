@@ -7,6 +7,7 @@ pub mod logs;
 pub mod migrations;
 pub mod model_policies;
 pub mod models;
+pub mod pack;
 pub mod pricing;
 pub mod providers;
 pub mod routing;

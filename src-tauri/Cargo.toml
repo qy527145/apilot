@@ -103,11 +103,19 @@ toml_edit = "0.22"
 notify = "8"
 notify-debouncer-full = "0.7"
 
+# --- 压缩 ---
+# 捕获原文按 zstd 落库：请求体是同一段对话历史的重复 JSON，压缩比通常 5～10 倍。
+# 用同步 API 而不是 async-compression：压缩发生在已经脱离响应路径的后台任务里，
+# 每次几毫秒，没必要为它引入一层 async 流。
+zstd = "0.14"
+
 # --- 错误与日志 ---
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 打包后的窗口程序没有控制台，日志只写 stderr 等于丢掉。见 `lib.rs::init_tracing`。
+tracing-appender = "0.2"
 
 # --- 用户脚本（模型自定义规则）---
 # QuickJS 由 rquickjs-sys 用 cc 从自带的 C 源码现编，所以每个新 shell 都必须先

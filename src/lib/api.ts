@@ -13,6 +13,22 @@ export type Protocol = "anthropic" | "openai_chat" | "openai_responses";
 export type ProviderKind = "anthropic" | "openai_chat" | "openai_responses";
 export type AuthStyle = "bearer" | "x-api-key" | "none";
 
+/**
+ * 渠道的模型元数据（价格 / 能力）来源。
+ *
+ * - `auto`：默认，等价 models.dev；从预设添加的渠道天然应该绑定目录。
+ * - `models_dev` / `litellm`：明确指定目录来源。
+ * - `off`：不自动同步，价格全靠手填。
+ */
+export type MetadataSource = "auto" | "models_dev" | "litellm" | "off";
+
+export const METADATA_SOURCE_LABEL: Record<MetadataSource, string> = {
+  auto: "自动（models.dev）",
+  models_dev: "models.dev",
+  litellm: "LiteLLM",
+  off: "不自动同步",
+};
+
 /** 渠道级代理怎么选。与后端 `ChannelProxyMode` 一一对应。 */
 export type ChannelProxyMode = "inherit" | "direct" | "manual";
 
@@ -88,6 +104,8 @@ export interface ProviderInput {
   timeout_ms: number;
   /** 该渠道走不走代理。省略表示跟随全局设置。 */
   proxy?: ChannelProxy;
+  /** 模型元数据来源。省略 = `auto`（models.dev）。 */
+  metadata_source?: MetadataSource;
 }
 
 export interface Provider {
@@ -107,6 +125,8 @@ export interface Provider {
   enabled: boolean;
   timeout_ms: number;
   proxy: ChannelProxy;
+  /** 模型元数据来源。保存渠道后会按它自动同步价格。 */
+  metadata_source: MetadataSource;
   created_at: number;
   updated_at: number;
 }
@@ -325,6 +345,15 @@ export interface AppSettings {  listen_host: string;
   thinking_mode: ThinkingMode;
   /** 全局出站代理。默认 `mode: "system"`（跟随环境变量）。 */
   proxy: ProxySettings;
+  /**
+   * 跨协议转 Anthropic 时自动打 prompt cache 断点。默认开。
+   * 直通请求不碰（客户端自己的断点原样保留）。
+   */
+  prompt_cache_injection: boolean;
+  /** 请求改写脚本（JS）。空 = 不改写。 */
+  request_script: string;
+  /** 响应改写脚本（JS，仅非流式）。空 = 不改写。 */
+  response_script: string;
 }
 
 /* ------------------------------ 路由规则 ------------------------------ */
@@ -920,6 +949,32 @@ export interface RequestDetail extends RequestLog {
   views: DetailViews;
 }
 
+/* --------------------------- 请求回放 / A-B 对比 --------------------------- */
+
+/**
+ * 一次回放的结果。**不计费、不写日志** —— 这是用户主动做的对比实验，
+ * 不应污染真实用量。
+ */
+export interface ReplayOutcome {
+  ok: boolean;
+  request_id: string;
+  provider_tag: string;
+  provider_name: string;
+  /** 入站模型名（客户端视角）。 */
+  model: string;
+  /** 渠道映射后真正发出去的名字。 */
+  upstream_model: string;
+  wire: Protocol;
+  url: string;
+  status?: number | null;
+  latency_ms: number;
+  text: string;
+  /** 解出来的完整内容块（含思考 / 工具调用）。 */
+  content: ContentBlock[];
+  usage?: UnifiedUsage | null;
+  error?: string | null;
+}
+
 /* --------------------------- 客户端接管 --------------------------- */
 
 export interface ClientDetect {
@@ -943,6 +998,8 @@ export interface AppInfo {
   version: string;
   apilot_home: string;
   db_path: string;
+  /** 日志目录：`~/.apilot/logs`。 */
+  log_dir: string;
   started_at: number;
 }
 
@@ -1161,6 +1218,13 @@ export const api = {
    */
   detectProviderProtocols: (input: ProtocolDetectInput) =>
     call<ProtocolDetection[]>("detect_provider_protocols", { input }),
+  /**
+   * 按渠道的元数据来源立刻同步一次价格。来源为 `off` 时返回全零统计。
+   *
+   * 保存渠道时后端已经自动同步；这个命令用于目录更新后手动补一次。
+   */
+  syncProviderMetadata: (id: number) =>
+    call<PriceImportStats>("sync_provider_metadata", { id }),
 
   /* ---- 上游目录：价格与能力共用同一个网络集成 ---- */
   /**
@@ -1277,6 +1341,22 @@ export const api = {
   /** 删除单条请求明细及其原文捕获。计费聚合不受影响。 */
   deleteLog: (requestId: string) =>
     call<ClearResult>("delete_log", { requestId }),
+  /**
+   * 把一条捕获过的请求重发到指定渠道 / 模型，供 A/B 对比。
+   *
+   * **不写日志、不计费、不查缓存**；一律按非流式发，才能拿到完整回答并排比较。
+   * 这是一次真实出站请求 —— 请求内容会发送到所选渠道。
+   */
+  replayRequest: (
+    requestId: string,
+    providerTag?: string | null,
+    model?: string | null,
+  ) =>
+    call<ReplayOutcome>("replay_request", {
+      requestId,
+      providerTag: providerTag ?? null,
+      model: model ?? null,
+    }),
 
   /* -------------------------- 模型（模型视角） -------------------------- */
 
@@ -1286,6 +1366,9 @@ export const api = {
   /** 校验一段模型脚本；null 表示可用，否则是给用户看的错因。 */
   validateModelScript: (source: string) =>
     call<string | null>("validate_model_script", { source }),
+  /** 校验一段请求 / 响应改写脚本；null 表示可用。 */
+  validateRewriteScript: (source: string) =>
+    call<string | null>("validate_rewrite_script", { source }),
 
   listModelCatalog: () => call<ModelCatalogEntry[]>("list_model_catalog"),
   listModelOptions: () => call<ModelOption[]>("list_model_options"),

@@ -475,6 +475,28 @@ CREATE TABLE IF NOT EXISTS session_titles (
     r#"
 ALTER TABLE session_titles ADD COLUMN source TEXT NOT NULL DEFAULT 'first_line';
 "#,
+    // --- v15: 捕获原文的**解压后**字节数 ---
+    //
+    // 捕获正文从 v15 起按 zstd 落库（见 `storage/pack.rs`）。`length()` 读到的是
+    // 压缩后的大小，而表达式筛选的读取预算（`PAYLOAD_FETCH_BUDGET`）必须按解压后
+    // 的规模算 —— 否则一份压到 1/10 的 1MB 报文会被当成 100KB，预算放行十倍内存。
+    //
+    // 老行留 0 表示"没有记录"，读取时回落到 `length()` 相加；它们本来就没压缩，
+    // 两者相等。不回填：给现存几万行逐行解压一遍，启动成本远大于收益。
+    r#"
+ALTER TABLE captures ADD COLUMN payload_bytes INTEGER NOT NULL DEFAULT 0;
+"#,
+    // --- v16: 渠道的元数据来源 ---
+    //
+    // 价格不是"每个模型手填"而是"跟着模型元数据走"：从预设添加的渠道天然应该
+    // 绑定目录（models.dev / LiteLLM），自定义渠道可以选「不自动同步」并手填。
+    //
+    // 存渠道上而不是模型上：同一份目录查询按渠道声明过的模型过滤，一个渠道
+    // 一个来源最直观；模型名本身仍可在价格页单独覆盖（`source = NULL` 即用户手填，
+    // 自动同步一律不碰）。老渠道默认 `auto`，下次保存或手动同步时补上价格。
+    r#"
+ALTER TABLE providers ADD COLUMN metadata_source TEXT NOT NULL DEFAULT 'auto';
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -486,7 +508,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(SCHEMA_VERSION, 16);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

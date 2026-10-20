@@ -16,7 +16,7 @@ Tauri 2 + React 19，后端约 21k 行 Rust。
 ```bash
 source scripts/msvc-env.sh     # 每个新 shell 都要执行一次
 cd src-tauri
-cargo test                     # 856 个测试
+cargo test                     # 1106 个测试
 cargo check --all-targets      # 期望零警告
 cargo build
 ```
@@ -72,6 +72,11 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **改「接管思考」（是否思考 / 思考深度）** | 唯一真源是 `config/settings.rs::ThinkingMode`（一个全局档位，客户端页那个下拉）→ `AppSettings::apply_thinking` 在 `gateway/pipeline.rs::handle` 里写进 IR（**必须在缓存键之前**）→ 同协议直通再拿**同一份**去改原始 body（`patch_outbound_body`）。它改的是请求参数，**不写客户端配置**，所以每请求生效、不用重新接管。同协议那三个键分别是 `thinking` / `reasoning_effort` / `reasoning.effort` |
 | **改「用哪个渠道」（服务商）** | `routing/model_select.rs::order`（按模型策略排序）+ `gateway/pipeline.rs::build_candidates`（未配策略时回落 selector）。**优先级是「模型策略 > selector」，别反过来**。策略存在 `model_policies` 表，界面上在**路由页**改 |
 | **改计费公式** | `billing/engine.rs::settle`（唯一真源）→ 对应更新其测试；倍率字段在 `billing/pricing.rs` |
+| **改「渠道的元数据来源 / 自动价格」** | 来源枚举在 `storage/models.rs::MetadataSource`（`auto` = models.dev、`litellm`、`off`）→ 保存渠道/模型声明后由 `commands/providers.rs::upsert_provider` 触发同步 → 实际写价在 `commands/catalog.rs::apply_catalog_prices_for`（**手填价格 `source = NULL` 一律不覆盖**）。手动补同步走 `sync_provider_metadata` |
+| **改「请求 / 响应改写脚本」** | 执行器在 `routing/rewrite_script.rs`，复用 `routing/model_script.rs` 的 QuickJS 引擎（无第二个 runtime）。请求脚本生效点在 `pipeline.rs::handle` 路由之后、**缓存键之前**；改过请求会 `force_encode` 放弃同协议直通。响应脚本只在 `finish_buffered` 里、计费之后生效 —— **真正的流式改不了**。配置是 `AppSettings::request_script` / `response_script` |
+| **改「Anthropic prompt cache 断点注入」** | `protocol/shared/prompt_cache.rs`（纯 JSON 处理，客户端已有断点就整体不碰）→ 只在 `pipeline.rs::try_outbound` 的**跨协议转 Anthropic** 分支调用，开关是 `AppSettings::prompt_cache_injection` |
+| **改「请求回放 / A-B 对比」** | `replay.rs`（解码捕获 → 换渠道/模型 → 非流式重发）+ `commands/replay.rs`。走 `upstream/oneshot.rs::send_on`，**不写日志、不计费、不查缓存**；对比 UI 在 `src/components/traffic/ReplayDialog.tsx` |
+| **改「捕获存储 / 保留条数 / 空间回收」** | 压缩格式与读写都在 `storage/pack.rs`（`APZ1` 魔数 + zstd，旧行无魔数原样读）；`storage/logs.rs` 的 `save_capture` / `get_detail` / `fetch_payloads` 负责压/解；`payload_bytes` 记解压后大小供表达式预算用。保留条数在**流式与非流式两条收尾**都要调 `prune_captures`；数据库用 `auto_vacuum=incremental`，删除后 `db::reclaim_space` 才真正缩文件 |
 | **加一种路由匹配条件** | `routing/rule_item.rs` 加 `RuleItem` 变体（`matches` + `describe` + 测试）→ 前端 `src/components/routing/RuleEditor.tsx` |
 | **加一种路由动作** | `routing/rule.rs::RouteAction`（注意 `is_final` 的归类）→ `routing/engine.rs::route` 的 match → 前端 `ruleSummary.ts` |
 | **加一个 Tauri 命令** | 在 `commands/<域>.rs` 写 → `lib.rs` 的 `generate_handler!` 用**完整路径**（不能 re-export）→ 前端 `src/lib/api.ts` |
@@ -81,6 +86,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **改 SSE 处理** | `gateway/sse.rs`（原语）→ `gateway/stream.rs`（转发管线） |
 | **加数据库表/字段** | `storage/migrations.rs` **追加**一条迁移（不要改已发布的），同步 `docs/CODE_MAP.md` |
 | **改前端页面** | `src/pages/<Name>Page.tsx` + `src/lib/api.ts` 的类型与封装 |
+| **改日志落盘** | `lib.rs::init_tracing`（stdout + `~/.apilot/logs` 按天滚动、保留 7 天、panic hook 带 backtrace）+ `config/paths.rs::log_dir`。**打包后的窗口程序没有控制台**，文件日志是唯一现场 |
 
 ## 铁律
 

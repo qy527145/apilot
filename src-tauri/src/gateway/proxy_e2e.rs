@@ -165,6 +165,7 @@ fn provider(base_url: &str, kind: ProviderKind) -> Provider {
         enabled: true,
         timeout_ms: 30_000,
         proxy: Default::default(),
+        metadata_source: Default::default(),
         created_at: 0,
         updated_at: 0,
     }

@@ -38,6 +38,14 @@ pub fn backups_dir() -> PathBuf {
     apilot_home().join("backups")
 }
 
+/// 日志目录：`~/.apilot/logs`。
+///
+/// 打包后的窗口程序没有控制台，stderr 里的日志用户看不到 —— 出问题时唯一能
+/// 拿到现场的就是这里。按天滚动，由 `lib.rs::init_tracing` 维护。
+pub fn log_dir() -> PathBuf {
+    apilot_home().join("logs")
+}
+
 /// 接管写入前的字节级首次备份目录。
 ///
 /// 每个客户端文件仅备份一次，保证「一键还原」始终能回到用户最初的样子。

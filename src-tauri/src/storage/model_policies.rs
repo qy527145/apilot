@@ -108,6 +108,7 @@ mod tests {
                 enabled: true,
                 timeout_ms: 60_000,
                 proxy: Default::default(),
+                metadata_source: Default::default(),
             },
         )
         .await

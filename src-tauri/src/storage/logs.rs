@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, SqlitePool};
 
+use super::{db, pack};
 use crate::error::AppResult;
 // `Row` 已经被 sqlx 占了，这里给表达式的行另起一个名字，免得读的人以为
 // 「行」是数据库行 —— 它其实是喂给 JS 求值器的一行。
@@ -500,18 +501,30 @@ async fn fetch_payloads(pool: &SqlitePool, ids: &[&str]) -> AppResult<HashMap<St
 
 /// 这几行的捕获各有多大（字节）。第二趟据此决定能带上多少行。
 ///
-/// 只取长度不取内容：`length()` 读的是记录头里的字段宽度，不会把几 MB 的 BLOB
-/// 拖出来 —— 否则这个「先看看有多大」的查询自己就先把内存吃掉了。
+/// 只取长度不取内容：`length()` 与读整列都走记录头里的字段宽度，不会把几 MB
+/// 的 BLOB 拖出来 —— 否则这个「先看看有多大」的查询自己就先把内存吃掉了。
+///
+/// v15 起正文列是压缩过的，`length()` 给的是**压缩后**的大小，直接拿它做预算
+/// 会让一份压到 1/10 的报文被当成只有十分之一 —— 解压时实际占的内存是它的十倍。
+/// 所以新行读 `payload_bytes`（落库时记下的解压后总字节数）。
+///
+/// 两边的口径必须一致：`payload_bytes` **已经包含**四份 headers 的 JSON 文本，
+/// 所以 CASE 的 THEN 分支不再加一次；ELSE 是 v15 之前的老行（那时没有这一列，
+/// 默认 0，且正文本来就是未压缩的），沿用原来的 `length()` 相加并对齐地补上
+/// 四个 headers。老行不回填：给几万行逐行解压算一遍，启动成本远大于收益。
 async fn fetch_payload_sizes(pool: &SqlitePool, ids: &[&str]) -> AppResult<HashMap<String, usize>> {
     let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
-        "SELECT request_id, coalesce(length(request_body), 0) \
-             + coalesce(length(response_body), 0) + coalesce(length(stream_text), 0) \
-             + coalesce(length(upstream_body), 0) \
-             + coalesce(length(upstream_response_body), 0) \
-             + coalesce(length(request_headers), 0) \
-             + coalesce(length(response_headers), 0) \
-             + coalesce(length(upstream_headers), 0) \
-             + coalesce(length(upstream_response_headers), 0) AS bytes \
+        "SELECT request_id, \
+             CASE WHEN payload_bytes > 0 THEN payload_bytes ELSE \
+                 coalesce(length(request_body), 0) \
+                 + coalesce(length(response_body), 0) + coalesce(length(stream_text), 0) \
+                 + coalesce(length(upstream_body), 0) \
+                 + coalesce(length(upstream_response_body), 0) \
+                 + coalesce(length(request_headers), 0) \
+                 + coalesce(length(response_headers), 0) \
+                 + coalesce(length(upstream_headers), 0) \
+                 + coalesce(length(upstream_response_headers), 0) \
+             END AS bytes \
          FROM captures WHERE request_id IN (",
     );
     push_in_list(&mut qb, ids);
@@ -602,11 +615,15 @@ fn expr_payload(r: &sqlx::sqlite::SqliteRow) -> Payload {
         response_headers: r.get::<Option<String>, _>("c_response_headers"),
         upstream_request_headers: r.get::<Option<String>, _>("c_upstream_headers"),
         upstream_response_headers: r.get::<Option<String>, _>("c_upstream_response_headers"),
-        request_body: r.get::<Option<Vec<u8>>, _>("c_request_body"),
-        response_body: r.get::<Option<Vec<u8>>, _>("c_response_body"),
+        // 正文列按需解压 —— 表达式可能一个 body 都不读，那就不该为它解压。
+        request_body: pack::unpack(r.get::<Option<Vec<u8>>, _>("c_request_body")),
+        response_body: pack::unpack(r.get::<Option<Vec<u8>>, _>("c_response_body")),
+        // headers 与 stream_text 按文本原样存，没有压缩。
         response_stream_text: r.get::<Option<String>, _>("c_stream_text"),
-        upstream_request_body: r.get::<Option<Vec<u8>>, _>("c_upstream_body"),
-        upstream_response_body: r.get::<Option<Vec<u8>>, _>("c_upstream_response_body"),
+        upstream_request_body: pack::unpack(r.get::<Option<Vec<u8>>, _>("c_upstream_body")),
+        upstream_response_body: pack::unpack(
+            r.get::<Option<Vec<u8>>, _>("c_upstream_response_body"),
+        ),
     }
 }
 
@@ -856,7 +873,44 @@ pub struct CaptureRecord {
     pub stream_timings: Option<String>,
 }
 
+/// 写入一次捕获。六个正文列按 `storage::pack` 压缩后落库，headers 与
+/// `stream_text` 保持文本原样（表达式筛选要按文本读它们，压缩只会让每次
+/// 求值多一次解压，而它们本来就不大）。
 pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()> {
+    let request_headers = serde_json::to_string(&c.request_headers)?;
+    let upstream_headers = serde_json::to_string(&c.upstream.headers)?;
+    let upstream_response_headers = serde_json::to_string(&c.upstream.response_headers)?;
+    let response_headers = serde_json::to_string(&c.response_headers)?;
+
+    // 先压好再量尺寸：`unpacked_len` 读的是落库那份数据自己的头，
+    // 于是「记下的 payload_bytes」与「实际存进去的字节」天然一致。
+    let request_body = pack::pack(c.request_body.clone());
+    let upstream_body = pack::pack(c.upstream.body.clone());
+    let upstream_response_body = pack::pack(c.upstream.response_body.clone());
+    let response_body = pack::pack(c.response_body.clone());
+    let upstream_stream_raw = pack::pack(c.upstream_stream_raw.clone());
+    let client_stream_raw = pack::pack(c.client_stream_raw.clone());
+
+    // 解压后的总字节数，给表达式筛选的读取预算用（见 `fetch_payload_sizes`）。
+    //
+    // 口径与 `fetch_payload_sizes` 的原实现逐项对齐：表达式能读到的五个正文列
+    // 加 `stream_text` 的文本字节，再加四份 headers 的 JSON 文本字节。**不含**
+    // 两个 `*_stream_raw` —— 表达式看不见它们，算进来只会让预算无故收紧。
+    // 两个 `*_stream_raw` 仍然会压缩，只是不参与这个计数。
+    let payload_bytes = [
+        pack::unpacked_len(request_body.as_deref()),
+        pack::unpacked_len(response_body.as_deref()),
+        pack::unpacked_len(upstream_body.as_deref()),
+        pack::unpacked_len(upstream_response_body.as_deref()),
+        c.stream_text.as_ref().map(String::len).unwrap_or(0),
+        request_headers.len(),
+        upstream_headers.len(),
+        upstream_response_headers.len(),
+        response_headers.len(),
+    ]
+    .iter()
+    .sum::<usize>() as i64;
+
     sqlx::query(
         "INSERT OR REPLACE INTO captures (
              request_id, ts, method, path, request_headers, request_body,
@@ -864,30 +918,31 @@ pub async fn save_capture(pool: &SqlitePool, c: &CaptureRecord) -> AppResult<()>
              upstream_response_headers, upstream_response_body,
              response_headers, response_body, stream_text, stream_events,
              response_content, upstream_stream_raw, client_stream_raw, stream_raw_truncated,
-             stream_timings)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+             stream_timings, payload_bytes)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
     )
     .bind(&c.request_id)
     .bind(c.ts)
     .bind(&c.method)
     .bind(&c.path)
-    .bind(serde_json::to_string(&c.request_headers)?)
-    .bind(&c.request_body)
+    .bind(request_headers)
+    .bind(request_body)
     .bind(&c.upstream.url)
-    .bind(serde_json::to_string(&c.upstream.headers)?)
-    .bind(&c.upstream.body)
+    .bind(upstream_headers)
+    .bind(upstream_body)
     .bind(c.upstream.status)
-    .bind(serde_json::to_string(&c.upstream.response_headers)?)
-    .bind(&c.upstream.response_body)
-    .bind(serde_json::to_string(&c.response_headers)?)
-    .bind(&c.response_body)
+    .bind(upstream_response_headers)
+    .bind(upstream_response_body)
+    .bind(response_headers)
+    .bind(response_body)
     .bind(&c.stream_text)
     .bind(c.stream_events)
     .bind(&c.response_content)
-    .bind(&c.upstream_stream_raw)
-    .bind(&c.client_stream_raw)
+    .bind(upstream_stream_raw)
+    .bind(client_stream_raw)
     .bind(c.stream_raw_truncated as i64)
     .bind(&c.stream_timings)
+    .bind(payload_bytes)
     .execute(pool)
     .await?;
     Ok(())
@@ -938,20 +993,22 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
             r.get::<Option<String>, _>("method").unwrap_or_default(),
             r.get::<Option<String>, _>("path").unwrap_or_default(),
             parse_json(r.get::<Option<String>, _>("request_headers")),
-            r.get::<Option<Vec<u8>>, _>("request_body"),
+            // 六个正文列可能被压过，也可能来自 v15 之前的旧行 —— `unpack`
+            // 两种都认，调用方拿到的永远是原文。
+            pack::unpack(r.get::<Option<Vec<u8>>, _>("request_body")),
             r.get::<Option<String>, _>("upstream_url"),
             parse_json(r.get::<Option<String>, _>("upstream_headers")),
-            r.get::<Option<Vec<u8>>, _>("upstream_body"),
+            pack::unpack(r.get::<Option<Vec<u8>>, _>("upstream_body")),
             r.get::<Option<i64>, _>("upstream_status").map(|v| v as i32),
             parse_json(r.get::<Option<String>, _>("upstream_response_headers")),
-            r.get::<Option<Vec<u8>>, _>("upstream_response_body"),
+            pack::unpack(r.get::<Option<Vec<u8>>, _>("upstream_response_body")),
             parse_json(r.get::<Option<String>, _>("response_headers")),
-            r.get::<Option<Vec<u8>>, _>("response_body"),
+            pack::unpack(r.get::<Option<Vec<u8>>, _>("response_body")),
             r.get::<Option<String>, _>("stream_text"),
             r.get::<Option<i64>, _>("stream_events").unwrap_or(0),
             r.get::<Option<String>, _>("response_content"),
-            r.get::<Option<Vec<u8>>, _>("upstream_stream_raw"),
-            r.get::<Option<Vec<u8>>, _>("client_stream_raw"),
+            pack::unpack(r.get::<Option<Vec<u8>>, _>("upstream_stream_raw")),
+            pack::unpack(r.get::<Option<Vec<u8>>, _>("client_stream_raw")),
             r.get::<Option<i64>, _>("stream_raw_truncated").unwrap_or(0) != 0,
             r.get::<Option<String>, _>("stream_timings"),
         ),
@@ -1131,6 +1188,11 @@ pub async fn prune_captures(pool: &SqlitePool, max_entries: i64) -> AppResult<u6
     .bind(max_entries)
     .execute(pool)
     .await?;
+    // 捕获是数据库体积的大头，删掉的页要真正还给文件系统，否则文件只增不减。
+    // `incremental_vacuum` 只搬尾部空页，代价与删掉的数据量成正比，不是全库重建。
+    if r.rows_affected() > 0 {
+        db::reclaim_space(pool).await;
+    }
     Ok(r.rows_affected())
 }
 
@@ -1162,6 +1224,11 @@ pub async fn clear_all(pool: &SqlitePool) -> AppResult<(u64, u64)> {
         .await?
         .rows_affected();
     tx.commit().await?;
+    // 必须在提交之后：VACUUM 不能在事务里跑。清空通常是「数据库太大」时用户
+    // 主动点的，正是最需要把空间还回去的时刻。
+    if logs > 0 || captures > 0 {
+        db::reclaim_space(pool).await;
+    }
     Ok((logs, captures))
 }
 
@@ -1187,6 +1254,11 @@ pub async fn delete_one(pool: &SqlitePool, request_id: &str) -> AppResult<(u64, 
         .await?
         .rows_affected();
     tx.commit().await?;
+    // 一条捕获可能就是几 MB，删掉后同样要把空页还回去。没删到行时不做 ——
+    // 重复点击「删除」不该反复触发磁盘操作。
+    if logs > 0 || captures > 0 {
+        db::reclaim_space(pool).await;
+    }
     Ok((logs, captures))
 }
 
@@ -1623,6 +1695,131 @@ mod tests {
         assert_eq!(parsed["names"][1], "content_block_delta");
         assert_eq!(parsed["name_idx"][2], 1);
         assert_eq!(parsed["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn capture_bodies_are_stored_compressed_and_read_back_intact() {
+        // 捕获表的大头是正文：落库要压小，详情要拿回原文，预算要按解压后算。
+        // 三者缺一，要么空间白省、要么详情显示乱码、要么预算放行十倍内存。
+        let p = pool().await;
+        insert(&p, &rec("r1", "claude-code", "m")).await.unwrap();
+
+        // 足够长且重复，才会真的进压缩分支（小报文原样落库）。
+        let mut body = String::from(r#"{"messages":["#);
+        for i in 0..200 {
+            body.push_str(&format!(r#"{{"role":"user","content":"第 {i} 条重复内容"}},"#));
+        }
+        body.push_str("]}");
+        let body = body.into_bytes();
+
+        let mut raw = Vec::new();
+        for _ in 0..100 {
+            raw.extend_from_slice(b"event: content_block_delta\ndata: {}\n\n");
+        }
+
+        let capture = CaptureRecord {
+            request_id: "r1".into(),
+            ts: now_ms(),
+            request_headers: serde_json::json!({ "x-req": "1" }),
+            request_body: Some(body.clone()),
+            upstream: UpstreamTrace {
+                body: Some(body.clone()),
+                response_body: Some(body.clone()),
+                ..Default::default()
+            },
+            response_body: Some(body.clone()),
+            stream_text: Some("最终答案".into()),
+            upstream_stream_raw: Some(raw.clone()),
+            client_stream_raw: Some(raw.clone()),
+            ..Default::default()
+        };
+        save_capture(&p, &capture).await.unwrap();
+
+        // 六个正文列在库里都是压缩后的样子。
+        let lengths: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT length(request_body), length(upstream_body), length(upstream_response_body),
+                    length(response_body), length(upstream_stream_raw), length(client_stream_raw)
+             FROM captures WHERE request_id = 'r1'",
+        )
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        for (name, len) in [
+            ("request_body", lengths.0),
+            ("upstream_body", lengths.1),
+            ("upstream_response_body", lengths.2),
+            ("response_body", lengths.3),
+            ("upstream_stream_raw", lengths.4),
+            ("client_stream_raw", lengths.5),
+        ] {
+            assert!(
+                (len as usize) < body.len().max(raw.len()),
+                "{name} 落库后应当变小，实际 {len} 字节"
+            );
+        }
+
+        // 详情读出来必须是原文。
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(d.request_body.as_deref(), Some(String::from_utf8_lossy(&body).as_ref()));
+        assert_eq!(
+            d.upstream_body.as_deref(),
+            Some(String::from_utf8_lossy(&body).as_ref())
+        );
+        assert_eq!(
+            d.response_body.as_deref(),
+            Some(String::from_utf8_lossy(&body).as_ref())
+        );
+        assert_eq!(
+            d.upstream_response_body.as_deref(),
+            Some(String::from_utf8_lossy(&body).as_ref())
+        );
+        assert!(d.upstream_stream_raw.as_deref().unwrap().contains("event:"));
+        assert!(d.client_stream_raw.as_deref().unwrap().contains("event:"));
+
+        // payload_bytes 是解压后的口径：四个正文 + stream_text 文本 + 四份 headers。
+        let headers_len = |v: &serde_json::Value| serde_json::to_string(v).unwrap().len();
+        let expected = body.len() * 4
+            + "最终答案".len()
+            + headers_len(&capture.request_headers)
+            + headers_len(&capture.upstream.headers)
+            + headers_len(&capture.upstream.response_headers)
+            + headers_len(&capture.response_headers);
+        let stored: i64 =
+            sqlx::query_scalar("SELECT payload_bytes FROM captures WHERE request_id = 'r1'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(stored as usize, expected);
+
+        // 表达式筛选的预算读的就是这个值，而不是压缩后的大小。
+        let sizes = fetch_payload_sizes(&p, &["r1"]).await.unwrap();
+        assert_eq!(sizes["r1"], expected);
+    }
+
+    #[tokio::test]
+    async fn legacy_uncompressed_capture_rows_still_read() {
+        // v15 之前的行没有魔数、也没有 payload_bytes。读取路径必须原样认，
+        // 否则升级后所有历史捕获都会变成空详情。
+        let p = pool().await;
+        insert(&p, &rec("r1", "a", "m")).await.unwrap();
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#.to_vec();
+
+        sqlx::query(
+            "INSERT INTO captures (request_id, ts, method, path, request_body)
+             VALUES ('r1', 1, 'POST', '/v1/messages', ?1)",
+        )
+        .bind(&body)
+        .execute(&p)
+        .await
+        .unwrap();
+
+        let d = get_detail(&p, "r1").await.unwrap().unwrap();
+        assert_eq!(d.request_body.as_deref(), Some(std::str::from_utf8(&body).unwrap()));
+
+        // 老行的 payload_bytes 是默认 0，预算回落到 length() 相加；
+        // 四份 headers 在库里是默认的 "{}"，各占 2 字节。
+        let sizes = fetch_payload_sizes(&p, &["r1"]).await.unwrap();
+        assert_eq!(sizes["r1"], body.len() + 4 * 2);
     }
 
     #[tokio::test]

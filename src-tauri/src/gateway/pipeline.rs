@@ -424,6 +424,42 @@ pub async fn handle(
     req.model = meta.model.clone();
     recorder.record.model = meta.model.clone();
 
+    // ---- 2.5 请求改写脚本 ----
+    //
+    // 位置很讲究：在路由之后（脚本看到的是**生效模型**，不是客户端原话），在
+    // 缓存键之前（键必须覆盖脚本的改动，否则会出现"键按 A 算、字节按 B 发"）。
+    //
+    // `model` 与 `stream` 由管线掌管，脚本改了也还原：前者是路由、计费、聚合
+    // 三者共用的口径，后者决定下游怎么收字节。想按条件换模型请用「模型策略」
+    // 里的自定义规则 —— 那里本来就有完整的判定上下文。
+    let mut rewritten_by_script = false;
+    let script = settings.request_script.trim();
+    if !script.is_empty() {
+        if let Ok(value) = serde_json::to_value(&req) {
+            if let Some(next) = crate::routing::rewrite_script::apply(
+                script,
+                &client,
+                protocol.as_str(),
+                &req.model,
+                "request",
+                &value,
+            ) {
+                match serde_json::from_value::<UnifiedRequest>(next) {
+                    Ok(mut r) => {
+                        r.model = req.model.clone();
+                        r.stream = req.stream;
+                        req = r;
+                        rewritten_by_script = true;
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "请求改写脚本返回的结构不合法，按不改写处理"
+                    ),
+                }
+            }
+        }
+    }
+
     // 预扣估算：拿本地 token 估算 + max_tokens 当输出上界。它**不参与真实计费**，
     // 只用来记下"估算与实际的偏差"，让用户在监控页看到估算靠不靠谱。
     // 口径要跟真实计费一致，所以在生效模型确定之后才算。
@@ -521,6 +557,10 @@ pub async fn handle(
             cacheable,
             key.clone(),
             started,
+            // 脚本改过 IR 时必须重编码：同协议直通转发的是原始字节，IR 的改动
+            // 到不了上游。代价是放弃直通（未建模字段会丢），这是脚本功能的
+            // 明确取舍 —— 只在用户真的配了脚本且确实改动了请求时发生。
+            rewritten_by_script,
         )
         .await
         {
@@ -1045,6 +1085,8 @@ async fn try_outbound(
     cacheable: bool,
     cache_key: Option<String>,
     started: Instant,
+    // 请求改写脚本确实改动了 IR。为真时即使同协议也必须重编码。
+    force_encode: bool,
 ) -> Result<Response, UpstreamError> {
     // 渠道声明支持入站协议就直接说那种协议（直通），不支持才回落到首选协议做转换。
     let wire = outbound.wire_for(protocol_in);
@@ -1057,17 +1099,22 @@ async fn try_outbound(
     let mapped_model = outbound.provider().upstream_model(upstream_model).to_string();
     recorder.record.upstream_model = Some(mapped_model.clone());
 
-    let needs_conversion = protocol_in != wire;
+    let cross_protocol = protocol_in != wire;
+    let needs_conversion = cross_protocol || force_encode;
 
     // ---- 组装出站请求体 ----
     let out_body: Bytes = if needs_conversion {
-        // 跨协议：用 IR 重新编码成渠道的线协议。
+        // 跨协议（或脚本改动了 IR）：用 IR 重新编码成渠道的线协议。
         let mut to_send = req.clone();
         to_send.model = mapped_model.clone();
         to_send.stream = req.stream;
 
         // 思考签名无法跨协议保真，剥离以免上游报 Invalid signature。
-        strip_unportable_thinking(&mut to_send, wire);
+        // **只在真的跨协议时剥**：脚本导致的同协议重编码仍处在同一种协议里，
+        // 签名完全有效，剥掉反而把客户端自己的思考上下文弄丢了。
+        if cross_protocol {
+            strip_unportable_thinking(&mut to_send, wire);
+        }
 
         let codec = shell.codecs.codec(wire);
         match codec.encode_request(&to_send) {
@@ -1094,6 +1141,23 @@ async fn try_outbound(
     let out_body: Bytes = Bytes::from(crate::protocol::shared::tool_pair::mend_request_body(
         &out_body, wire,
     ));
+
+    // ---- Anthropic prompt cache 断点 ----
+    //
+    // 只补**跨协议转 Anthropic** 这一条路：直通时客户端自己的断点原样保留，
+    // 我们不去加戏。放在所有改写之后（工具配对修补会重排 JSON），保证加的是
+    // 最终形态；注入函数在客户端已经带断点时会一个字节都不动。
+    let out_body: Bytes = if cross_protocol
+        && wire == Protocol::AnthropicMessages
+        && shell.settings().prompt_cache_injection
+    {
+        match crate::protocol::shared::prompt_cache::inject_anthropic_breakpoints(&out_body) {
+            Some(b) => Bytes::from(b),
+            None => out_body,
+        }
+    } else {
+        out_body
+    };
 
     let prepared = outbound.prepare(wire, headers, out_body.clone(), req.stream)?;
 
@@ -1378,9 +1442,9 @@ async fn finish_buffered(
     };
 
     // 从 SSE 还原出来的响应必须走编码路径。
-    let needs_conversion = needs_conversion || decoded_from_sse;
+    let mut needs_conversion = needs_conversion || decoded_from_sse;
 
-    let Some((decoded, usage)) = decoded else {
+    let Some((mut decoded, usage)) = decoded else {
         // 完全解不出来：把原文交给客户端，至少让功能可用，同时把用量记成未知。
         recorder.record.quota = 0;
         // 转发的是原文，客户端那一栏就得有原文 —— 这条路上"解不出来"往往正是
@@ -1411,6 +1475,43 @@ async fn finish_buffered(
 
     let latency = started.elapsed().as_millis() as i64;
     recorder.record.latency_ms = latency;
+
+    // ---- 响应改写脚本 ----
+    //
+    // **只对非流式生效**（含"客户端要流式、上游却回了完整响应"这种伪流式）：
+    // 真正的流式在收尾时客户端早已收到字节，此时再改只是骗自己。
+    //
+    // 位置在计费之后：这次请求花了多少 token 是上游的客观事实，脚本不该能通过
+    // 增删内容把它改小。位置在写缓存之前：缓存里存的必须是客户端真正看到的那份。
+    let script = shell.settings().response_script.trim().to_string();
+    if !script.is_empty() {
+        if let Ok(value) = serde_json::to_value(&decoded) {
+            if let Some(next) = crate::routing::rewrite_script::apply(
+                &script,
+                &recorder.record.client,
+                protocol_in.as_str(),
+                &recorder.record.model,
+                "response",
+                &value,
+            ) {
+                match serde_json::from_value::<UnifiedResponse>(next) {
+                    Ok(mut r) => {
+                        // `id` / `model` 是客户端认的契约字段，脚本改了也还原 ——
+                        // 一个脱敏或改文案的脚本没有理由顺手换掉模型名。
+                        r.id = decoded.id.clone();
+                        r.model = decoded.model.clone();
+                        decoded = r;
+                        // 同协议本来会透传原始字节，脚本改动只有重编码才落地。
+                        needs_conversion = true;
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "响应改写脚本返回的结构不合法，按不改写处理"
+                    ),
+                }
+            }
+        }
+    }
 
     // 写缓存：把这次的结果存下来供后续相同请求复用。
     if cacheable {
@@ -1683,6 +1784,14 @@ fn finalize_stream(
 
             if let Err(e) = crate::storage::logs::save_capture(&shell.db, &cap).await {
                 tracing::warn!("写流式捕获失败: {e}");
+            }
+
+            // 条数上限必须在这里也执行一次。以前只有非流式那条路调 prune，
+            // 而真实流量 99% 是流式 —— 结果是 `capture_max_entries` 对绝大多数
+            // 请求形同虚设（现场：上限 500，表里 717 行）。
+            let max_entries = shell.settings().capture_max_entries as i64;
+            if let Err(e) = crate::storage::logs::prune_captures(&shell.db, max_entries).await {
+                tracing::warn!("清理超限捕获失败: {e}");
             }
         }
     });

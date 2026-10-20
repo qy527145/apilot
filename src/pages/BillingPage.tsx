@@ -159,7 +159,7 @@ export default function BillingPage() {
           </CardHeader>
           <CardContent className="space-y-6">
             {buckets.isLoading ? (
-              <TableSkeleton rows={5} cols={11} />
+              <TableSkeleton rows={5} cols={12} />
             ) : buckets.isError ? (
               <ErrorState onRetry={() => buckets.refetch()} />
             ) : bucketData.length === 0 ? (
@@ -267,6 +267,12 @@ export default function BillingPage() {
                         <TableHead className="text-right">输入 Token</TableHead>
                         <TableHead className="text-right">输出 Token</TableHead>
                         <TableHead className="text-right">缓存读</TableHead>
+                        <TableHead
+                          className="text-right"
+                          title="上游提示缓存相对全价输入少花的钱。按该模型的单价系数换算；没配价格时为 0。"
+                        >
+                          缓存节省
+                        </TableHead>
                         <TableHead className="text-right">缓存命中率</TableHead>
                         <TableHead className="text-right">本地缓存命中</TableHead>
                         {/*
@@ -327,6 +333,9 @@ export default function BillingPage() {
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {formatNumber(b.cache_read_tokens)}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {quotaToUsd(b.saved_quota)}
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {formatPercent(b.prompt_cache_hit_rate)}

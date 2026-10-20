@@ -34,11 +34,13 @@ import { qk } from "@/hooks/queries";
 import {
   ALL_PROTOCOLS,
   api,
+  METADATA_SOURCE_LABEL,
   PROTOCOL_DEFAULT_PATH,
   PROTOCOL_LABEL,
   PROTOCOL_VERDICT_LABEL,
   type AuthStyle,
   type ChannelProxyMode,
+  type MetadataSource,
   type Protocol,
   type ProtocolDetection,
   type ProtocolVerdict,
@@ -73,6 +75,8 @@ interface FormState {
   param_override: string;
   proxy_mode: ChannelProxyMode;
   proxy_url: string;
+  /** 模型元数据（价格 / 能力）来源。预设渠道默认自动。 */
+  metadata_source: MetadataSource;
 }
 
 const EMPTY: FormState = {
@@ -93,6 +97,7 @@ const EMPTY: FormState = {
   param_override: "",
   proxy_mode: "inherit",
   proxy_url: "",
+  metadata_source: "auto",
 };
 
 const PROXY_MODE_LABEL: Record<ChannelProxyMode, string> = {
@@ -177,6 +182,7 @@ function toForm(p: Provider): FormState {
     // 后端可能给 null（老行没迁移过），前端这一栏统一用 inherit 兜底。
     proxy_mode: p.proxy?.mode ?? "inherit",
     proxy_url: p.proxy?.url ?? "",
+    metadata_source: p.metadata_source ?? "auto",
   };
 }
 
@@ -235,6 +241,8 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
       await api.setProviderModels(id, models);
       qc.invalidateQueries({ queryKey: qk.providerModels(id) });
       qc.invalidateQueries({ queryKey: qk.modelCatalog });
+      // 声明改变会触发后端按渠道来源同步价格，价格表得跟着刷新。
+      qc.invalidateQueries({ queryKey: qk.pricing });
       toast.success(`渠道已创建，已声明 ${models.length} 个模型`, {
         // 声明之后这个渠道就不再"通吃"了：客户端发来的名字必须在列表里才会路由过来。
         // 不说清楚的话，用户会觉得"刚加的渠道怎么不接我的请求"。
@@ -320,6 +328,8 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
       // 改渠道的启用状态 / 删渠道都会影响模型页的候选列表。
       qc.invalidateQueries({ queryKey: qk.modelCatalog });
       qc.invalidateQueries({ queryKey: qk.providerModels(saved.id) });
+      // 保存时后端可能按元数据来源自动同步了价格。
+      qc.invalidateQueries({ queryKey: qk.pricing });
       onOpenChange(false);
 
       if (provider) {
@@ -355,6 +365,9 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
         auth_style: p.auth_style,
         protocols: p.protocols.map((e) => e.protocol),
         paths,
+        // 预设都是主流服务商，目录里查得到价格；套用预设就该顺手把元数据绑上。
+        // 用户仍可在下面改成「不自动同步」。
+        metadata_source: "auto",
       };
     });
 
@@ -400,6 +413,7 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
         mode: form.proxy_mode,
         url: form.proxy_url.trim() ? form.proxy_url.trim() : null,
       },
+      metadata_source: form.metadata_source,
     };
     setError(null);
     mutation.mutate(input);
@@ -724,6 +738,32 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
                 placeholder="socks5://127.0.0.1:1080"
               />
             </div>
+          </div>
+
+          <div className="space-y-2 rounded-md border p-3">
+            <Label className="text-sm">模型元数据来源</Label>
+            <p className="text-muted-foreground text-xs">
+              价格与能力跟着模型元数据走。保存渠道后会按这里的选择，为它声明过的
+              模型补上目录里的价格；手填过的价格一律不覆盖。自定义模型在目录里
+              查不到时会保留兜底倍率，可在「统计 → 单价系数」里单独设。
+            </p>
+            <Select
+              value={form.metadata_source}
+              onValueChange={(v) => set("metadata_source", v as MetadataSource)}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(METADATA_SOURCE_LABEL) as MetadataSource[]).map(
+                  (m) => (
+                    <SelectItem key={m} value={m}>
+                      {METADATA_SOURCE_LABEL[m]}
+                    </SelectItem>
+                  ),
+                )}
+              </SelectContent>
+            </Select>
           </div>
 
           <div className="space-y-2">

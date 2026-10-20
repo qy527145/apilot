@@ -27,7 +27,7 @@ use crate::util::now_ms;
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// 拿目录，能命中缓存就不重新下载。
-async fn catalog_for(
+pub(crate) async fn catalog_for(
     shell: &Arc<AppShell>,
     source: CatalogSource,
     force_refresh: bool,
@@ -89,19 +89,61 @@ async fn wanted_prices(
     source: CatalogSource,
     models: &[CatalogModel],
 ) -> AppResult<Vec<ModelPricing>> {
-    let declared: std::collections::HashSet<String> =
-        provider_store::all_declared_models(&shell.db).await?.into_iter().collect();
+    let declared = provider_store::all_declared_models(&shell.db).await?;
+    Ok(prices_for_models(models, source, &declared))
+}
 
+/// 从目录里挑出**指定模型名**的单价行。纯函数，便于脱离网络测筛选与定价换算。
+///
+/// 只收调用方点名的模型：目录里躺着几千个本项目根本用不上的模型，全导进去会把
+/// 价格页淹没，而且没有意义 —— 没声明过的模型本来就走兜底倍率。
+fn prices_for_models(
+    models: &[CatalogModel],
+    source: CatalogSource,
+    wanted: &[String],
+) -> Vec<ModelPricing> {
+    let wanted: std::collections::HashSet<&str> =
+        wanted.iter().map(|m| m.trim()).collect();
     let tag = format!("catalog:{}", source_label(source));
-    Ok(index_by_model(models.to_vec())
+
+    index_by_model(models.to_vec())
         .into_values()
-        .filter(|m| declared.contains(&m.model))
+        .filter(|m| wanted.contains(m.model.as_str()))
         .filter_map(|m| to_pricing(&m))
         .map(|mut p| {
+            // 标记来源，让下一次同来源导入能覆盖它、而用户手填的行（source=None）
+            // 在 `diff_catalog` 里永远被保留。
             p.source = Some(tag.clone());
             p
         })
-        .collect())
+        .collect()
+}
+
+/// 给一批指定模型同步目录价格，并把结果写进库。
+///
+/// 渠道绑定了目录来源时（保存渠道、保存模型声明）自动调用。`diff_catalog` +
+/// `apply_catalog` 会保留用户手填的行，所以这里不必先判断哪些行"归目录管"。
+///
+/// 目录本身走 [`catalog_for`] 的缓存：同一轮操作里保存多个渠道不会重复下载。
+pub(crate) async fn apply_catalog_prices_for(
+    shell: &Arc<AppShell>,
+    source: CatalogSource,
+    models: &[String],
+) -> AppResult<pricing::PriceImportStats> {
+    // 一个模型都没声明时不值得联网：目录有几千条，但落库的会是零行。
+    if models.is_empty() {
+        return Ok(pricing::PriceImportStats::default());
+    }
+
+    let catalog = catalog_for(shell, source, false).await?;
+    let incoming = prices_for_models(&catalog, source, models);
+    let rows = pricing::diff_catalog(&shell.db, &incoming).await?;
+    let stats = pricing::apply_catalog(&shell.db, &rows).await?;
+
+    // 内存单价表是热替换的，写完必须重载才生效 —— 少了这步用户会看到
+    // "价格更新了但账单还是按旧的算"。
+    shell.reload_pricing().await?;
+    Ok(stats)
 }
 
 fn source_label(s: CatalogSource) -> &'static str {
@@ -313,4 +355,136 @@ pub async fn test_model(
         outcome.latency_ms = started.elapsed().as_millis() as i64;
     }
     Ok(outcome)
+}
+
+/// 启动时补一次价格。
+///
+/// 从老版本升级上来的库 `model_pricing` 可能是空的，而渠道默认
+/// `metadata_source = auto`。这里只在整个价格表为空时跑 —— 那是"从来没同步过"
+/// 的明确信号；之后新增/改模型由保存渠道那条路负责，不会每次启动都联网。
+///
+/// 网络失败只 warn：目录拉不下来不影响网关启动，下次启动再试。
+pub(crate) async fn backfill_prices_on_startup(shell: &Arc<AppShell>) {
+    match crate::storage::pricing::list(&shell.db).await {
+        Ok(rows) if rows.is_empty() => {}
+        Ok(_) => return, // 已经有价格了，不重复下载
+        Err(e) => {
+            tracing::warn!(error = %e, "读取价格表失败，跳过启动时补价");
+            return;
+        }
+    }
+
+    let providers = match provider_store::list(&shell.db).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "读取渠道失败，跳过启动时补价");
+            return;
+        }
+    };
+
+    // 按来源合并：同一份目录只下载一次，哪怕有好几条渠道都绑定了它。
+    let mut wanted: std::collections::HashMap<CatalogSource, Vec<String>> =
+        std::collections::HashMap::new();
+    for p in &providers {
+        let Some(source) = p.metadata_source.catalog_source() else {
+            continue; // off：用户明确说别碰价格
+        };
+        match provider_store::list_models(&shell.db, p.id).await {
+            Ok(models) => {
+                let bucket = wanted.entry(source).or_default();
+                bucket.extend(models.into_iter().map(|m| m.model));
+            }
+            Err(e) => tracing::warn!(tag = %p.tag, error = %e, "读取渠道模型失败"),
+        }
+    }
+
+    for (source, mut models) in wanted {
+        models.sort();
+        models.dedup();
+        if models.is_empty() {
+            continue;
+        }
+        match apply_catalog_prices_for(shell, source, &models).await {
+            Ok(stats) => tracing::info!(
+                source = source.label(),
+                inserted = stats.inserted,
+                updated = stats.updated,
+                "启动时已补齐模型价格"
+            ),
+            Err(e) => tracing::warn!(
+                source = source.label(),
+                error = %e,
+                "启动时补价失败（下次启动再试）"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(model: &str, input: Option<f64>, output: Option<f64>) -> CatalogModel {
+        CatalogModel {
+            model: model.into(),
+            vendor: "test".into(),
+            first_party: true,
+            input,
+            output,
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+            supports_reasoning: false,
+            supports_tools: false,
+            supports_vision: false,
+            supports_pdf: false,
+        }
+    }
+
+    #[test]
+    fn only_the_named_models_are_picked_out_of_the_catalog() {
+        // 目录有几千条，全导进去会把价格页淹没；渠道没声明过的模型本来就走兜底倍率。
+        let catalog = vec![
+            entry("wanted", Some(3.0), Some(15.0)),
+            entry("not-declared", Some(1.0), None),
+        ];
+
+        let prices = prices_for_models(&catalog, CatalogSource::ModelsDev, &["wanted".into()]);
+        assert_eq!(prices.len(), 1);
+        assert_eq!(prices[0].model, "wanted");
+        assert_eq!(prices[0].model_ratio, 1.5, "$3/1M ÷ 2 = 1.5 倍率");
+        assert_eq!(prices[0].completion_ratio, 5.0);
+    }
+
+    #[test]
+    fn a_model_without_a_price_is_skipped_instead_of_being_written_as_free() {
+        // `to_pricing` 返回 None 时不能拿 0 填：0 在计费里是"免费"。
+        let catalog = vec![entry("unknown-price", None, None)];
+        assert!(prices_for_models(
+            &catalog,
+            CatalogSource::ModelsDev,
+            &["unknown-price".into()]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn imported_prices_are_tagged_with_the_catalog_that_produced_them() {
+        // 这个标记是下次导入能否覆盖的依据，也是"用户手填的行不被覆盖"的边界。
+        let catalog = vec![entry("m", Some(2.0), None)];
+
+        let from_dev = prices_for_models(&catalog, CatalogSource::ModelsDev, &["m".into()]);
+        assert_eq!(from_dev[0].source.as_deref(), Some("catalog:models.dev"));
+
+        let from_litellm = prices_for_models(&catalog, CatalogSource::LiteLlm, &["m".into()]);
+        assert_eq!(from_litellm[0].source.as_deref(), Some("catalog:litellm"));
+    }
+
+    #[test]
+    fn declared_model_names_are_trimmed_before_matching() {
+        // 前端提交的模型名带空白时，不该因此漏掉一条本来能匹配上的价格。
+        let catalog = vec![entry("m", Some(2.0), None)];
+        let prices = prices_for_models(&catalog, CatalogSource::ModelsDev, &[" m ".into()]);
+        assert_eq!(prices.len(), 1);
+    }
 }

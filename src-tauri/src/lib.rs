@@ -10,6 +10,7 @@ mod error;
 mod gateway;
 mod probe;
 mod protocol;
+mod replay;
 mod routing;
 mod shell;
 mod storage;
@@ -34,6 +35,13 @@ pub fn run() {
             let handle = app.handle().clone();
             let shell = tauri::async_runtime::block_on(AppShell::bootstrap(handle))?;
             app.manage(shell.clone());
+
+            // 老库升级上来时价格表可能是空的；渠道默认 auto，这里在后台补一次。
+            // 只在整个表为空时联网，成功之后不再触发（见函数注释）。
+            let shell_for_prices = shell.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::commands::catalog::backfill_prices_on_startup(&shell_for_prices).await;
+            });
 
             // 按设置自动拉起网关。失败不阻断启动 —— 用户可能只是端口被占了，
             // 应当能进界面改成别的端口，而不是应用直接起不来。
@@ -62,6 +70,7 @@ pub fn run() {
             commands::app::update_settings,
             commands::app::set_model_policy,
             commands::app::validate_model_script,
+            commands::app::validate_rewrite_script,
             // --- 网关 ---
             commands::gateway::gateway_start,
             commands::gateway::gateway_stop,
@@ -76,6 +85,7 @@ pub fn run() {
             commands::providers::fetch_provider_models,
             commands::providers::set_provider_enabled,
             commands::providers::detect_provider_protocols,
+            commands::providers::sync_provider_metadata,
             // --- 上游目录（价格与能力共用同一个网络集成） ---
             commands::catalog::catalog_price_preview,
             commands::catalog::catalog_price_apply,
@@ -135,6 +145,8 @@ pub fn run() {
             commands::logs::get_inflight_requests,
             commands::logs::clear_logs,
             commands::logs::delete_log,
+            // --- 回放 / A-B 对比 ---
+            commands::replay::replay_request,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -153,14 +165,89 @@ pub fn run() {
 }
 
 /// 初始化日志。`RUST_LOG` 可覆盖默认级别。
+/// 日志写到哪里、保留多久。
+///
+/// 打包后的窗口程序（Windows 的 `windows_subsystem = "windows"`）没有控制台，
+/// stderr 里的日志等于直接扔掉 —— 用户报「它突然不好用了」时，我们连一句现场
+/// 都拿不到。所以文件日志不是锦上添花：它是打包形态下**唯一**可用的排查入口。
+///
+/// 同时保留 stdout 一份：`tauri dev` 与终端启动时仍然能直接看到。
+const LOG_FILE_PREFIX: &str = "apilot";
+const LOG_KEEP_DAYS: usize = 7;
+
 fn init_tracing() {
+    use tracing_subscriber::prelude::*;
     use tracing_subscriber::{fmt, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("apilot_lib=debug,apilot=debug,warn"));
 
-    fmt().with_env_filter(filter).with_target(true).init();
+    let stdout_layer = fmt::layer().with_target(true);
+
+    // 文件这一层失败不该挡住应用启动：没有日志目录权限时退化成只写 stdout，
+    // 比因为日志起不来而整个打不开应用好得多。
+    let writer = match file_writer() {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("日志文件初始化失败，仅输出到控制台: {e}");
+            None
+        }
+    };
+
+    // 文件层在这里就地构造，而不是从 helper 返回一个 `Layer`：`fmt::Layer`
+    // 的泛型参数跟着"最终由哪些层组合成 subscriber"走，提前固定成某个具体
+    // Subscriber 类型反而拼不上去。
+    match writer {
+        Some(writer) => tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .with(
+                fmt::layer()
+                    .with_target(true)
+                    // 文件里不需要 ANSI 颜色码 —— 那些字节会原样躺在日志里。
+                    .with_ansi(false)
+                    .with_writer(writer),
+            )
+            .init(),
+        None => tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .init(),
+    }
+
+    // panic 在默认 hook 里只打到 stderr，窗口程序里等于丢失。这里把它连同
+    // backtrace 一起写进 tracing（因此也会落进文件）。`force_capture` 不依赖
+    // RUST_BACKTRACE，release 包里也能拿到。
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(panic = %info, backtrace = %backtrace, "进程 panic");
+    }));
 }
+
+/// 建按天滚动的文件写入器。
+///
+/// `WorkerGuard` 必须活到进程结束，否则非阻塞写入器会在 drop 时把最后一批
+/// 日志丢掉 —— 而最后一批往往正是崩溃前的那几行。放进 `OnceLock` 里挂着。
+fn file_writer(
+) -> Result<tracing_appender::non_blocking::NonBlocking, Box<dyn std::error::Error>> {
+    let dir = crate::config::paths::log_dir();
+    std::fs::create_dir_all(&dir)?;
+
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(LOG_FILE_PREFIX)
+        .filename_suffix("log")
+        .max_log_files(LOG_KEEP_DAYS)
+        .build(&dir)?;
+
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    // 只在第一次初始化时生效；重复调用（测试/热重载）不会拿掉已经活着的 guard。
+    let _ = LOG_GUARD.set(guard);
+    Ok(writer)
+}
+
+static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+    std::sync::OnceLock::new();
 
 /// 供集成测试与外部调用复用的启动入口。
 pub use error::{AppError, AppResult};

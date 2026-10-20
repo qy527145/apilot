@@ -336,6 +336,15 @@ impl ModelPolicy {
     }
 }
 
+/// 布尔字段的默认值：缺字段时取 `true`。
+///
+/// `AppSettings` 整体带 `#[serde(default)]`，缺字段本来会走 `Default::default()`；
+/// 显式写这一层是为了让**字段自身的默认值**不受 `Default` 实现改动的影响 ——
+/// 例如以后把 `default()` 改成更保守的组合，老存档里没写过的这个开关不该跟着变。
+fn default_true_setting() -> bool {
+    true
+}
+
 /// 修剪空白；空白串等同于没配。
 ///
 /// 界面上「留空 = 跟随全局」「保持原样」都会存成空串，那种值必须在入口处清掉 ——
@@ -452,6 +461,30 @@ pub struct AppSettings {
 
     /// 全局出站代理。默认跟随环境变量 —— 与引入本功能之前逐字等价。
     pub proxy: ProxySettings,
+
+    /// 跨协议转换到 Anthropic 时，自动在 system / tools / 最后一条消息上打
+    /// `cache_control` 断点。
+    ///
+    /// 只在**转换**这条路上做：直通时客户端自己的断点原样保留，我们不去加戏。
+    /// 默认开 —— Agent 会话的上下文几乎总在下一轮被复用，缓存写（1.25x）通常
+    /// 一次就摊平；觉得不划算可以在设置里关掉。
+    #[serde(default = "default_true_setting")]
+    pub prompt_cache_injection: bool,
+
+    /// 请求改写脚本（JS）。空 = 不改写。
+    ///
+    /// 脚本拿到的是**IR 的 JSON 形态**，返回 JSON 字符串即视为改写；任何异常 /
+    /// 超时 / 非字符串返回都按「不改写」处理，**绝不让脚本拖垮请求**。
+    /// 生效点在模型/思考确定之后、缓存键之前，所以缓存键看到的是改写后的请求。
+    #[serde(default)]
+    pub request_script: String,
+
+    /// 响应改写脚本（JS）。空 = 不改写。
+    ///
+    /// **只对非流式生效**：流式响应在收尾时客户端早就收到了字节，此时再改已经
+    /// 没有意义。跨协议改写还会顺带关闭直通（必须重编码才能落地）。
+    #[serde(default)]
+    pub response_script: String,
 }
 
 /// 接管时对客户端模型配置做什么。
@@ -642,6 +675,9 @@ impl Default for AppSettings {
             client_model_mode: ClientModelMode::default(), // 默认两个都写：单走一条都会留缺口
             thinking_mode: ThinkingMode::default(), // 默认不接管：与引入本功能之前逐字等价
             proxy: ProxySettings::default(),      // 默认跟随环境变量
+            prompt_cache_injection: true,         // Agent 会话的上下文通常会被复用
+            request_script: String::new(),
+            response_script: String::new(),
         }
     }
 }
@@ -1336,6 +1372,19 @@ mod tests {
         assert_eq!(s.listen_port, 9999);
         assert_eq!(s.proxy.mode, ProxyMode::System);
         assert_eq!(s.proxy.url, None);
+    }
+
+    #[test]
+    fn an_old_settings_file_without_scripts_or_prompt_cache_still_loads() {
+        // 脚本与提示缓存开关都是后加的字段。老存档里没有它们时，只该让这两个
+        // 新功能取默认值 —— 整份设置打回默认会连带冲掉端口、捕获上限等配置。
+        let old = r#"{"listen_port": 9999, "capture_max_entries": 42}"#;
+        let s: AppSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.listen_port, 9999);
+        assert_eq!(s.capture_max_entries, 42);
+        assert!(s.prompt_cache_injection, "缺字段时默认开启提示缓存注入");
+        assert!(s.request_script.is_empty());
+        assert!(s.response_script.is_empty());
     }
 
     #[test]

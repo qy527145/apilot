@@ -5,6 +5,7 @@ pub mod metadata;
 pub mod model_policy;
 pub mod model_script;
 pub mod model_select;
+pub mod rewrite_script;
 pub mod rule;
 pub mod rule_item;
 pub mod selector;

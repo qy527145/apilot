@@ -29,7 +29,76 @@ pub async fn open(path: &Path) -> AppResult<SqlitePool> {
         .await?;
 
     migrate(&pool).await?;
+    ensure_incremental_auto_vacuum(&pool).await;
     Ok(pool)
+}
+
+/// 让数据库支持「删行之后把空页还给文件系统」。
+///
+/// 捕获表是体积的大头。`prune_captures` 每次都删掉一批行，但 SQLite 默认
+/// （`auto_vacuum = 0`）只把页标成空闲留着复用，**文件一个大字节都不会小**——
+/// 用户看到的就是「删了几万条，数据库还是 1.3GB」。切到增量模式之后，
+/// `PRAGMA incremental_vacuum` 才能把尾部的空页截掉。
+///
+/// 改这个属性是持久化在库头里的，而且只对空库直接生效：已有数据的库必须先
+/// `VACUUM` 重建一次。所以第一次启动会付一次全库重建的代价（1.3GB 的库大约
+/// 几十秒），之后每次启动就只是读一下 pragma 立刻返回。
+///
+/// 放在 `open()` 里、网关开始接流量之前执行 —— 那时没有并发写入，阻塞是安全的。
+/// 失败只 warn：空间回收是锦上添花，不该让应用启动不了，下一轮启动会再试。
+///
+/// 一个 SQLite 的细节：`auto_vacuum` 的值在每条连接里各有一份缓存，改完之后
+/// 只有之后新建的连接能看到。本次运行里迁移用过的旧连接要等连接池把它们回收掉
+/// 才跟上（最多是本次运行里回收得少一些，不会出错），下次启动就全是新连接。
+async fn ensure_incremental_auto_vacuum(pool: &SqlitePool) {
+    // 三步必须在同一条连接上做：`PRAGMA auto_vacuum = ...` 设的是一个
+    // 连接级待生效值，换一条连接执行 VACUUM 就把它丢了。
+    let Ok(mut conn) = pool.acquire().await else {
+        tracing::warn!("取不到数据库连接，跳过增量回收模式的检查");
+        return;
+    };
+
+    let mode: Result<i64, _> = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(&mut *conn)
+        .await;
+    match mode {
+        Ok(2) => return,
+        Ok(mode) => tracing::info!(mode, "数据库不是增量回收模式，正在切换（一次性 VACUUM）"),
+        Err(e) => {
+            tracing::warn!(error = %e, "读不到 auto_vacuum，跳过增量回收模式的检查");
+            return;
+        }
+    }
+
+    if let Err(e) = sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::warn!(error = %e, "设置 auto_vacuum 失败，本次跳过");
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    match sqlx::query("VACUUM").execute(&mut *conn).await {
+        Ok(_) => tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "数据库已切换为增量回收模式"
+        ),
+        Err(e) => tracing::warn!(error = %e, "VACUUM 失败，增量回收暂不可用"),
+    }
+}
+
+/// 把删除后留下的空闲页还给文件系统。
+///
+/// 只在库已经切到增量模式（`ensure_incremental_auto_vacuum`）之后才真的做事；
+/// 普通模式下这就是一条 no-op。它是**增量**的：只截掉文件末尾的空页，
+/// 代价与空闲页数量成正比，不是全库重建 —— 所以每次裁剪后调一次可以接受。
+///
+/// 失败只 warn：空间回收是尽力而为，一次失败不该让「删了一条日志」看起来失败了。
+pub async fn reclaim_space(pool: &SqlitePool) {
+    if let Err(e) = sqlx::query("PRAGMA incremental_vacuum").execute(pool).await {
+        tracing::warn!(error = %e, "增量回收空闲页失败，忽略");
+    }
 }
 
 /// 内存库，仅供测试。
@@ -360,6 +429,57 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(found, 1, "缺少表 {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaim_space_is_a_noop_on_a_plain_database() {
+        // 普通库（auto_vacuum = 0）上 `PRAGMA incremental_vacuum` 什么都不做。
+        // 它挂在每次裁剪之后，绝不能因为「这个库没开自动回收」就报错或 panic ——
+        // 那会让本来成功的删除操作在调用方看来是失败的。
+        let pool = open_memory().await.unwrap();
+        sqlx::query("INSERT INTO captures (request_id, ts, method, path) VALUES ('r', 1, 'POST', '/x')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        reclaim_space(&pool).await;
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM captures")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1, "回收空间不该动数据");
+    }
+
+    #[tokio::test]
+    async fn open_switches_the_database_to_incremental_vacuum() {
+        // 只有切到增量模式，删行后的空页才收得回来。用真文件库测：
+        // 内存库没有「文件大小」这个概念，auto_vacuum 也无从生效。
+        //
+        // 断言放在**第二次打开**之后：SQLite 把 auto_vacuum 的值缓存在每条
+        // 连接里，转换是由 `ensure_incremental_auto_vacuum` 拿的那条连接做的，
+        // 同一个池里别的连接（迁移用过的那些）仍读到旧值。新进程的连接都在
+        // 文件改完之后才打开，读到的才是真实状态 —— 这也正是用户实际会经历的。
+        let path = std::env::temp_dir().join(format!(
+            "apilot-av-{}-{}.db",
+            std::process::id(),
+            crate::util::now_ms()
+        ));
+
+        let pool = open(&path).await.unwrap();
+        pool.close().await;
+
+        let pool = open(&path).await.unwrap();
+        let mode: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, 2, "第二次启动应看到已持久化的增量回收模式");
+
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 

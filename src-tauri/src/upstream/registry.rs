@@ -144,6 +144,7 @@ mod tests {
             enabled: true,
             timeout_ms: 600_000,
             proxy: Default::default(),
+            metadata_source: Default::default(),
             created_at: 0,
             updated_at: 0,
         }

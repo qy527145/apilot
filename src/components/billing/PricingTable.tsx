@@ -70,6 +70,18 @@ export function PricingTable() {
     if (data) setRows(data.map(toEditable));
   }, [data]);
 
+  /**
+   * 这一行的价格是谁写的。
+   *
+   * - `catalog:*`：由目录自动导入，下次同来源导入会覆盖；
+   * - 空：用户手填，任何批量导入都不动它。
+   *
+   * 拆开显示是因为两者在"更新价格"时的命运完全不同 —— 用户得知道
+   * 自己那行会不会被冲掉。
+   */
+  const sourceOf = (model: string): string | null =>
+    data?.find((p) => p.model === model)?.source ?? null;
+
   const save = useMutation({
     mutationFn: (input: PricingInput) => api.upsertPricing(input),
     onSuccess: () => {
@@ -158,11 +170,11 @@ export function PricingTable() {
       <CatalogPriceDialog open={catalogOpen} onOpenChange={setCatalogOpen} />
 
       {isLoading ? (
-        <TableSkeleton rows={4} cols={7} />
+        <TableSkeleton rows={4} cols={8} />
       ) : rows.length === 0 ? (
         <EmptyState
           title="还没有单价配置"
-          description="添加模型单价系数后，统计页的配额与费用才会按此计算。"
+          description="从预设添加的渠道会按绑定的元数据来源自动补价格；自定义模型也可以在这里手填。没有价格的模型按兜底倍率计算。"
           action={
             <Button size="sm" onClick={() => setDialogOpen(true)}>
               <Plus className="size-4" />
@@ -176,6 +188,7 @@ export function PricingTable() {
             <TableHeader>
               <TableRow>
                 <TableHead className="min-w-[180px]">模型</TableHead>
+                <TableHead className="min-w-[110px]">来源</TableHead>
                 {FIELDS.map((f) => (
                   <TableHead key={f.key} className="min-w-[110px]">
                     {f.label}
@@ -192,6 +205,9 @@ export function PricingTable() {
                       value={row.model}
                       onChange={(e) => update(idx, "model", e.target.value)}
                     />
+                  </TableCell>
+                  <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
+                    {sourceOf(row.model) ?? "手填"}
                   </TableCell>
                   {FIELDS.map((f) => (
                     <TableCell key={f.key}>

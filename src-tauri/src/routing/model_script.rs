@@ -44,6 +44,23 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 /// 结果缓存的条数上限。
 const MEMO_CAPACITY: usize = 1024;
 
+/// 通用改写脚本的入参。
+///
+/// 与 `ScriptInput` 分开而不是把字段堆进同一个结构：模型脚本只认「谁在问哪个模型」，
+/// 改写脚本还要知道这是请求还是响应、以及完整的请求体 —— 两类脚本的 ctx 契约不同，
+/// 混在一起会让任何一边多出一个字段时另一边跟着漂移。
+pub(crate) struct JsonScriptInput<'a> {
+    pub client: &'a str,
+    pub protocol: &'a str,
+    pub model: &'a str,
+    /// "request" 或 "response"。
+    pub kind: &'a str,
+    /// IR 的 JSON 字符串。让脚本自己 `JSON.parse`，而不是直接传对象：
+    /// 一来省掉一次宿主侧的对象构造，二来「字符串进、字符串出」的契约能用
+    /// 现成的 `FromJs for Option<String>` 把非字符串返回值直接判成不改写。
+    pub json: &'a str,
+}
+
 /// 跑一段用户脚本，返回要用的模型名。`None` = 不改写，用客户端请求的那个。
 pub fn run(source: &str, input: &ScriptInput<'_>) -> Option<String> {
     let source = source.trim();
@@ -71,6 +88,23 @@ pub fn run(source: &str, input: &ScriptInput<'_>) -> Option<String> {
     }
     cache.insert(key, MemoEntry::new(source, input, out.as_deref()));
     out
+}
+
+/// 跑一段通用改写脚本，返回脚本给出的 JSON 字符串。`None` = 不改写。
+///
+/// **故意不做 memo**。模型脚本能缓存是因为它「脚本 × 模型 × 客户端」的组合很有限，
+/// 同一组入参必然同解；改写脚本的入参里带着整个请求体，每次都不同，命中率约等于零，
+/// 而要把 body 塞进 key 就得为每条请求复制一份并哈希一遍 —— 比直接求值还贵。
+/// 失败同样不缓存：脚本有 25ms 上限，重算的成本有界，没必要为它维护一张随请求膨胀的表。
+///
+/// 除了入参对象不同，超时、内存上限、异常清理全都与 `run` 共用同一份引擎与同一套逻辑。
+pub(crate) fn run_json(source: &str, input: &JsonScriptInput<'_>) -> Option<String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+
+    with_engine(|engine| engine.call_json(source, input)).flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -170,15 +204,36 @@ impl Engine {
     }
 
     fn call(&self, source: &str, input: &ScriptInput<'_>) -> Option<String> {
+        self.run("模型脚本执行失败，按不改写处理", |ctx| {
+            Self::invoke(ctx, source, input)
+        })
+    }
+
+    fn call_json(&self, source: &str, input: &JsonScriptInput<'_>) -> Option<String> {
+        self.run("改写脚本执行失败，按不改写处理", |ctx| {
+            Self::invoke_json(ctx, source, input)
+        })
+    }
+
+    /// 两种脚本共用的外壳：设截止时刻 → 求值 → 清异常 → 收尾。
+    ///
+    /// 这段必须共用而不是各写一份：`catch()` 漏一次，一个写坏的脚本就会让本线程
+    /// 后续所有求值都在同一份挂起异常上翻车；而截止时刻漏清一次，下一次求值会
+    /// 还没开始就已经超时。两处都只在出错路径上才看得见，复制时最容易漏。
+    fn run(
+        &self,
+        log_message: &str,
+        eval: impl FnOnce(&Ctx<'_>) -> rquickjs::Result<Option<String>>,
+    ) -> Option<String> {
         self.deadline.set(Some(Instant::now() + TIMEOUT));
 
-        let out = self.ctx.with(|ctx| match Self::invoke(&ctx, source, input) {
+        let out = self.ctx.with(|ctx| match eval(&ctx) {
             Ok(v) => v,
             Err(e) => {
                 // 必须把挂起的异常取走：不清掉的话，下一次求值会立刻在同一份
                 // 挂起异常上翻车 —— 一个写坏的脚本会连累后面所有请求。
                 let _ = ctx.catch();
-                tracing::warn!(error = %e, "模型脚本执行失败，按不改写处理");
+                tracing::warn!(error = %e, "{log_message}");
                 None
             }
         });
@@ -226,12 +281,40 @@ impl Engine {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()))
     }
+
+    fn invoke_json(
+        ctx: &Ctx<'_>,
+        source: &str,
+        input: &JsonScriptInput<'_>,
+    ) -> rquickjs::Result<Option<String>> {
+        let func: Function = ctx.eval(wrapped(source))?;
+
+        let arg = Object::new(ctx.clone())?;
+        arg.set("model", input.model)?;
+        arg.set("client", input.client)?;
+        arg.set("protocol", input.protocol)?;
+        arg.set("kind", input.kind)?;
+        arg.set("json", input.json)?;
+
+        // 与 invoke 同一套判定：null/undefined → None，字符串 → Some，其它类型在
+        // 转换里报错（走 run 的失败路径）。空串与纯空白在这里就折成 None，
+        // 调用方不必再区分「返回了空串」和「没返回」。
+        let out: Option<String> = func.call((arg,))?;
+        Ok(out
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()))
+    }
 }
 
 fn evaluate(source: &str, input: &ScriptInput<'_>) -> Option<String> {
     #[cfg(test)]
     EVAL_COUNT.with(|c| c.set(c.get() + 1));
 
+    with_engine(|engine| engine.call(source, input)).flatten()
+}
+
+/// 拿到本线程的引擎（没有就建），在其上跑 `f`。`None` = 引擎起不来。
+fn with_engine<R>(f: impl FnOnce(&Engine) -> R) -> Option<R> {
     ENGINE.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
@@ -239,14 +322,14 @@ fn evaluate(source: &str, input: &ScriptInput<'_>) -> Option<String> {
                 Ok(engine) => *slot = Some(engine),
                 Err(e) => {
                     // 引擎起不来（例如 QuickJS 分配失败）也不该让请求失败。
-                    tracing::warn!(error = %e, "模型脚本引擎初始化失败，自定义规则不生效");
+                    tracing::warn!(error = %e, "脚本引擎初始化失败，自定义脚本不生效");
                     return None;
                 }
             }
         }
         // 上面的 borrow_mut 活到这一行；求值路径里没有任何东西会再进 ENGINE
         // （脚本拿不到宿主回调），所以不会有重入 panic。
-        slot.as_ref().expect("上面刚填过").call(source, input)
+        Some(f(slot.as_ref().expect("上面刚填过")))
     })
 }
 

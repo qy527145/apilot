@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { AlertTriangle, FolderOpen, Save } from "lucide-react";
 import { toast } from "sonner";
 
@@ -18,6 +19,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { qk, useAppInfo, useSettings } from "@/hooks/queries";
 import { api, type AppSettings, type ProxyMode } from "@/lib/api";
 
@@ -57,6 +59,27 @@ export default function SettingsPage() {
     setForm((f) => (f ? { ...f, [key]: value } : f));
 
   const num = (v: string) => (v === "" ? 0 : Number(v));
+
+  // 两个改写脚本的行内错因。保存前先过一遍校验：脚本写坏了只会静默不生效，
+  // 那种错用户自己很难发现（与模型脚本同一个理由）。
+  const [scriptErrors, setScriptErrors] = useState<{
+    request?: string | null;
+    response?: string | null;
+  }>({});
+
+  const checkScript = async (kind: "request" | "response") => {
+    if (!form) return;
+    const source =
+      kind === "request" ? form.request_script : form.response_script;
+    try {
+      const err = await api.validateRewriteScript(source);
+      setScriptErrors((e) => ({ ...e, [kind]: err }));
+      if (!err) toast.success("脚本语法通过");
+    } catch {
+      // call 已经弹过 toast，这里只需要把行内状态清掉。
+      setScriptErrors((e) => ({ ...e, [kind]: null }));
+    }
+  };
 
   return (
     <PageShell
@@ -264,6 +287,107 @@ export default function SettingsPage() {
                   value={form.capture_max_entries}
                   onChange={(e) => set("capture_max_entries", num(e.target.value))}
                 />
+                <p className="text-muted-foreground text-xs">
+                  流式与非流式请求都受这个上限约束。正文按 zstd 压缩落库，
+                  压缩与解压都不在请求转发的热路径上；监控页可随时清空历史。
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">提示缓存</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                <div>
+                  <Label>跨协议转 Anthropic 时自动打缓存断点</Label>
+                  <p className="text-muted-foreground text-xs">
+                    客户端说 OpenAI 协议、上游是 Anthropic 时，转换会丢掉
+                    <code> cache_control</code>。打开后网关在 system / tools /
+                    最后一条消息上补断点，长上下文能命中上游提示缓存。直通请求不碰
+                    （客户端自己的断点原样保留）。缓存写入按上游规则略贵，
+                    上下文会被复用的 Agent 会话通常是净收益。
+                  </p>
+                </div>
+                <Switch
+                  checked={form.prompt_cache_injection}
+                  onCheckedChange={(v) => set("prompt_cache_injection", v)}
+                />
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">请求 / 响应改写脚本</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <p className="text-muted-foreground text-xs leading-relaxed">
+                脚本以 <code>resolve(ctx)</code> 为入口，<code>ctx.json</code> 是 IR
+                的 JSON 字符串：<code>const o = JSON.parse(ctx.json); …; return
+                JSON.stringify(o)</code>。返回 null / 空串表示不改写；
+                语法错、抛错、超时都按不改写处理，**绝不会让请求失败**。
+                请求脚本在缓存键之前生效，改过请求时会关闭同协议直通（需要重编码）。
+              </p>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>请求改写</Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => checkScript("request")}
+                  >
+                    校验语法
+                  </Button>
+                </div>
+                <Textarea
+                  value={form.request_script}
+                  onChange={(e) => set("request_script", e.target.value)}
+                  placeholder={
+                    "function resolve(ctx) {\n  const o = JSON.parse(ctx.json);\n  o.temperature = 0;\n  return JSON.stringify(o);\n}"
+                  }
+                  className="min-h-40 font-mono text-xs"
+                  spellCheck={false}
+                />
+                {scriptErrors.request ? (
+                  <p className="text-destructive text-xs whitespace-pre-wrap">
+                    {scriptErrors.request}
+                  </p>
+                ) : null}
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>响应改写（仅非流式）</Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => checkScript("response")}
+                  >
+                    校验语法
+                  </Button>
+                </div>
+                <Textarea
+                  value={form.response_script}
+                  onChange={(e) => set("response_script", e.target.value)}
+                  placeholder={
+                    "function resolve(ctx) {\n  const o = JSON.parse(ctx.json);\n  // 例如把回答里的内网地址脱敏\n  return JSON.stringify(o);\n}"
+                  }
+                  className="min-h-40 font-mono text-xs"
+                  spellCheck={false}
+                />
+                {scriptErrors.response ? (
+                  <p className="text-destructive text-xs whitespace-pre-wrap">
+                    {scriptErrors.response}
+                  </p>
+                ) : null}
+                <p className="text-muted-foreground text-xs">
+                  真正的流式响应在收尾时客户端早已收到字节，脚本改不了它 ——
+                  只有非流式（含“客户端要流式、上游却回了完整响应”）会经过这里。
+                </p>
               </div>
             </CardContent>
           </Card>
@@ -282,6 +406,22 @@ export default function SettingsPage() {
                 <span className="text-muted-foreground w-24 shrink-0">数据库</span>
                 <code className="break-all">{info?.db_path ?? "—"}</code>
               </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-muted-foreground w-24 shrink-0">日志</span>
+                <code className="break-all">{info?.log_dir ?? "—"}</code>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={!info?.log_dir}
+                  onClick={() => info?.log_dir && openPath(info.log_dir)}
+                >
+                  打开
+                </Button>
+              </div>
+              <p className="text-muted-foreground text-xs">
+                按天滚动、保留 7 天。打包后的窗口程序没有控制台，
+                日志文件是排障时唯一能看到现场的地方。
+              </p>
               <div className="flex flex-wrap gap-2">
                 <span className="text-muted-foreground w-24 shrink-0">版本</span>
                 <code>

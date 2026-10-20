@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::CatalogSource;
 use crate::protocol::dto::Protocol;
 
 /// 渠道类型 = 该渠道说哪种线协议。
@@ -147,6 +148,72 @@ impl ProtocolEndpoint {
     }
 }
 
+/// 渠道的模型元数据（价格、能力等）从哪来。
+///
+/// 渠道与元数据是绑定的、而不是全局二选一：用户从预设加的渠道天然该跟着目录
+/// 更新（`Auto` 就是 models.dev），而自定义中转可能有自己的一套命名和定价，
+/// 那就得能单独关掉或换个来源。`Off` 是明确选项，不是"没有来源" ——
+/// 它表示"我知道有目录，但这个渠道的价格我自己填，别碰"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataSource {
+    /// 默认。等价于 models.dev：预设渠道不传这个字段时走的就是它。
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "models_dev")]
+    ModelsDev,
+    #[serde(rename = "litellm")]
+    LiteLlm,
+    /// 不从任何目录取价格 / 能力。
+    #[serde(rename = "off")]
+    Off,
+    /// 认不出的取值。同 `ChannelProxyMode::Unknown`：一个错别字不该让渠道打不开；
+    /// 读取方（`parse`）已把它折回 `Auto`，这个变体只可能来自前端 JSON。
+    #[serde(other)]
+    Unknown,
+}
+
+impl MetadataSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ModelsDev => "models_dev",
+            Self::LiteLlm => "litellm",
+            Self::Off => "off",
+            // 不该落库；真要写下去也写默认值，别把 Unknown 变成一个以后再解析不了的字符串。
+            Self::Unknown => "auto",
+        }
+    }
+
+    /// 解析库里的字符串。非法值回落 `Auto` —— 和 `AuthStyle::parse` 同样的取向：
+    /// 一条脏数据只该让这个渠道少一次自动同步，不该让它打不开。
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "models_dev" | "modelsdev" | "models.dev" => Self::ModelsDev,
+            "litellm" => Self::LiteLlm,
+            "off" => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+
+    /// 该来源对应的目录；`None` 表示这个渠道不从目录取元数据。
+    ///
+    /// `Auto` 与 `ModelsDev` 都映射到同一个目录，是因为前者是"默认"的语义，
+    /// 后者是用户明确点名 —— 对下游来说要做的事完全相同。
+    pub fn catalog_source(&self) -> Option<CatalogSource> {
+        match self {
+            Self::Auto | Self::ModelsDev => Some(CatalogSource::ModelsDev),
+            Self::LiteLlm => Some(CatalogSource::LiteLlm),
+            Self::Off | Self::Unknown => None,
+        }
+    }
+}
+
+impl Default for MetadataSource {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 /// 一个上游渠道。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -177,6 +244,9 @@ pub struct Provider {
     /// 该渠道走不走代理、走哪个。
     #[serde(default)]
     pub proxy: ChannelProxy,
+    /// 模型元数据（含价格）的来源。默认 `Auto`，即 models.dev。
+    #[serde(default)]
+    pub metadata_source: MetadataSource,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -398,6 +468,7 @@ mod tests {
             enabled: true,
             timeout_ms: 600_000,
             proxy: Default::default(),
+            metadata_source: MetadataSource::Auto,
             created_at: 0,
             updated_at: 0,
         }
@@ -702,6 +773,66 @@ mod tests {
                 "base={base} protocol={protocol:?} path={path:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 元数据来源
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metadata_source_names_roundtrip_between_db_json_and_parse() {
+        // 三处必须用同一套名字：DB 的 metadata_source 列、前端的联合类型、`as_str()`。
+        // 对不上时表现为"编辑对话框里显示的是自动，保存后却变回默认"。
+        for (source, name) in [
+            (MetadataSource::Auto, "auto"),
+            (MetadataSource::ModelsDev, "models_dev"),
+            (MetadataSource::LiteLlm, "litellm"),
+            (MetadataSource::Off, "off"),
+        ] {
+            assert_eq!(source.as_str(), name);
+            assert_eq!(MetadataSource::parse(name), source);
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{name}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<MetadataSource>(&format!("\"{name}\"")).unwrap(),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_metadata_source_degrades_to_auto() {
+        // 一个错别字不该让整条渠道读不出来，也不该悄悄变成"不同步"。
+        assert_eq!(MetadataSource::parse("nope"), MetadataSource::Auto);
+        assert_eq!(MetadataSource::parse(""), MetadataSource::Auto);
+        assert_eq!(
+            serde_json::from_str::<MetadataSource>("\"nope\"").unwrap(),
+            MetadataSource::Unknown
+        );
+        assert_eq!(MetadataSource::Unknown.catalog_source(), None);
+        // Unknown 写回库时落成默认值，之后还能被正常解析。
+        assert_eq!(MetadataSource::Unknown.as_str(), "auto");
+    }
+
+    #[test]
+    fn metadata_source_maps_to_the_catalog_it_means() {
+        assert_eq!(
+            MetadataSource::Auto.catalog_source(),
+            Some(crate::catalog::CatalogSource::ModelsDev),
+            "auto 的语义就是 models.dev"
+        );
+        assert_eq!(
+            MetadataSource::ModelsDev.catalog_source(),
+            Some(crate::catalog::CatalogSource::ModelsDev)
+        );
+        assert_eq!(
+            MetadataSource::LiteLlm.catalog_source(),
+            Some(crate::catalog::CatalogSource::LiteLlm)
+        );
+        assert_eq!(MetadataSource::Off.catalog_source(), None);
+        assert_eq!(MetadataSource::default(), MetadataSource::Auto);
     }
 
     #[test]

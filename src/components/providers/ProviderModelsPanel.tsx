@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CloudDownload, FlaskConical, ListChecks, Loader2, Plus, Trash2 } from "lucide-react";
+import {
+  CloudDownload,
+  FlaskConical,
+  ListChecks,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { CatalogCapabilitiesDialog } from "@/components/providers/CatalogCapabilitiesDialog";
@@ -108,7 +116,30 @@ export function ProviderModelsPanel({
       qc.invalidateQueries({ queryKey: qk.takeoverReadiness });
       // 能力是按「渠道 × 模型」存的，删掉某个模型声明后它的能力行也该跟着消失。
       qc.invalidateQueries({ queryKey: qk.capabilities(providerId) });
+      // 模型集合变化会触发后端按渠道来源同步价格。
+      qc.invalidateQueries({ queryKey: qk.pricing });
       toast.success("已保存该渠道支持的模型");
+    },
+  });
+
+  /**
+   * 按渠道的元数据来源同步一次价格。
+   *
+   * 保存渠道时后端已经自动做过；这里给的是「目录更新了，我想再拉一次」的入口。
+   * 手填过的价格不会被覆盖（后端按 `source` 判断）。
+   */
+  const syncPrices = useMutation({
+    mutationFn: () => api.syncProviderMetadata(providerId),
+    onSuccess: (s) => {
+      qc.invalidateQueries({ queryKey: qk.pricing });
+      toast.success(`价格已同步：新增 ${s.inserted}，更新 ${s.updated}`, {
+        description:
+          s.kept_user_owned > 0
+            ? `保留了 ${s.kept_user_owned} 条手填价格`
+            : s.inserted + s.updated === 0
+              ? "目录里没有匹配到新价格，或这个渠道设成了「不自动同步」。"
+              : undefined,
+      });
     },
   });
 
@@ -213,6 +244,19 @@ export function ProviderModelsPanel({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs font-medium">该渠道支持的模型</p>
         <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => syncPrices.mutate()}
+            disabled={syncPrices.isPending}
+          >
+            {syncPrices.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <RefreshCw className="size-4" />
+            )}
+            同步价格
+          </Button>
           <Button
             variant="outline"
             size="sm"

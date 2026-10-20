@@ -19,6 +19,8 @@ pub struct AppInfo {
     pub version: String,
     pub apilot_home: String,
     pub db_path: String,
+    /// 日志目录。打包后的窗口程序没有控制台，用户排障全靠这里。
+    pub log_dir: String,
     pub started_at: i64,
 }
 
@@ -29,6 +31,7 @@ pub fn app_info(shell: State<'_, Arc<AppShell>>) -> AppInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         apilot_home: crate::config::apilot_home().display().to_string(),
         db_path: crate::config::db_path().display().to_string(),
+        log_dir: crate::config::paths::log_dir().display().to_string(),
         started_at: shell.started_at(),
     }
 }
@@ -140,4 +143,13 @@ async fn reapply_after_policy_change(
 #[tauri::command]
 pub fn validate_model_script(source: String) -> Option<String> {
     crate::routing::model_script::validate(&source).err()
+}
+
+/// 校验一段请求 / 响应改写脚本。
+///
+/// 与模型脚本共用同一个 QuickJS 引擎与安全边界；这里只求值顶层，不真的跑一遍
+/// 改写 —— 那需要一个具体的请求体，而用户还在编辑框里打字。
+#[tauri::command]
+pub fn validate_rewrite_script(source: String) -> Option<String> {
+    crate::routing::rewrite_script::validate(&source).err()
 }

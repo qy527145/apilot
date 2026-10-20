@@ -12,5 +12,6 @@ pub mod gateway;
 pub mod logs;
 pub mod models;
 pub mod providers;
+pub mod replay;
 pub mod routing;
 pub mod takeover;

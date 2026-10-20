@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, Loader2, Trash2 } from "lucide-react";
+import { ArrowRight, GitCompareArrows, Loader2, Trash2 } from "lucide-react";
 
 import { CopyButton } from "@/components/common/CopyButton";
 import { JsonViewer, tryParseJson } from "@/components/common/JsonViewer";
 import { RawBody } from "@/components/common/RawBody";
 import { ResponseView, RequestView } from "@/components/traffic/InspectViews";
+import { ReplayDialog } from "@/components/traffic/ReplayDialog";
 import {
   StreamTimeline,
   parseTimings,
@@ -130,6 +131,7 @@ function formattedOf(d: RequestDetail, side: "client" | "upstream"): string | nu
 export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props) {
   const [view, setView] = useState<ViewMode>("visual");
   const [tab, setTab] = useState<DetailTab>("request");
+  const [replayOpen, setReplayOpen] = useState(false);
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: qk.requestDetail(requestId ?? ""),
@@ -149,8 +151,10 @@ export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
 
   // 换一条请求就清掉选中：序号是"第几个"，留着它会正好落在另一条请求的轴上别处。
+  // 回放弹窗也一并关掉 —— 它的目标是上一条请求，留着会让用户以为对比的是新的这条。
   useEffect(() => {
     setSelectedSeq(null);
+    setReplayOpen(false);
   }, [requestId]);
 
   // 时间轴只知道"第几个事件什么时候到"，不知道它发了什么。正文得从同一份捕获里的
@@ -165,18 +169,34 @@ export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props
   );
 
   return (
-    <Dialog open={!!requestId} onOpenChange={onOpenChange}>
-      {/*
-       * 弹窗必须有高度上限并把正文做成可滚动区。`min-h-0` 是关键：
-       * flex 子项默认 min-height:auto，不加就不会收缩，滚动条也不会出现。
-       */}
-      <DialogContent className="flex max-h-[88vh] flex-col gap-4 overflow-hidden sm:max-w-5xl">
-        <DialogHeader className="shrink-0">
-          <DialogTitle>请求详情</DialogTitle>
-          <DialogDescription className="font-mono text-xs">
-            {requestId}
-          </DialogDescription>
-        </DialogHeader>
+    <>
+      <Dialog open={!!requestId} onOpenChange={onOpenChange}>
+        {/*
+         * 弹窗必须有高度上限并把正文做成可滚动区。`min-h-0` 是关键：
+         * flex 子项默认 min-height:auto，不加就不会收缩，滚动条也不会出现。
+         */}
+        <DialogContent className="flex max-h-[88vh] flex-col gap-4 overflow-hidden sm:max-w-5xl">
+          <DialogHeader className="shrink-0">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <DialogTitle>请求详情</DialogTitle>
+                <DialogDescription className="font-mono text-xs">
+                  {requestId}
+                </DialogDescription>
+              </div>
+              {data ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setReplayOpen(true)}
+                  title="把这条请求重发到另一个渠道 / 模型"
+                >
+                  <GitCompareArrows className="size-4" />
+                  回放对比
+                </Button>
+              ) : null}
+            </div>
+          </DialogHeader>
 
         {isLoading ? (
           <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
@@ -348,7 +368,18 @@ export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props
           </DialogFooter>
         )}
       </DialogContent>
-    </Dialog>
+      </Dialog>
+
+      {/* 回放弹窗放在详情弹窗之外：它是一次有副作用的真实请求，
+          不该被详情页的关闭动作连带影响（Radix 嵌套弹窗的焦点也更难处理）。 */}
+      {data ? (
+        <ReplayDialog
+          detail={data}
+          open={replayOpen}
+          onOpenChange={setReplayOpen}
+        />
+      ) : null}
+    </>
   );
 }
 

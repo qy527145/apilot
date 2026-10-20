@@ -95,7 +95,29 @@ pub async fn send(
 
     // 用渠道自己的首选协议，不用入站协议 —— 探测问的是"这条渠道能不能干活"，
     // 它最擅长的那个协议才代表上限。
-    let wire = outbound.wire();
+    send_on(shell, provider, req, outbound.wire()).await
+}
+
+/// 同 [`send`]，但线协议由调用方指定。
+///
+/// 回放要用 `Provider::wire_for(入站协议)`：渠道支持入站协议就直通、不支持才
+/// 转换 —— 与真实路由的口径一致。若这里也按渠道首选协议发，回放走的路就和用户
+/// 当时那条请求不是同一条，A/B 对比也就失去了意义。
+pub async fn send_on(
+    shell: &Arc<AppShell>,
+    provider: &Provider,
+    req: &UnifiedRequest,
+    wire: Protocol,
+) -> OneshotOutcome {
+    let started = Instant::now();
+
+    let Some(outbound) = shell.registry.get(&provider.tag) else {
+        return OneshotOutcome::failed(
+            elapsed(&started),
+            wire,
+            format!("渠道 {} 未注册（可能已被删除或停用）", provider.tag),
+        );
+    };
 
     let body = match shell.codecs.codec(wire).encode_request(req) {
         Ok(b) => Bytes::from(b),
@@ -130,8 +152,8 @@ pub async fn send(
     let latency_ms = elapsed(&started);
     let status = resp.status.as_u16();
 
-    // 探测一律非流式，所以这里只可能是 Buffered。真出现流就说明渠道无视了
-    // stream=false —— 不读它，直接按"没拿到可用的回包"处理。
+    // 调用方一律按非流式发（探测与回放都是），所以这里只可能是 Buffered。
+    // 真出现流就说明渠道无视了 stream=false —— 不读它，直接按"没拿到可用的回包"处理。
     let bytes = match resp.body {
         UpstreamBody::Buffered(b) => b,
         UpstreamBody::Stream(_) => Bytes::new(),
