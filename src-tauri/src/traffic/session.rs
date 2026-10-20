@@ -25,6 +25,9 @@
 //!   不是任何一条线上的一轮。它们记在会话里，不参与分线，见 [`is_conversation_path`]。
 //! - 主线 / 子代理 / 旁路的**分类**在查询时按整个会话来定（谁的请求最多谁是主线），
 //!   单条请求自己说不清 —— 见 [`classify_threads`]。
+//! - 旁路里的**起标题**任务还顺带提供标题：它不带工具、真问题包在 `<session>` 里
+//!   （[`is_title_request`]），回复就是 `{"title": "…"}`（[`parse_generated_title`]）。
+//!   那比"取用户第一句话"准，所以它优先。
 //!
 //! system 里有**每轮都会变的片段**（Claude Code 第一段是带版本号与随机串的计费头），
 //! 指纹只取稳定的部分，见 [`system_fingerprint`]。
@@ -50,6 +53,9 @@ pub struct SessionTag {
     /// 给这个对话起的标题：用户第一条消息里的第一句话。取不到就是 `None`。
     /// 见 [`first_user_line`] —— 直接取第一段文本拿到的是客户端的提醒块，不能那么取。
     pub title: Option<String>,
+    /// 这次请求是不是客户端的「起标题」任务。是的话，响应回来时值得再看一眼 ——
+    /// 它的回复就是一整个标题，见 [`parse_generated_title`]。
+    pub title_request: bool,
 }
 
 /// 按请求头优先、body 兜底的顺序找会话 ID。
@@ -121,7 +127,54 @@ pub fn tag(headers: &HeaderMap, path: &str, body: &[u8]) -> SessionTag {
         message_count,
         has_tools,
         title: first_user_line(&json),
+        title_request: is_title_request(&json, has_tools),
     }
+}
+
+/// 是不是客户端的「起标题」任务。
+///
+/// 判据是**形状**，不是模型名：不带工具，且第一条用户消息里就有
+/// `<session>…</session>` 块。实测 Claude Code 起标题时把真问题包在 `<session>` 里，
+/// 后面跟一句英文指令让我们把标题写成什么语言；`tools` 是空数组。
+///
+/// 不拿"旁路"（不带工具）直接当判据：stop hook 求值也是旁路，但它的回复不是标题，
+/// 把那边的几个字抠出来当标题只会更糟。
+pub fn is_title_request(body: &Value, has_tools: bool) -> bool {
+    if has_tools {
+        return false;
+    }
+    let Some(messages) = messages_of(body) else {
+        return false;
+    };
+    messages
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .is_some_and(|m| names_the_session(&user_texts(m.get("content"))))
+}
+
+/// 回复里是不是裹着真问题的那层标签。清洗之前就看 —— 标签正是要被删掉的东西。
+fn names_the_session(blocks: &[&str]) -> bool {
+    blocks.iter().any(|t| t.trim_start().starts_with("<session>"))
+}
+
+/// 从起标题任务的回复里取出标题。
+///
+/// 客户端要求模型输出 `{"title": "..."}`。实测有的模型会套一层 ```json 围栏，
+/// 或者前后加一句解释，所以先切出第一对花括号再解析。
+///
+/// **解析不出非空标题就返回 `None`**：从一段自由文本里猜标题，猜出来的东西
+/// 比"没有"更糟 —— 没有的话，并发落库的「用户第一句话」会继续当标题。
+pub fn parse_generated_title(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    let value: Value = serde_json::from_str(&text[start..=end]).ok()?;
+    let title = value.get("title")?.as_str()?.trim();
+    // 标题理应只有一行；多行是模型把说明也塞进来了，取第一行。
+    let line = title.lines().next().unwrap_or(title).trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(truncate_title(line))
 }
 
 /// 标题的长度上限（**字符**，不是字节）。
@@ -142,10 +195,7 @@ const TITLE_MAX_CHARS: usize = 80;
 ///
 /// 只看**第一条** user 消息：往后翻就是对话内容了，不是开场白。
 pub fn first_user_line(body: &Value) -> Option<String> {
-    let messages = body
-        .get("messages")
-        .or_else(|| body.get("input"))
-        .and_then(Value::as_array)?;
+    let messages = messages_of(body)?;
 
     for m in messages {
         if m.get("role").and_then(Value::as_str) != Some("user") {
@@ -153,12 +203,20 @@ pub fn first_user_line(body: &Value) -> Option<String> {
         }
         let blocks = user_texts(m.get("content"));
         // 起标题请求的判据在**清洗之前**：那个 `<session>` 块正是要被删掉的东西。
-        if blocks.iter().any(|t| t.trim_start().starts_with("<session>")) {
+        if names_the_session(&blocks) {
             return None;
         }
         return blocks.iter().find_map(|t| first_meaningful_line(t));
     }
     None
+}
+
+/// 消息数组。Anthropic / Chat 在 `messages`，Responses 在 `input`。
+fn messages_of(body: &Value) -> Option<&[Value]> {
+    body.get("messages")
+        .or_else(|| body.get("input"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
 }
 
 /// 一条 user 消息里的纯文本块。
@@ -184,13 +242,17 @@ fn first_meaningful_line(text: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with("[Image:"))?;
+    Some(truncate_title(line))
+}
 
+/// 按**字符**截到 [`TITLE_MAX_CHARS`]，超出的用省略号收尾。
+fn truncate_title(line: &str) -> String {
     if line.chars().count() <= TITLE_MAX_CHARS {
-        return Some(line.to_string());
+        return line.to_string();
     }
     let mut out: String = line.chars().take(TITLE_MAX_CHARS).collect();
     out.push('…');
-    Some(out)
+    out
 }
 
 /// 删掉 `<tag …>…</tag>` 整块。
@@ -564,6 +626,66 @@ mod tests {
             }]}],
         });
         assert_eq!(first_user_line(&body), None);
+    }
+
+    #[test]
+    fn a_tool_less_request_with_the_session_tag_is_a_title_request() {
+        let title_body = json!({
+            "tools": [],
+            "messages": [{ "role": "user", "content": [{
+                "type": "text",
+                "text": "<session>\n重构路由层\n</session>\n\nWrite the title in the predominant language of the session.",
+            }]}],
+        });
+        assert!(is_title_request(&title_body, false));
+
+        // 带工具的是正常对话：哪怕正文里引用了 `<session>`，也不是起标题任务。
+        assert!(!is_title_request(&title_body, true));
+
+        // 旁路不只起标题（stop hook 求值也是），只有长这个形状的才是。
+        let hook = json!({ "tools": [], "messages": [{ "role": "user", "content": "Evaluate the stop condition" }] });
+        assert!(!is_title_request(&hook, false));
+    }
+
+    #[test]
+    fn a_title_request_is_marked_on_the_tag() {
+        let body = json!({
+            "tools": [],
+            "messages": [{ "role": "user", "content": "<session>\n重构路由层\n</session>\n\nWrite the title…" }],
+        });
+        let t = tag(&headers(&[("x-claude-code-session-id", "s")]), "/v1/messages",
+                    &serde_json::to_vec(&body).unwrap());
+        assert!(t.title_request);
+        assert_eq!(t.title, None, "起标题请求本身不提供「第一句话」标题");
+    }
+
+    #[test]
+    fn the_reply_to_a_title_request_is_parsed_as_json() {
+        assert_eq!(parse_generated_title(r#"{"title": "carter-app 内置 ripgrep"}"#).as_deref(),
+                   Some("carter-app 内置 ripgrep"));
+        // 有的模型会套围栏或前后加一句话。
+        assert_eq!(parse_generated_title("```json\n{\"title\": \"重构路由层\"}\n```").as_deref(),
+                   Some("重构路由层"));
+        assert_eq!(parse_generated_title("Here you go: {\"title\": \"重构路由层\"}").as_deref(),
+                   Some("重构路由层"));
+    }
+
+    #[test]
+    fn an_unparseable_title_reply_is_given_up_on() {
+        // 拿不到就保持「用户第一句话」—— 从自由文本里猜标题只会更糟。
+        assert_eq!(parse_generated_title("重构路由层"), None);
+        assert_eq!(parse_generated_title(r#"{"title": ""}"#), None);
+        assert_eq!(parse_generated_title(r#"{"title": 42}"#), None);
+        assert_eq!(parse_generated_title(r#"{"name": "重构路由层"}"#), None);
+        assert_eq!(parse_generated_title(""), None);
+    }
+
+    #[test]
+    fn a_generated_title_is_cut_like_a_first_line() {
+        let long = format!(r#"{{"title": "{}"}}"#, "长".repeat(200));
+        let title = parse_generated_title(&long).unwrap();
+        assert_eq!(title.chars().count(), TITLE_MAX_CHARS + 1);
+        assert!(title.ends_with('…'));
     }
 
     #[test]

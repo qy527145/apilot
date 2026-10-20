@@ -25,8 +25,9 @@ pub struct SessionSummary {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub quota: i64,
-    /// 这个对话的标题（用户第一条消息的第一句话）。老会话或取不出时为 `None`，
-    /// 界面回落到 `客户端 #会话ID`。来源见 `traffic::session::first_user_line`。
+    /// 这个对话的标题。优先用客户端起标题任务的产出（`{"title": "…"}`），
+    /// 拿不到才用用户第一条消息的第一句话。老会话或取不出时为 `None`，
+    /// 界面回落到 `客户端 #会话ID`。来源见 [`TitleSource`]。
     pub title: Option<String>,
     /// 会话里用到过的生效模型，按首次出现排序。多个就说明中途换过模型。
     pub models: Vec<String>,
@@ -127,13 +128,48 @@ pub async fn list(pool: &SqlitePool, f: &SessionFilter) -> AppResult<Vec<Session
     Ok(out)
 }
 
+/// 标题从哪来。决定它能不能覆盖已有的那一行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleSource {
+    /// 用户第一条消息里的第一句话。
+    FirstLine,
+    /// 客户端起标题任务的产出（`{"title": "…"}`）。模型专门起的名字，比切一句准。
+    Generated,
+}
+
 /// 记下这个对话的标题。
 ///
-/// **谁先到谁说话**（`INSERT OR IGNORE`）：同一个会话的每一条请求里都还带着那句
-/// 开场白，所以正常情况下先落的那条就是对的；反过来「后来者覆盖」会在上下文压缩
-/// 之后把标题改成摘要，那才是错的。取不出标题的请求（起标题任务、只有图）不写。
-pub async fn save_title(pool: &SqlitePool, session_id: &str, title: &str, ts: i64) -> AppResult<()> {
-    sqlx::query("INSERT OR IGNORE INTO session_titles (session_id, title, ts) VALUES (?1, ?2, ?3)")
+/// 两个来源的规则不同：
+///
+/// - `FirstLine`：**谁先到谁说话**（`INSERT OR IGNORE`）。同一个会话的每一条请求
+///   里都还带着那句开场白，正常情况下先落的就是对的；反过来「后来者覆盖」会在
+///   上下文压缩之后把标题改成摘要，那才是错的。
+/// - `Generated`：**覆盖 `FirstLine`，但不覆盖另一个 `Generated`**。起标题任务
+///   是客户端请模型专门起的名字，比切一刀准；而同一会话后面再起一次标题，
+///   也不该把用户已经看惯的那个换掉。
+///
+/// 取不出标题就什么都不写（开场只有一张图、起标题任务的回复解析不出 JSON）。
+pub async fn save_title(
+    pool: &SqlitePool,
+    session_id: &str,
+    title: &str,
+    ts: i64,
+    source: TitleSource,
+) -> AppResult<()> {
+    let sql = match source {
+        TitleSource::FirstLine => {
+            "INSERT OR IGNORE INTO session_titles (session_id, title, ts, source) \
+             VALUES (?1, ?2, ?3, 'first_line')"
+        }
+        TitleSource::Generated => {
+            "INSERT INTO session_titles (session_id, title, ts, source) \
+             VALUES (?1, ?2, ?3, 'generated') \
+             ON CONFLICT(session_id) DO UPDATE SET \
+                 title = excluded.title, ts = excluded.ts, source = excluded.source \
+             WHERE session_titles.source <> 'generated'"
+        }
+    };
+    sqlx::query(sql)
         .bind(session_id)
         .bind(title)
         .bind(ts)
@@ -345,7 +381,9 @@ mod tests {
             rec("a1", 1, "A", "main", 1, true, "flash"),
             rec("b1", 2, "B", "main", 1, true, "flash"),
         ]).await;
-        save_title(&pool, "A", "帮我生成一下上周的ReleaseNote", 1).await.unwrap();
+        save_title(&pool, "A", "帮我生成一下上周的ReleaseNote", 1, TitleSource::FirstLine)
+            .await
+            .unwrap();
 
         let list = list(&pool, &SessionFilter { limit: 10, ..Default::default() }).await.unwrap();
         let a = list.iter().find(|s| s.session_id == "A").unwrap();
@@ -362,11 +400,47 @@ mod tests {
         // 压缩之后请求里带的"第一句话"是摘要 —— 那时再覆盖，标题就变成了摘要。
         let pool = crate::storage::db::open_memory().await.unwrap();
         seed(&pool, &[rec("1", 1, "S", "main", 1, true, "m")]).await;
-        save_title(&pool, "S", "重构路由层", 1).await.unwrap();
-        save_title(&pool, "S", "This session is being continued…", 2).await.unwrap();
+        save_title(&pool, "S", "重构路由层", 1, TitleSource::FirstLine).await.unwrap();
+        save_title(&pool, "S", "This session is being continued…", 2, TitleSource::FirstLine)
+            .await
+            .unwrap();
 
         let list = list(&pool, &SessionFilter { limit: 10, ..Default::default() }).await.unwrap();
         assert_eq!(list[0].title.as_deref(), Some("重构路由层"));
+    }
+
+    #[tokio::test]
+    async fn a_generated_title_beats_the_first_line_whichever_arrives_first() {
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        seed(&pool, &[
+            rec("a1", 1, "A", "main", 1, true, "m"),
+            rec("b1", 1, "B", "main", 1, true, "m"),
+        ]).await;
+        // A：第一句话先落，起标题任务的产出后到。
+        save_title(&pool, "A", "现在 apilot 会感知到一个旁路请求…", 1, TitleSource::FirstLine)
+            .await
+            .unwrap();
+        save_title(&pool, "A", "apilot 旁路请求标题", 2, TitleSource::Generated).await.unwrap();
+        // B：顺序反过来。第一句话不能把已经落下的生成标题盖回去。
+        save_title(&pool, "B", "客户端起的名字", 1, TitleSource::Generated).await.unwrap();
+        save_title(&pool, "B", "这是用户的第一句话", 2, TitleSource::FirstLine).await.unwrap();
+
+        let list = list(&pool, &SessionFilter { limit: 10, ..Default::default() }).await.unwrap();
+        let title = |sid: &str| list.iter().find(|s| s.session_id == sid).unwrap().title.clone();
+        assert_eq!(title("A").as_deref(), Some("apilot 旁路请求标题"));
+        assert_eq!(title("B").as_deref(), Some("客户端起的名字"));
+    }
+
+    #[tokio::test]
+    async fn a_later_generated_title_does_not_replace_the_first_one() {
+        // 客户端再起一次标题不该把用户看惯的那个换掉。
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        seed(&pool, &[rec("1", 1, "S", "main", 1, true, "m")]).await;
+        save_title(&pool, "S", "第一次起的名字", 1, TitleSource::Generated).await.unwrap();
+        save_title(&pool, "S", "后来起的名字", 2, TitleSource::Generated).await.unwrap();
+
+        let list = list(&pool, &SessionFilter { limit: 10, ..Default::default() }).await.unwrap();
+        assert_eq!(list[0].title.as_deref(), Some("第一次起的名字"));
     }
 
     #[tokio::test]

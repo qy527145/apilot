@@ -459,6 +459,22 @@ CREATE TABLE IF NOT EXISTS session_titles (
   ts          INTEGER NOT NULL
 );
 "#,
+    // --- v14: 标题的来源 ---
+    //
+    // 动机：Claude Code 开局会发一条**起标题任务**（不带工具、真问题包在
+    // `<session>` 里），回复就是 `{"title": "…"}`。那是模型专门起的名字，比
+    // 「用户第一句话切一刀」准得多（见 `traffic/session::parse_generated_title`）。
+    //
+    // 两个来源的优先级不同，而 `INSERT OR IGNORE` 表达不了「后到的高优先级覆盖
+    // 先到的低优先级」，所以得记住来源：`generated` 可以覆盖 `first_line`，
+    // 反过来不行；同来源仍是先到者说话（压缩后请求里带的"第一句"是摘要，
+    // 后来再起一次标题也不该把用户看惯的那个换掉）。
+    //
+    // 老行一律 `first_line` —— 它们本来就是那么来的。老对话的起标题任务早就发过了，
+    // 不会补上；这与 v13「老会话不回填」的取舍一致。
+    r#"
+ALTER TABLE session_titles ADD COLUMN source TEXT NOT NULL DEFAULT 'first_line';
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -470,7 +486,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(SCHEMA_VERSION, 14);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 
