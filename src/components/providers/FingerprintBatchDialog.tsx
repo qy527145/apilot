@@ -76,6 +76,7 @@ export function FingerprintBatchDialog({
   const [mode, setMode] = useState<ChallengeMode>("random");
   const [selectedChallenges, setSelectedChallenges] = useState<string[]>([]);
   const [confirmed, setConfirmed] = useState(false);
+  const [setup, setSetup] = useState(true);
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<Record<string, FingerprintDetection>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -98,6 +99,7 @@ export function FingerprintBatchDialog({
     setMode("random");
     setSelectedChallenges([]);
     setConfirmed(false);
+    setSetup(true);
     setRunning(false);
     setResults({});
     setErrors({});
@@ -173,6 +175,7 @@ export function FingerprintBatchDialog({
   const startBatch = async () => {
     if (selected.length === 0) return;
     if (mode === "manual" && selectedChallenges.length !== 3) return;
+    setSetup(false);
     setRunning(true);
     setResults({});
     setErrors({});
@@ -201,11 +204,6 @@ export function FingerprintBatchDialog({
       item.upstream.toLowerCase().includes(keyword)
     );
   });
-  const hasStarted =
-    running ||
-    activeModel !== null ||
-    Object.keys(results).length > 0 ||
-    Object.keys(errors).length > 0;
   const total = selected.length;
   const failed = Object.keys(errors).length;
   const percent = total > 0 ? Math.min(100, (completed / total) * 100) : 0;
@@ -253,7 +251,7 @@ export function FingerprintBatchDialog({
         </DialogHeader>
 
         <ScrollArea className="min-h-0 flex-1 pr-2">
-          {!hasStarted && (
+          {setup && (
             <div className="space-y-4">
               <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
                 <div className="mb-1 flex items-center gap-2 font-medium">
@@ -360,7 +358,7 @@ export function FingerprintBatchDialog({
             </div>
           )}
 
-          {hasStarted && (
+          {!setup && (
             <div className="space-y-3">
               <div className="space-y-1">
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -514,8 +512,13 @@ export function FingerprintBatchDialog({
         </ScrollArea>
 
         <DialogFooter className="bg-background relative z-10 shrink-0 pt-2">
-          {hasStarted ? (
+          {!setup ? (
             <>
+              {!running && (
+                <Button variant="ghost" onClick={() => setSetup(true)}>
+                  返回设置
+                </Button>
+              )}
               <Button
                 variant="outline"
                 disabled={running}
