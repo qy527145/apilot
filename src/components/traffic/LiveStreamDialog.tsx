@@ -6,7 +6,7 @@ import {
   useState,
   type UIEvent,
 } from "react";
-import { ArrowDownToLine, Loader2, Radio } from "lucide-react";
+import { ArrowDownToLine, Loader2, Radio, SkipForward } from "lucide-react";
 
 import { CopyButton } from "@/components/common/CopyButton";
 import { StreamTimeline } from "@/components/traffic/StreamTimeline";
@@ -133,6 +133,12 @@ function frameName(frame: StreamFrame): string {
 
 interface Props {
   live: LiveRequest | null;
+  /**
+   * 当前这条已结束、且还有别的请求在跑时，可供跳转的下一条。
+   * 没有（还在跑，或者全都跑完了）就不显示那个按钮。
+   */
+  nextRequestId?: string | null;
+  onGoToNext?: (requestId: string) => void;
   onOpenChange: (open: boolean) => void;
 }
 
@@ -142,7 +148,12 @@ interface Props {
  * 数据来自 `apilot://stream` 事件，不查数据库 —— 流式请求在整条流结束前
  * **根本没有落库**，查也查不到。
  */
-export function LiveStreamDialog({ live, onOpenChange }: Props) {
+export function LiveStreamDialog({
+  live,
+  nextRequestId,
+  onGoToNext,
+  onOpenChange,
+}: Props) {
   // 用 null 表示"跟随最新"，用序号表示"固定在某帧"。
   // 不用 frames[frames.length-1] 作默认值，避免每帧都触发 raw 面板重渲染。
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
@@ -222,6 +233,18 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
             )}
             {live && !live.done && <Badge variant="success">进行中</Badge>}
             {live?.truncated && <Badge variant="secondary">已截断</Badge>}
+            {live?.done && nextRequestId && onGoToNext && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="ml-auto h-6 px-2 text-[11px]"
+                title="跳到下一条还在跑的请求"
+                onClick={() => onGoToNext(nextRequestId)}
+              >
+                <SkipForward className="size-3" />
+                下一条进行中
+              </Button>
+            )}
           </DialogTitle>
           <DialogDescription className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
             {live && (

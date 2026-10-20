@@ -439,6 +439,20 @@ export default function TrafficPage() {
 
   const openLive = liveStream ? inflight.get(liveStream) ?? null : null;
 
+  // 当前这条跑完之后，下一步看哪条。长回答往往连着好几个请求（主回答 + 子代理），
+  // 一条结束就停在「已结束」上没有意义 —— 按开始时间找紧挨着的下一条还在跑的，
+  // 到末尾了就绕回最早的那条。
+  const nextLiveId = useMemo(() => {
+    if (!liveStream) return null;
+    const cur = inflight.get(liveStream);
+    if (!cur?.done) return null;
+    const running = [...inflight.values()]
+      .filter((r) => !r.done && r.request_id !== liveStream)
+      .sort((a, b) => a.ts - b.ts);
+    if (running.length === 0) return null;
+    return (running.find((r) => r.ts > cur.ts) ?? running[0]).request_id;
+  }, [inflight, liveStream]);
+
   // 表达式在后端执行，其错因（语法错、执行超时）只有查询失败时才拿得到，
   // 顺手显示出来 —— 否则用户只能看到一个笼统的「加载失败」。
   const errorMessage = error instanceof Error ? error.message : null;
@@ -919,6 +933,8 @@ export default function TrafficPage() {
 
       <LiveStreamDialog
         live={openLive}
+        nextRequestId={nextLiveId}
+        onGoToNext={setLiveStream}
         onOpenChange={(o) => !o && setLiveStream(null)}
       />
 
