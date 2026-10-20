@@ -364,6 +364,9 @@ impl StreamEncoder for ChatStreamEncoder {
                 }
             }
 
+            // OpenAI 系没有思考签名这回事，跨协议时签名本来就会被剥掉。
+            UnifiedDelta::ThinkingSignature { .. } => {}
+
             UnifiedDelta::ToolInputDelta {
                 index,
                 partial_json,

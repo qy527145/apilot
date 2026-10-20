@@ -31,7 +31,9 @@ use crate::storage::sessions::TitleSource;
 use crate::upstream::outbound::{Outbound, UpstreamBody, UpstreamError};
 
 use super::router::{protocol_family, upstream_path};
-use super::stream::{translate_stream_observed, StreamOutcome, StreamTimeouts};
+use super::stream::{
+    translate_stream_with_rewrite, StreamOutcome, StreamRewrite, StreamTimeouts,
+};
 
 /// 从请求头 / 路径识别调用方。
 ///
@@ -1245,8 +1247,34 @@ async fn try_outbound(
     // ---- 流式 ----
     if req.stream {
         let decoder = shell.codecs.codec(wire).new_stream_decoder();
-        // 同协议走直通（不重编码），异协议才用编码器。
-        let encoder = needs_conversion.then(|| shell.codecs.codec(protocol_in).new_stream_encoder());
+        let settings = shell.settings();
+        let script = settings.response_script.clone();
+
+        // 响应脚本默认只管非流式。打开 `response_script_on_stream` 后必须先把
+        // 整条流收完再改写、再以 SSE 回放 —— 代价是首字延迟变成整条流的耗时，
+        // 所以这个取舍只能由用户显式打开。
+        let rewriting_stream =
+            !script.trim().is_empty() && settings.response_script_on_stream;
+
+        // 同协议走直通（不重编码），异协议或需要缓冲改写时才用编码器。
+        let encoder = if needs_conversion || rewriting_stream {
+            Some(shell.codecs.codec(protocol_in).new_stream_encoder())
+        } else {
+            None
+        };
+
+        let rewrite = rewriting_stream.then(|| StreamRewrite {
+            id: recorder.record.request_id.clone(),
+            model: req.model.clone(),
+            apply: Box::new({
+                let script = script.clone();
+                let client = recorder.record.client.clone();
+                let model = req.model.clone();
+                move |resp: UnifiedResponse| {
+                    rewrite_response_with(&script, protocol_in, &client, &model, resp)
+                }
+            }),
+        });
 
         let upstream_stream = match resp.body {
             UpstreamBody::Stream(s) => s,
@@ -1260,7 +1288,6 @@ async fn try_outbound(
             }
         };
 
-        let settings = shell.settings();
         let timeouts = StreamTimeouts {
             first_byte: std::time::Duration::from_millis(settings.first_byte_timeout_ms),
             idle: std::time::Duration::from_millis(settings.idle_timeout_ms),
@@ -1332,12 +1359,13 @@ async fn try_outbound(
             shell.inflight.clone(),
         ));
 
-        let body = translate_stream_observed(
+        let body = translate_stream_with_rewrite(
             upstream_stream,
             decoder,
             encoder,
             timeouts,
             Some(observer),
+            rewrite,
             move |outcome| finalize_stream(ctx, outcome),
         );
 
@@ -1384,6 +1412,50 @@ async fn try_outbound(
 
 /// 处理非流式（或上游一次性返回的）响应。
 #[allow(clippy::too_many_arguments)]
+/// 跑响应改写脚本。`Some` = 确实改写了。
+///
+/// 非流式与「缓冲整条流再改写」共用这一份：`id` / `model` 是客户端认的契约字段，
+/// 两条路都必须把它们还原成上游给的原值 —— 一个脱敏或改文案的脚本没有理由
+/// 顺手换掉模型名，而两条路一旦处理不一致，客户端看到的模型名就会因为
+/// "是不是流式"而不同。
+fn rewrite_response_with(
+    script: &str,
+    protocol: Protocol,
+    client: &str,
+    model: &str,
+    resp: UnifiedResponse,
+) -> Option<UnifiedResponse> {
+    let script = script.trim();
+    if script.is_empty() {
+        return None;
+    }
+
+    let value = serde_json::to_value(&resp).ok()?;
+    let next = crate::routing::rewrite_script::apply(
+        script,
+        client,
+        protocol.as_str(),
+        model,
+        "response",
+        &value,
+    )?;
+
+    match serde_json::from_value::<UnifiedResponse>(next) {
+        Ok(mut r) => {
+            r.id = resp.id.clone();
+            r.model = resp.model.clone();
+            Some(r)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "响应改写脚本返回的结构不合法，按不改写处理"
+            );
+            None
+        }
+    }
+}
+
 async fn finish_buffered(
     shell: &Arc<AppShell>,
     protocol_in: Protocol,
@@ -1478,39 +1550,23 @@ async fn finish_buffered(
 
     // ---- 响应改写脚本 ----
     //
-    // **只对非流式生效**（含"客户端要流式、上游却回了完整响应"这种伪流式）：
-    // 真正的流式在收尾时客户端早已收到字节，此时再改只是骗自己。
+    // 这条分支覆盖非流式（含"客户端要流式、上游却回了完整响应"这种伪流式）。
+    // 真正的流式走 `translate_stream_with_rewrite`：只有在设置里显式打开
+    // `response_script_on_stream` 时才会先缓冲整条流再改写。
     //
     // 位置在计费之后：这次请求花了多少 token 是上游的客观事实，脚本不该能通过
     // 增删内容把它改小。位置在写缓存之前：缓存里存的必须是客户端真正看到的那份。
-    let script = shell.settings().response_script.trim().to_string();
-    if !script.is_empty() {
-        if let Ok(value) = serde_json::to_value(&decoded) {
-            if let Some(next) = crate::routing::rewrite_script::apply(
-                &script,
-                &recorder.record.client,
-                protocol_in.as_str(),
-                &recorder.record.model,
-                "response",
-                &value,
-            ) {
-                match serde_json::from_value::<UnifiedResponse>(next) {
-                    Ok(mut r) => {
-                        // `id` / `model` 是客户端认的契约字段，脚本改了也还原 ——
-                        // 一个脱敏或改文案的脚本没有理由顺手换掉模型名。
-                        r.id = decoded.id.clone();
-                        r.model = decoded.model.clone();
-                        decoded = r;
-                        // 同协议本来会透传原始字节，脚本改动只有重编码才落地。
-                        needs_conversion = true;
-                    }
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "响应改写脚本返回的结构不合法，按不改写处理"
-                    ),
-                }
-            }
-        }
+    let script = shell.settings().response_script.clone();
+    if let Some(r) = rewrite_response_with(
+        &script,
+        protocol_in,
+        &recorder.record.client,
+        &recorder.record.model,
+        decoded.clone(),
+    ) {
+        decoded = r;
+        // 同协议本来会透传原始字节，脚本改动只有重编码才落地。
+        needs_conversion = true;
     }
 
     // 写缓存：把这次的结果存下来供后续相同请求复用。

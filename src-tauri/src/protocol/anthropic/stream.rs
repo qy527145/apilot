@@ -172,9 +172,14 @@ impl AnthropicStreamDecoder {
                 vec![UnifiedDelta::ThinkingDelta { index, text }]
             }
             "signature_delta" => {
-                // 签名本身对计费与文本无意义，但转换到同协议时必须原样回传。
-                // 这里记录到 thinking 累积器的尾部由 encoder 处理；解码侧暂不产出 delta。
-                Vec::new()
+                // 签名本身对计费与文本无意义，但同协议重编码（缓存重放 /
+                // 缓冲改写）必须原样带回去，所以它得作为一条 IR 增量活下来。
+                let signature = delta
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                vec![UnifiedDelta::ThinkingSignature { index, signature }]
             }
             "input_json_delta" => {
                 let partial = delta
@@ -490,6 +495,20 @@ impl StreamEncoder for AnthropicStreamEncoder {
                 ));
             }
 
+            UnifiedDelta::ThinkingSignature { index, signature } => {
+                self.ensure_started(&mut out);
+                self.ensure_block_open(*index, &mut out);
+                out.push(SseEvent::named(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "signature_delta", "signature": signature },
+                    })
+                    .to_string(),
+                ));
+            }
+
             UnifiedDelta::ToolInputDelta { index, partial_json } => {
                 self.ensure_started(&mut out);
                 self.ensure_block_open(*index, &mut out);
@@ -600,6 +619,44 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_signature_delta_survives_as_an_ir_delta() {
+        // 签名不影响正文与计费，但同协议重编码（缓存重放 / 缓冲改写）要靠它
+        // 把思考块原样还回去。以前这里直接 `Vec::new()` 丢掉，重编码后签名就没了。
+        let mut dec = AnthropicStreamDecoder::new();
+        let deltas = decode_all(
+            &mut dec,
+            &[
+                SseEvent::named(
+                    "message_start",
+                    r#"{"type":"message_start","message":{"id":"m","model":"x"}}"#,
+                ),
+                SseEvent::named(
+                    "content_block_start",
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                ),
+                SseEvent::named(
+                    "content_block_delta",
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想"}}"#,
+                ),
+                SseEvent::named(
+                    "content_block_delta",
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}"#,
+                ),
+                SseEvent::named(
+                    "content_block_stop",
+                    r#"{"type":"content_block_stop","index":0}"#,
+                ),
+                SseEvent::named("message_stop", r#"{"type":"message_stop"}"#),
+            ],
+        );
+
+        assert!(deltas.iter().any(|d| matches!(
+            d,
+            UnifiedDelta::ThinkingSignature { signature, .. } if signature == "sig-1"
+        )));
     }
 
     #[test]

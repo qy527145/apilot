@@ -361,7 +361,7 @@ export default function SettingsPage() {
 
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <Label>响应改写（仅非流式）</Label>
+                  <Label>响应改写</Label>
                   <Button
                     variant="outline"
                     size="sm"
@@ -384,10 +384,22 @@ export default function SettingsPage() {
                     {scriptErrors.response}
                   </p>
                 ) : null}
-                <p className="text-muted-foreground text-xs">
-                  真正的流式响应在收尾时客户端早已收到字节，脚本改不了它 ——
-                  只有非流式（含“客户端要流式、上游却回了完整响应”）会经过这里。
-                </p>
+                <div className="flex items-center justify-between rounded-md border px-3 py-2">
+                  <div>
+                    <Label>流式响应也执行改写</Label>
+                    <p className="text-muted-foreground text-xs">
+                      关闭时流式逐帧直通/转码，只有非流式经过脚本。
+                      打开后，流式会先把上游整条流收完再改写、再以 SSE 回放：
+                      内容能改，但客户端要等整条回答生成完才看到第一个字。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={form.response_script_on_stream}
+                    onCheckedChange={(v) =>
+                      set("response_script_on_stream", v)
+                    }
+                  />
+                </div>
               </div>
             </CardContent>
           </Card>

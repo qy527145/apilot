@@ -481,10 +481,18 @@ pub struct AppSettings {
 
     /// 响应改写脚本（JS）。空 = 不改写。
     ///
-    /// **只对非流式生效**：流式响应在收尾时客户端早就收到了字节，此时再改已经
-    /// 没有意义。跨协议改写还会顺带关闭直通（必须重编码才能落地）。
+    /// 默认只对非流式生效：流式响应边收边转，等收完再改时客户端早就看到了。
+    /// 想让流式也经过脚本，打开 [`Self::response_script_on_stream`]。
     #[serde(default)]
     pub response_script: String,
+
+    /// 流式响应也执行改写脚本。
+    ///
+    /// **代价很大，所以默认关**：脚本契约吃的是完整响应，只能先把上游整条流收完、
+    /// 改写、再以 SSE 回放 —— 客户端要等整条回答生成完才看到第一个字。
+    /// 不打开时流式保持直通/转码，逐帧到达。
+    #[serde(default)]
+    pub response_script_on_stream: bool,
 }
 
 /// 接管时对客户端模型配置做什么。
@@ -678,6 +686,7 @@ impl Default for AppSettings {
             prompt_cache_injection: true,         // Agent 会话的上下文通常会被复用
             request_script: String::new(),
             response_script: String::new(),
+            response_script_on_stream: false,
         }
     }
 }
@@ -1385,6 +1394,7 @@ mod tests {
         assert!(s.prompt_cache_injection, "缺字段时默认开启提示缓存注入");
         assert!(s.request_script.is_empty());
         assert!(s.response_script.is_empty());
+        assert!(!s.response_script_on_stream, "流式改写默认关闭");
     }
 
     #[test]

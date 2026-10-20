@@ -63,7 +63,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `dto.rs` | IR 定义：`Protocol`、`Role`、`ContentBlock`、`UnifiedRequest` / `UnifiedResponse`、`UnifiedUsage`、`UnifiedDelta`、`FinishReason` |
+| `dto.rs` | IR 定义：`Protocol`、`Role`、`ContentBlock`、`UnifiedRequest` / `UnifiedResponse`、`UnifiedUsage`、`UnifiedDelta`（含 `ThinkingSignature` —— Anthropic 思考签名，同协议重编码必须带回）、`FinishReason` |
 | `codec.rs` | `Codec` / `StreamDecoder` / `StreamEncoder` trait、`ConvertError`、**`CodecRegistry`**（转换调度入口） |
 | `anthropic/` | Anthropic Messages 的 `mod`（Codec 实现）/ `request` / `response` / `stream` |
 | `oai_chat/` | OpenAI Chat Completions，同结构 |
@@ -105,7 +105,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 |---|---|---|
 | **同协议直通** | 入站协议 == 渠道声明的协议 | 仍在对话那条路上。转发原始字节，只把 `model` 换成映射后的名字；不解码再编码 |
 | **非对话原样转发** | 路径不是三种对话入口 | 走 `handle_raw`。**连 IR 都不解**，只从 body 里取一个 `model` 用来选渠道，请求与响应都原样收发，上游的报错也不包装 |
-| `stream.rs` | `translate_stream()`（上游流 → 下游流）、`stream_from_response()`（缓存重放流）、**`ContentAccumulator`**（从增量重建完整内容，供缓存写入）、**`StreamTimings`**（每个事件的时间点，供时间轴；平行数组 + 名字表，两千帧几 KB）。`delta_display_name()` 那套名字**必须与前端 `StreamDelta` 的 serde 标签逐字相同**，有测试钉着 |
+| `stream.rs` | `translate_stream_with_rewrite()`（上游流 → 下游流；可选的 `StreamRewrite` 会**先缓冲整条流**，收尾后改写再用 `response_to_deltas()` 合成 SSE）、`stream_from_response()`（缓存重放 / 缓冲改写共用的合成流）、**`ContentAccumulator`**（从增量重建完整内容，供缓存写入；保留 `ThinkingSignature`）、**`StreamTimings`**（每个事件的时间点，供时间轴；平行数组 + 名字表，两千帧几 KB）。`delta_display_name()` 那套名字**必须与前端 `StreamDelta` 的 serde 标签逐字相同**，有测试钉着 |
 | `sse.rs` | SSE 原语：`take_sse_block`（两种分隔符取最早）、`append_utf8_safe`（跨 chunk 多字节）、`parse_event` / `encode_event` |
 | `proxy_e2e.rs` | 端到端测试：起真实上游 HTTP 服务跑通全链路 |
 

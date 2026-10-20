@@ -491,6 +491,12 @@ pub enum UnifiedDelta {
     BlockStart { index: u32, block: ContentBlock },
     TextDelta { index: u32, text: String },
     ThinkingDelta { index: u32, text: String },
+    /// 思考块的签名（Anthropic 专有）。
+    ///
+    /// 签名不影响计费与正文，但**同协议重编码必须原样带回去**：缓存重放、
+    /// 缓冲改写都会重建整条流，丢了签名，客户端下一轮回传时上游会拒收。
+    /// 跨协议时仍由 `strip_unportable_thinking` 整体剥离。
+    ThinkingSignature { index: u32, signature: String },
     /// 工具入参的分片 JSON。**未收齐前不可解析**。
     ToolInputDelta { index: u32, partial_json: String },
     BlockStop { index: u32 },

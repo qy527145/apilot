@@ -92,6 +92,8 @@ pub enum StreamDelta {
     BlockStart { index: u32, block: ContentBlock },
     Text { index: u32, text: String },
     Thinking { index: u32, text: String },
+    /// 思考签名。只报 index：签名本身很长，实时视图看原始帧就够了。
+    ThinkingSignature { index: u32 },
     ToolInput { index: u32, partial_json: String },
     BlockStop { index: u32 },
     Usage(UsageDelta),
@@ -118,6 +120,9 @@ impl From<&UnifiedDelta> for StreamDelta {
                 index: *index,
                 text: text.clone(),
             },
+            UnifiedDelta::ThinkingSignature { index, .. } => {
+                Self::ThinkingSignature { index: *index }
+            }
             UnifiedDelta::ToolInputDelta {
                 index,
                 partial_json,

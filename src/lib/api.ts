@@ -352,8 +352,15 @@ export interface AppSettings {  listen_host: string;
   prompt_cache_injection: boolean;
   /** 请求改写脚本（JS）。空 = 不改写。 */
   request_script: string;
-  /** 响应改写脚本（JS，仅非流式）。空 = 不改写。 */
+  /** 响应改写脚本（JS）。空 = 不改写。 */
   response_script: string;
+  /**
+   * 流式响应也执行改写。默认关。
+   *
+   * 打开后网关会先把整条上游流收完再改写、再以 SSE 回放 —— 内容能改，
+   * 但客户端要等整条回答生成完才看到第一个字。
+   */
+  response_script_on_stream: boolean;
 }
 
 /* ------------------------------ 路由规则 ------------------------------ */
@@ -858,6 +865,8 @@ export type StreamDelta =
   | { kind: "block_start"; index: number; block: ContentBlock }
   | { kind: "text"; index: number; text: string }
   | { kind: "thinking"; index: number; text: string }
+  // 思考签名只报 index：签名本身很长，实时视图看原始帧就够了。
+  | { kind: "thinking_signature"; index: number }
   | { kind: "tool_input"; index: number; partial_json: string }
   | { kind: "block_stop"; index: number }
   | {
