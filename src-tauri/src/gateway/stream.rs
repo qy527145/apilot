@@ -136,6 +136,11 @@ pub struct StreamOutcome {
     pub timings: StreamTimings,
     pub finish_reason: Option<FinishReason>,
     pub error: Option<String>,
+    /// 流是**被丢弃**的（客户端断开 / 请求被取消），不是跑完的。
+    ///
+    /// 与 `error` 分开：客户端断连时上游并没有报错，把它归成 502 会让客户端
+    /// 以为是网关或上游抽风。收尾按 499（nginx 的「客户端关闭请求」）记。
+    pub aborted: bool,
 }
 
 /// 有上限地累积原始帧。到顶之后不再增长，只把 `truncated` 立起来。
@@ -352,6 +357,83 @@ fn apply_delta_rewrite(
     out
 }
 
+/// 一条流的收尾状态，**由 `Drop` 兜底**。
+///
+/// 只在生成器末尾调 `on_finish` 是不够的：`Body::from_stream` 的消费者随时可能
+/// 在某个 `yield` 之后直接丢掉这条流 —— 客户端收完 `[DONE]` 就关连接是最常见的
+/// 一种，hyper 于是把 Body 丢给析构，生成器后面那些记账代码一行都跑不到。
+/// 那条请求既不进日志、也不进捕获，监控页上表现就是「并发发了三个，结束后只剩两个」。
+///
+/// 所以状态放在这个结构里、收尾放在 `Drop` 里：正常跑完显式调一次 `finalize`，
+/// 被丢弃时由析构补上，二者靠 `finished` 保证只发生一次。
+struct StreamTail<F: FnOnce(StreamOutcome)> {
+    start: Instant,
+    outcome: StreamOutcome,
+    acc: ContentAccumulator,
+    decoder: Box<dyn StreamDecoder>,
+    observer: Option<Box<dyn StreamObserver>>,
+    passthrough: bool,
+    raw_upstream: RawBuffer,
+    raw_client: RawBuffer,
+    on_finish: Option<F>,
+    finished: bool,
+    /// 上游这一段是否已经走完（正常结束或失败都已定性）。
+    ///
+    /// 之后即使 Body 被丢弃，也只是尾帧没发完，内容与用量都齐了 —— 按正常收尾记账，
+    /// 不能冤成「客户端提前断开」。只有循环中途被丢弃才是真的断连。
+    upstream_finished: bool,
+}
+
+impl<F: FnOnce(StreamOutcome)> StreamTail<F> {
+    fn finalize(&mut self, aborted: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        if aborted {
+            self.outcome.aborted = true;
+            if self.outcome.error.is_none() {
+                self.outcome.error = Some("客户端提前断开".into());
+            }
+        }
+
+        // 断连时前面收到的内容与 usage 照样要算进去：这条请求真的花了上游的
+        // token，不记账等于让账单悄悄少一笔。没收全就按已有的记。
+        self.outcome.usage = self.decoder.usage();
+        let accumulated = std::mem::take(&mut self.acc).finish();
+        // 文本从**累加器**取而不是 `decoder.text()`：后者是上游原文，逐增量
+        // 改写之后两者会不一致。捕获里的 `stream_text` 必须与 `response_content`
+        // 一样，反映客户端实际看到（或本应看到）的内容。
+        self.outcome.text = accumulated
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<Vec<_>>()
+            .join("");
+        self.outcome.content = accumulated;
+        self.outcome.raw_upstream = std::mem::take(&mut self.raw_upstream.bytes);
+        self.outcome.raw_client = (!self.passthrough)
+            .then(|| std::mem::take(&mut self.raw_client.bytes));
+        self.outcome.raw_truncated = self.raw_upstream.truncated || self.raw_client.truncated;
+        self.outcome.total = Some(self.start.elapsed());
+
+        if let Some(o) = self.observer.as_mut() {
+            o.on_finish(self.outcome.error.as_deref());
+        }
+        if let Some(f) = self.on_finish.take() {
+            f(std::mem::take(&mut self.outcome));
+        }
+    }
+}
+
+impl<F: FnOnce(StreamOutcome)> Drop for StreamTail<F> {
+    fn drop(&mut self) {
+        // 正常路径已经显式收过尾，这里什么都不会发生。
+        let aborted = !self.upstream_finished;
+        self.finalize(aborted);
+    }
+}
+
 /// 逐增量改写的便捷入口，只给测试用：生产路径统一走
 /// [`translate_stream_with_rewrite`]（它多一个 `delta_rewrite` 参数）。
 /// 二十多个流式用例都从这条路进来，给每个都补一个 `None` 只是噪音。
@@ -378,10 +460,10 @@ where
 /// 不能走直通）；否则钩子会被忽略，按普通流式处理。
 pub fn translate_stream_with_rewrite<F>(
     upstream: BoxStream<'static, reqwest::Result<Bytes>>,
-    mut decoder: Box<dyn StreamDecoder>,
-    mut encoder: Option<Box<dyn StreamEncoder>>,
+    decoder: Box<dyn StreamDecoder>,
+    encoder: Option<Box<dyn StreamEncoder>>,
     timeouts: StreamTimeouts,
-    mut observer: Option<Box<dyn StreamObserver>>,
+    observer: Option<Box<dyn StreamObserver>>,
     delta_rewrite: Option<StreamDeltaRewrite>,
     on_finish: F,
 ) -> Body
@@ -391,21 +473,33 @@ where
     let passthrough = encoder.is_none();
     // 没有编码器就无法把改写后的增量发出去。宁可按普通流式走，也不要把请求弄坏。
     let mut delta_rewrite = delta_rewrite.filter(|_| !passthrough);
-    let mut on_finish = Some(on_finish);
+    let mut encoder = encoder;
+
+    // **在生成器外构造**：Body 可能一次都没被 poll 就被丢掉（客户端收到响应头
+    // 就断开）。放到生成器里面的话，那种情况下状态根本没建起来，既不会记账、
+    // 也不会把「进行中」摘掉 —— 前端从此挂着一个永远不消失的幽灵。
+    let mut tail = StreamTail {
+        start: Instant::now(),
+        outcome: StreamOutcome::default(),
+        acc: ContentAccumulator::new(),
+        decoder,
+        observer,
+        passthrough,
+        raw_upstream: RawBuffer::default(),
+        raw_client: RawBuffer::default(),
+        on_finish: Some(on_finish),
+        finished: false,
+        upstream_finished: false,
+    };
 
     let stream = async_stream::stream! {
-        let start = Instant::now();
-        let mut outcome = StreamOutcome::default();
-        let mut acc = ContentAccumulator::new();
         let mut buf = String::new();
         let mut rem: Vec<u8> = Vec::new();
         let mut pinned = upstream;
-        let mut raw_upstream = RawBuffer::default();
-        let mut raw_client = RawBuffer::default();
 
         loop {
             // 首个字节用更短的超时，之后用空闲超时。
-            let timeout = if outcome.ttfb.is_none() {
+            let timeout = if tail.outcome.ttfb.is_none() {
                 timeouts.first_byte
             } else {
                 timeouts.idle
@@ -413,7 +507,7 @@ where
 
             let chunk = match tokio::time::timeout(timeout, pinned.next()).await {
                 Err(_) => {
-                    outcome.error = Some(if outcome.ttfb.is_none() {
+                    tail.outcome.error = Some(if tail.outcome.ttfb.is_none() {
                         "等待上游首字节超时".to_string()
                     } else {
                         "上游流空闲超时".to_string()
@@ -422,21 +516,21 @@ where
                 }
                 Ok(None) => break,
                 Ok(Some(Err(e))) => {
-                    outcome.error = Some(format!("读取上游流失败: {e}"));
+                    tail.outcome.error = Some(format!("读取上游流失败: {e}"));
                     break;
                 }
                 Ok(Some(Ok(chunk))) => chunk,
             };
 
-            if outcome.ttfb.is_none() {
-                outcome.ttfb = Some(start.elapsed());
+            if tail.outcome.ttfb.is_none() {
+                tail.outcome.ttfb = Some(tail.start.elapsed());
             }
 
             // 原始帧：上游侧无条件留一份。
-            raw_upstream.push(&chunk);
+            tail.raw_upstream.push(&chunk);
 
             // 直通模式：先把原始字节原样发给客户端。
-            if passthrough {
+            if tail.passthrough {
                 yield Ok::<Bytes, std::io::Error>(chunk.clone());
             }
 
@@ -445,9 +539,9 @@ where
 
             while let Some(block) = take_sse_block(&mut buf) {
                 let Some(ev) = parse_event(&block) else { continue };
-                outcome.events += 1;
+                tail.outcome.events += 1;
 
-                let deltas = match decoder.on_event(&ev) {
+                let deltas = match tail.decoder.on_event(&ev) {
                     Ok(d) => d,
                     Err(e) => {
                         // 单个事件解析失败不该中断整条流 —— 记下来继续，
@@ -466,9 +560,9 @@ where
                         // 只在**转码**这条路上补发：直通时这一个块的原始字节上面
                         // 已经发过了，再发一次就是重复。补上 `\n\n` 是因为
                         // `take_sse_block` 只回块内容，不回上游用的是哪种换行。
-                        if !passthrough {
+                        if !tail.passthrough {
                             let bytes = Bytes::from(format!("{block}\n\n"));
-                            raw_client.push(&bytes);
+                            tail.raw_client.push(&bytes);
                             yield Ok::<Bytes, std::io::Error>(bytes);
                         }
                         Vec::new()
@@ -479,7 +573,7 @@ where
                 // 同一份增量，否则实时视图、捕获内容与客户端收到的会互相矛盾。
                 let deltas = apply_delta_rewrite(deltas, &mut delta_rewrite);
 
-                if let Some(o) = observer.as_mut() {
+                if let Some(o) = tail.observer.as_mut() {
                     o.on_event(&block, &deltas);
                 }
 
@@ -487,24 +581,24 @@ where
                 // 是要落库的，观察者只管实时推送，两边各记各的会跑出两份不一致的
                 // 时间。放在观察者之后是为了让"推给前端"这件事先发生 ——
                 // 名字推导要遍历原文，不能让排查用的东西拖慢实时视图。
-                outcome.timings.push(
-                    start.elapsed().as_millis() as i64,
+                tail.outcome.timings.push(
+                    tail.start.elapsed().as_millis() as i64,
                     &timeline_name(&block, &deltas),
                 );
 
                 for d in &deltas {
                     if let UnifiedDelta::Finish(r) = d {
-                        outcome.finish_reason = Some(r.clone());
+                        tail.outcome.finish_reason = Some(r.clone());
                     }
-                    acc.apply(d);
+                    tail.acc.apply(d);
                 }
 
-                if !passthrough {
+                if !tail.passthrough {
                     for d in &deltas {
                         if let Some(enc) = encoder.as_mut() {
                             for out in enc.on_delta(d) {
                                 let bytes = encode_event(&out);
-                                raw_client.push(&bytes);
+                                tail.raw_client.push(&bytes);
                                 yield Ok::<Bytes, std::io::Error>(bytes);
                             }
                         }
@@ -513,27 +607,31 @@ where
             }
         }
 
+        // 上游这一段已经走完：内容与用量都齐了。标记放在这里（而不是收尾之后），
+        // 是为了让"尾帧还没发完客户端就断了"仍然按正常请求记账。
+        tail.upstream_finished = true;
+
         // 收尾。**断流与正常结束必须分开走**：解码器的 `finish()` 是给"上游干脆
         // 没发终止帧"用的兜底（补一个 `end_turn`），而超时/读取失败是**失败** ——
         // 照旧调它会发出一个语法完整、内容却半截的"成功"回复，客户端于是把截断
         // 当成回答完了（不重试、不报错、什么都不说）。用户看到的是一条莫名断掉
         // 的回复，而监控里这一栏还写着成功。
-        let broken = outcome.error.is_some();
+        let broken = tail.outcome.error.is_some();
 
         if !broken {
             // 收尾补出来的增量也要过脚本：否则客户端收到的流里，最后那帧
             // （终止原因等）会绕过改写，出现"前面的都改了、最后一帧没改"。
-            let finished = apply_delta_rewrite(decoder.finish(), &mut delta_rewrite);
+            let finished = apply_delta_rewrite(tail.decoder.finish(), &mut delta_rewrite);
             for d in finished {
                 if let UnifiedDelta::Finish(r) = &d {
-                    outcome.finish_reason = Some(r.clone());
+                    tail.outcome.finish_reason = Some(r.clone());
                 }
-                acc.apply(&d);
-                if !passthrough {
+                tail.acc.apply(&d);
+                if !tail.passthrough {
                     if let Some(enc) = encoder.as_mut() {
                         for out in enc.on_delta(&d) {
                             let bytes = encode_event(&out);
-                            raw_client.push(&bytes);
+                            tail.raw_client.push(&bytes);
                             yield Ok::<Bytes, std::io::Error>(bytes);
                         }
                     }
@@ -541,12 +639,16 @@ where
             }
         }
 
-        if !passthrough {
+        // 直通那条路**不能补发 error 帧**：客户端收到的本来就是上游的原始字节，
+        // 在末尾硬塞一帧别的协议的 error，反而可能把它弄坏。代价是客户端拿不到
+        // 我们的说明 —— 用带状态码的那句话补上一部分：上游拒绝时的码与报文都
+        // 原样在它手里，能自己判断要不要重试。监控里这一栏照旧标着失败原因。
+        if !tail.passthrough {
             if let Some(enc) = encoder.as_mut() {
                 // 失败的流**不发**终止帧：`error` 之后再来一个 `message_stop`
                 // 就等于又说了一遍"正常结束"，正好抵消掉上面那句话。
                 let events = if broken {
-                    let message = stream_break_message(outcome.error.as_deref().unwrap_or(""));
+                    let message = stream_break_message(tail.outcome.error.as_deref().unwrap_or(""));
                     enc.on_delta(&UnifiedDelta::Error {
                         code: "api_error".into(),
                         message,
@@ -556,41 +658,13 @@ where
                 };
                 for out in events {
                     let bytes = encode_event(&out);
-                    raw_client.push(&bytes);
+                    tail.raw_client.push(&bytes);
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }
             }
         }
 
-        // 直通那条路**不能补发 error 帧**：客户端收到的本来就是上游的原始字节，
-        // 在末尾硬塞一帧别的协议的 error，反而可能把它弄坏。代价是客户端拿不到
-        // 我们的说明 —— 用带状态码的那句话补上一部分：上游拒绝时的码与报文都
-        // 原样在它手里，能自己判断要不要重试。监控里这一栏照旧标着失败原因。
-        outcome.usage = decoder.usage();
-        let accumulated = acc.finish();
-
-        // 文本从**累加器**取而不是 `decoder.text()`：后者是上游原文，逐增量
-        // 改写之后两者会不一致。捕获里的 `stream_text` 必须与 `response_content`
-        // 一样，反映客户端实际看到的内容。
-        outcome.text = accumulated
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("");
-        outcome.content = accumulated;
-        // 直通时客户端收到的就是上游字节，客户端侧那份不必重复存。
-        outcome.raw_client = (!passthrough).then_some(raw_client.bytes);
-
-        outcome.raw_upstream = raw_upstream.bytes;
-        outcome.raw_truncated = raw_upstream.truncated || raw_client.truncated;
-        outcome.total = Some(start.elapsed());
-
-        if let Some(o) = observer.as_mut() {
-            o.on_finish(outcome.error.as_deref());
-        }
-        if let Some(f) = on_finish.take() {
-            f(outcome);
-        }
+        tail.finalize(false);
     };
 
     Body::from_stream(stream)
@@ -671,6 +745,37 @@ fn response_to_deltas(response: &UnifiedResponse, usage: &UnifiedUsage) -> Vec<U
 ///
 /// 用于缓存命中：客户端要流式，但结果是现成的，于是用编码器把它"假装"成流。
 /// 这样客户端拿到的响应形态与真实调用一致，不需要它区分是否命中缓存。
+/// 重放缓存的收尾守卫。与 [`StreamTail`] 同一个理由：消费者可能不把这条流
+/// 读完就丢掉（缓存重放几乎是瞬间结束，客户端常常在最后一帧之后立刻关连接），
+/// 收尾写在生成器末尾就会漏掉这一次请求的记账。
+struct ReplayTail<F: FnOnce(StreamOutcome)> {
+    start: Instant,
+    outcome: StreamOutcome,
+    on_finish: Option<F>,
+    finished: bool,
+}
+
+impl<F: FnOnce(StreamOutcome)> ReplayTail<F> {
+    fn finalize(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let elapsed = self.start.elapsed();
+        self.outcome.ttfb = Some(elapsed);
+        self.outcome.total = Some(elapsed);
+        if let Some(f) = self.on_finish.take() {
+            f(std::mem::take(&mut self.outcome));
+        }
+    }
+}
+
+impl<F: FnOnce(StreamOutcome)> Drop for ReplayTail<F> {
+    fn drop(&mut self) {
+        self.finalize();
+    }
+}
+
 pub fn stream_from_response<F>(
     response: UnifiedResponse,
     usage: UnifiedUsage,
@@ -680,14 +785,25 @@ pub fn stream_from_response<F>(
 where
     F: FnOnce(StreamOutcome) + Send + 'static,
 {
-    let mut on_finish = Some(on_finish);
     let deltas = response_to_deltas(&response, &usage);
 
-    let stream = async_stream::stream! {
-        let start = Instant::now();
-        let mut outcome = StreamOutcome::default();
-        outcome.finish_reason = Some(response.finish_reason.clone());
+    // 与 `translate_stream_with_rewrite` 同理：在生成器外构造，Body 一次都
+    // 没被 poll 就被丢掉时也能收尾。
+    let mut tail = ReplayTail {
+        start: Instant::now(),
+        outcome: StreamOutcome {
+            finish_reason: Some(response.finish_reason.clone()),
+            text: response.concat_text(),
+            content: response.content.clone(),
+            usage,
+            events: deltas.len() as u64,
+            ..Default::default()
+        },
+        on_finish: Some(on_finish),
+        finished: false,
+    };
 
+    let stream = async_stream::stream! {
         for d in &deltas {
             for out in encoder.on_delta(d) {
                 yield Ok::<Bytes, std::io::Error>(encode_event(&out));
@@ -697,16 +813,7 @@ where
             yield Ok::<Bytes, std::io::Error>(encode_event(&out));
         }
 
-        outcome.ttfb = Some(start.elapsed());
-        outcome.total = Some(start.elapsed());
-        outcome.events = deltas.len() as u64;
-        outcome.text = response.concat_text();
-        outcome.content = response.content.clone();
-        outcome.usage = usage;
-
-        if let Some(f) = on_finish.take() {
-            f(outcome);
-        }
+        tail.finalize();
     };
 
     Body::from_stream(stream)
@@ -1273,11 +1380,106 @@ mod tests {
             None,
             StreamTimeouts::default(),
             None,
-            move |_| {
+            move |o| {
                 c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(!o.aborted, "正常跑完不能标成断连");
             });
         run(body).await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// 客户端收完 `[DONE]` 就关连接时，hyper 会在最后一个 `yield` 之后直接丢掉
+    /// Body —— 生成器末尾的收尾代码一行都轮不上。那正是「并发发三个、结束后
+    /// 只剩两个」的现场：这一条请求既不在日志里，也不在捕获里。
+    #[tokio::test]
+    async fn dropping_the_body_mid_stream_still_finalizes_the_request() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_observed(
+            // 发完这一帧就不再产出：收尾一定不会自己发生。
+            hanging_upstream(vec![
+                "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"半\"}}]}\n\n",
+            ]),
+            Box::new(ChatStreamDecoder::new()),
+            // 走转码：直通会在处理这一帧之前就把它 yield 出去，测试拿到的
+            // 时刻解码器还没见到内容；转码则保证"客户端看到的"已经处理过。
+            Some(Box::new(ChatStreamEncoder::new())),
+            StreamTimeouts::default(),
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+
+        let mut data = body.into_data_stream();
+        assert!(data.next().await.is_some(), "先拿到那一帧");
+        drop(data);
+
+        let o = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("丢 Body 之后必须补上收尾，否则这条请求就丢了")
+            .unwrap();
+        assert!(o.aborted);
+        assert_eq!(o.text, "半", "已经收到的内容照样要记进捕获");
+        assert!(
+            o.error.as_deref().is_some_and(|e| e.contains("客户端")),
+            "断连的归因要说清是谁断的"
+        );
+    }
+
+    /// 连一次都没被 poll 的 Body 也要收尾：客户端收到响应头就断开时就是这种形状。
+    /// 少了它，「进行中」里会留下一条永远不会被摘掉的幽灵。
+    #[tokio::test]
+    async fn dropping_the_body_before_it_is_polled_still_finalizes_the_request() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_observed(
+            upstream(vec!["data: [DONE]\n\n"]),
+            Box::new(AnthropicStreamDecoder::new()),
+            None,
+            StreamTimeouts::default(),
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+
+        drop(body);
+
+        let o = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("未 poll 就被丢掉的 Body 也必须收尾")
+            .unwrap();
+        assert!(o.aborted);
+    }
+
+    /// 缓存重放同理：客户端在最后一帧之后立刻关连接，也要把这笔账记上。
+    #[tokio::test]
+    async fn dropping_a_cache_replay_early_still_finalizes() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let resp = UnifiedResponse {
+            id: "r".into(),
+            model: "m".into(),
+            content: vec![crate::protocol::dto::ContentBlock::text("缓存的答案")],
+            finish_reason: FinishReason::Stop,
+        };
+        let body = stream_from_response(
+            resp,
+            UnifiedUsage::default(),
+            Box::new(AnthropicStreamEncoder::new()),
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+
+        // 读一帧就丢，模拟客户端收完就关连接。
+        let mut data = body.into_data_stream();
+        assert!(data.next().await.is_some());
+        drop(data);
+
+        let o = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("重放被丢掉也要收尾")
+            .unwrap();
+        assert_eq!(o.text, "缓存的答案");
     }
 
     // --- 缓存命中重放 ---

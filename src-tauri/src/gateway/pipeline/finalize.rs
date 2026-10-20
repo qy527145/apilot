@@ -82,7 +82,15 @@ pub(super) fn finalize_stream(
 
     let latency = started.elapsed().as_millis() as i64;
     let ttfb = outcome.ttfb.map(|d| d.as_millis() as i64);
-    let status_code = if outcome.error.is_some() { 502 } else { 200 };
+    // 499 = nginx 的「客户端关闭请求」。客户端收完内容就断、或者中途按 Esc，
+    // 上游都没错；记成 502 会让人以为是上游抽风。见 `Recorder::Drop` 同样的取舍。
+    let status_code = if outcome.aborted {
+        499
+    } else if outcome.error.is_some() {
+        502
+    } else {
+        200
+    };
 
     // 起标题任务的回复就是标题本身。流断了或解析不出就算了 —— 保持「用户第一句话」。
     let generated_title = (session.title_request && outcome.error.is_none())

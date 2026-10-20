@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Clock, Pause, Play, RefreshCw, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
@@ -213,13 +213,36 @@ export default function TrafficPage() {
   // --- 进行中的请求 ---
   const [inflight, setInflight] = useState<Map<string, LiveRequest>>(new Map());
 
+  /**
+   * 已经结束过的请求 id。
+   *
+   * 结束事件可能比「进页时补的那份底账」先到（进页那一刻正在收尾的请求），
+   * 底账是那一刻拍下的快照，晚一步回来时不能把它们再当成「进行中」贴回去。
+   * 这份集合只为挡住这种晚到的快照，而请求 id 是 UUID，旧的不可能再出现，
+   * 所以只保留最近一批就够。
+   */
+  const endedIds = useRef<Set<string>>(new Set());
+  const rememberEnded = (id: string) => {
+    const set = endedIds.current;
+    set.add(id);
+    if (set.size > 512) {
+      const oldest = set.values().next().value;
+      if (oldest !== undefined) set.delete(oldest);
+    }
+  };
+
   // 进入页面时查询当前正在进行的请求，补齐用户进入前已开始的请求。
   // 这些请求不会触发 apilot://request-start（那个已经在进页面前发出去了）。
   const inflightQuery = useQuery({
     queryKey: ["inflight_seed"],
     queryFn: api.getInflightRequests,
-    // 只在挂载时取一次；之后靠事件驱动维护。
-    staleTime: Infinity,
+    // 这是一份**此刻**的快照，不是可复用的缓存。以前写成 `staleTime: Infinity`，
+    // 结果重新进入监控页时 React Query 直接回放上一次的快照 —— 那时正在跑的请求
+    // 早已结束，却被当成「进行中」带绿点贴回列表，而且 done=false 的条目永远不会
+    // 被 `pruneDone` 清掉，于是成了永不消失的幽灵。
+    staleTime: 0,
+    gcTime: 0,
+    refetchOnMount: "always" as const,
     retry: 1,
   });
 
@@ -228,6 +251,8 @@ export default function TrafficPage() {
     setInflight((prev) => {
       const next = new Map(prev);
       for (const r of inflightQuery.data) {
+        // 快照里可能有在它回来之前就已经结束的请求：不能补。
+        if (endedIds.current.has(r.request_id)) continue;
         // 只补齐之前没有的；事件已经处理过的不覆盖（那些可能有帧数据了）。
         if (!next.has(r.request_id)) {
           next.set(r.request_id, {
@@ -323,6 +348,7 @@ export default function TrafficPage() {
       // 收尾那一批**也要接上**：后端的 `on_finish` 会先把攒着的帧 flush 出来，
       // 再带 `done` 一起发 —— 直接 markDone 就把最后这段（含 finish / usage）丢了，
       // 表现是流明明结束了，内容却停在倒数第二三批。
+      if (batch.done) rememberEnded(batch.request_id);
       const next = new Map(prev);
       next.set(
         batch.request_id,
@@ -333,6 +359,7 @@ export default function TrafficPage() {
   });
 
   useApilotEvent("apilot://request-end", (p) => {
+    rememberEnded(p.request_id);
     setInflight((prev) => {
       const cur = prev.get(p.request_id);
       if (!cur) return prev;
