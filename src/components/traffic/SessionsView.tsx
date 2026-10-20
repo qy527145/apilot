@@ -549,6 +549,16 @@ function TimelineRow({
               {modelChanged && "→ "}
               {e.model || "—"}
             </span>
+            {/* 与进行中那行同一套写法：生效模型在前，客户端原本要的模型在后。
+                两者相同的请求（绝大多数）不显示，免得每行都挂一截噪音。 */}
+            {e.request_model && e.request_model !== e.model && (
+              <span
+                className="text-muted-foreground min-w-0 truncate font-mono text-[11px]"
+                title={`客户端请求的模型：${e.request_model}`}
+              >
+                ← {e.request_model}
+              </span>
+            )}
             {e.thread_key === null && (
               // 模型名优先：路径在这一行只是辅助说明（标签已经写了「计数」），挤不下就截它。
               <span className="text-muted-foreground min-w-0 truncate font-mono" title={e.path}>
