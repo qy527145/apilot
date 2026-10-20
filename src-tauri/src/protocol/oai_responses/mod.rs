@@ -237,7 +237,7 @@ fn decode_item(item: &Value, req: &mut UnifiedRequest) -> Result<(), ConvertErro
         }
         // 没建模的条目类型只跳过、不报错。
         //
-        // 解码是路由前的必经步骤（见 gateway/pipeline.rs 第 1 步），同协议直通时
+        // 解码是路由前的必经步骤（见 gateway/pipeline/mod.rs 第 1 步），同协议直通时
         // 转发的是原始字节、IR 只用于统计，所以这里丢掉的内容并不影响那种场景；
         // 而一旦报错，整条请求 400 —— 每来一种新条目类型（web_search_call、
         // local_shell_call、item_reference……）都会让网关在客户端升级后全线崩掉，

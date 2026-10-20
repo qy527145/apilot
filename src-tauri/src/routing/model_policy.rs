@@ -99,7 +99,7 @@ pub fn resolve(policy: &ModelPolicy, req: &RequestCtx<'_>, env: &dyn ModelEnv) -
 
 /// 供管线调用：判定 + 兜底成"不改就用原值"。
 ///
-/// 调用点在 `gateway/pipeline.rs` 解码之后、构造 `RouteMetadata` 之前 ——
+/// 调用点在 `gateway/pipeline/mod.rs` 解码之后、构造 `RouteMetadata` 之前 ——
 /// 这样规则链看到的就是生效模型。
 pub fn effective_model(policy: &ModelPolicy, req: &RequestCtx<'_>, env: &dyn ModelEnv) -> String {
     resolve(policy, req, env).unwrap_or_else(|| req.model.to_string())

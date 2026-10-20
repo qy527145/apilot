@@ -5,29 +5,63 @@
 
 行数为参考量级，用来判断一个模块是"读十分钟"还是"读半小时"。
 
----
-
 ## 目录
 
+- [模块速查](#模块速查) — 每个目录多大、先读哪个文件
 - [请求全链路](#请求全链路) — 一次请求经过哪些文件
 - [协议兼容矩阵](PROTOCOL_MATRIX.md) — 什么时候直通、什么时候转换、转换丢什么
 - [后端模块](#后端模块)
-  - [protocol — 协议 IR 与编解码](#protocol--协议-ir-与编解码6409-行)
-  - [gateway — 反向代理与请求管线](#gateway--反向代理与请求管线3364-行)
-  - [routing — 模型选择、规则链与热切换](#routing--模型选择规则链与热切换1874-行)
-  - [upstream — 上游渠道](#upstream--上游渠道771-行)
+  - [protocol — 协议 IR 与编解码](#protocol--协议-ir-与编解码8925-行)
+  - [gateway — 反向代理与请求管线](#gateway--反向代理与请求管线7598-行)
+  - [routing — 模型选择、规则链与热切换](#routing--模型选择规则链与热切换4197-行)
+  - [upstream — 上游渠道](#upstream--上游渠道1852-行)
   - [catalog — 上游模型目录](#catalog--上游模型目录价格--能力)
   - [codex — 发给客户端的模型目录](#codex--发给客户端的模型目录)
-  - [billing — 计费](#billing--计费848-行)
-  - [cache — 响应缓存](#cache--响应缓存1109-行)
-  - [takeover — 客户端接管](#takeover--客户端接管1763-行)
-  - [storage — 持久化](#storage--持久化3316-行)
-  - [traffic — 实时统计与事件](#traffic--实时统计与事件419-行)
-  - [commands — Tauri 命令层](#commands--tauri-命令层775-行)
+  - [billing — 计费](#billing--计费859-行)
+  - [cache — 响应缓存](#cache--响应缓存1146-行)
+  - [takeover — 客户端接管](#takeover--客户端接管2423-行)
+  - [storage — 持久化](#storage--持久化10000-行)
+  - [traffic — 实时统计与事件](#traffic--实时统计与事件3094-行)
+  - [commands — Tauri 命令层](#commands--tauri-命令层2706-行)
   - [shell / config / error / util](#shellconfigerrorutil)
 - [数据库](#数据库)
 - [前端](#前端)
 - [测试](#测试)
+
+---
+
+**给 agent 的用法**：先看下面的「请求全链路」确定要碰哪几层，再跳到对应模块，
+不要按目录通读。[CLAUDE.md](../CLAUDE.md) 的「改什么去哪里」给出了每类改动的
+唯一真源，本文件只负责展开细节。需要现场数据时直接读 `~/.apilot/apilot.db`
+（SQLite，配置与逐字节原始报文都在里面），通常比读代码猜快。
+
+## 模块速查
+
+行数 = 目录下全部 `.rs` / `.ts`（**含同文件测试**），用来判断"读十分钟"还是"读半小时"。
+
+| 目录 | 行数 | 入口 / 先读 |
+|---|---:|---|
+| `protocol/` | 8925 | `dto.rs`（IR）→ `codec.rs`（注册表）→ 各协议 `mod.rs` |
+| `gateway/` | 7598 | `pipeline/mod.rs`（编排）→ `pipeline/outbound.rs`（出站）→ `stream.rs`（转发） |
+| `storage/` | 10000 | `migrations.rs`（表结构）→ `logs.rs`（监控）/ `providers.rs`（渠道） |
+| `routing/` | 4197 | `model_policy.rs`（模型名）→ `engine.rs`（规则链）→ `model_select.rs`（渠道） |
+| `traffic/` | 3094 | `session.rs`（对话归属）→ `stream_events.rs`（实时事件）→ `log_filter.rs`（表达式） |
+| `commands/` | 2706 | `<域>.rs`，与前端 `src/lib/api.ts` 一一对应 |
+| `takeover/` | 2423 | `clients.rs`（各客户端补丁）→ `engine.rs`（保序写入） |
+| `upstream/` | 1852 | `channel.rs`（拼 URL / 鉴权 / 发出） |
+| `config/` | 1596 | `settings.rs`（全部设置）→ `paths.rs` |
+| `cache/` | 1146 | `key.rs`（键）→ `policy.rs`（可缓存判定）→ `store.rs` |
+| `billing/` | 859 | `engine.rs::settle`（唯一结算公式） |
+| `catalog/` | 686 | 上游模型目录（价格 + 能力） |
+| `replay.rs` | 445 | 请求回放 / A-B 对比 |
+| `codex/` | 378 | 发给 Codex 的模型目录 |
+| `shell.rs` | 338 | `AppShell`：全部共享状态的装配与热重载 |
+| `lib.rs` | 261 | Tauri 启动 + `generate_handler!` |
+| `error.rs` / `util.rs` | 119 / 81 | `AppError`、时间与脱敏工具 |
+| `src/`（前端） | 16822 | `lib/api.ts`（契约）→ `App.tsx` → `pages/*` |
+
+> 启动顺序：`main.rs` → `lib.rs::run` → `AppShell::bootstrap` → `gateway/server.rs`。
+
 
 ---
 
@@ -38,7 +72,7 @@
 | # | 位置 | 做什么 |
 |---|---|---|
 | 1 | `gateway/router.rs` | 按路径定协议，取出 body |
-| 2 | `gateway/pipeline.rs::handle` | 分配 request_id、识别客户端、建 `Recorder` |
+| 2 | `gateway/pipeline/mod.rs::handle` | 分配 request_id、识别客户端、建 `Recorder` |
 | 3 | `protocol/codec.rs::Codec::decode_request` | 字节 → `UnifiedRequest`（IR） |
 | 4 | `protocol/shared/tokens.rs::estimate_request_tokens` | 估算输入 token（供路由分流与预扣） |
 | 5 | `routing/engine.rs::Router::route` | 顺序跑规则链，首个终结动作胜出 |
@@ -49,15 +83,15 @@
 | 10 | `upstream/channel.rs::Channel::dial` | 发请求；失败且可重试则换渠道 |
 | 11 | `gateway/stream.rs::translate_stream` | 流式：上游 SSE → 解码 → IR 增量 → 编码 → 下游 |
 | 12 | `billing/engine.rs::BillingEngine::settle` | 按用量与倍率算额度 |
-| 13 | `gateway/pipeline.rs::Recorder::finish` | 落库明细 + 内存聚合 + 推送前端事件 |
+| 13 | `gateway/pipeline/recorder.rs::Recorder::finish` | 落库明细 + 内存聚合 + 推送前端事件 |
 
-非流式走 `pipeline.rs::finish_buffered`，逻辑与 11 对应。
+非流式走 `pipeline/buffered.rs::finish_buffered`，逻辑与 11 对应。
 
 ---
 
 ## 后端模块
 
-### `protocol/` — 协议 IR 与编解码（6409 行）
+### `protocol/` — 协议 IR 与编解码（8925 行）
 
 核心抽象：**所有协议转换都经过 IR**。N 个协议只需 2N 个编解码器，而不是 N² 个两两转换器。
 
@@ -70,7 +104,7 @@
 | `oai_responses/` | OpenAI Responses，同结构（`mod.rs` 内含 request+response）。**流式编码器的 `output_item.done` 必须带完整 item** —— Codex 只从这里取工具调用，见 [PROTOCOL_MATRIX.md](PROTOCOL_MATRIX.md#客户端的硬契约responses-流靠-output_itemdone-收工具调用) |
 | `shared/tokens.rs` | 无上游 usage 时的本地 token 估算（按 CJK / 拉丁字符分档） |
 | `shared/tools.rs` | 工具调用的跨协议处理（分片 JSON 累积、结果拍平） |
-| `shared/prompt_cache.rs` | **跨协议转 Anthropic 时补 `cache_control` 断点**（tools 末项 / system / 最后一条消息，最多 4 个）。整份请求只要已有一个 `cache_control` 就整体不碰 —— 尊重客户端自己的缓存布局，也顺带让函数幂等。跳过 thinking / redacted_thinking 块（它们不接受断点）。只在 `pipeline::try_outbound` 的跨协议分支调用 |
+| `shared/prompt_cache.rs` | **跨协议转 Anthropic 时补 `cache_control` 断点**（tools 末项 / system / 最后一条消息，最多 4 个）。整份请求只要已有一个 `cache_control` 就整体不碰 —— 尊重客户端自己的缓存布局，也顺带让函数幂等。跳过 thinking / redacted_thinking 块（它们不接受断点）。只在 `pipeline::outbound::try_outbound` 的跨协议分支调用 |
 | `inspect.rs` | 把**捕获的报文**解成 IR，供监控页做语义化展示。解四个方向（入站在此协议、出站协议各一份请求与响应），流式响应从 `captures.response_content` 还原。解码失败只填 `error`，不抛错 |
 
 **关键约定**：`UnifiedUsage.input_tokens` 是**不含缓存的 fresh 输入**。
@@ -91,13 +125,27 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 ---
 
-### `gateway/` — 反向代理与请求管线（3364 行）
+### `gateway/` — 反向代理与请求管线（7598 行）
 
 | 文件 | 内容 |
 |---|---|
-| `pipeline.rs` | **核心编排**。`handle()` 串起整条链路；`handle_raw()` 是**非对话请求的原样转发**（见下）；`Recorder` 收口记账；`detect_client()` 识别来源；`decode_sse_as_response()` 兜住「上游无视 stream 参数」 |
+| `pipeline/` | **核心编排**，按职责分文件，见下表 |
 | `server.rs` | `GatewayServer`：`start` / `start_at` / `stop` / `status` / `base_url`，用 oneshot + graceful shutdown。**`rebind` 负责"改了监听地址要真的换过去"**：端口变了先绑新的探路（绑不上就原样退回，绝不先停再试），新地址起不来则退回老地址；`needs_rebind` 是它的纯函数判据 |
 | `router.rs` | axum 路由表、`/health`、`/v1/models`、路径兜底。兜底按**后缀**判：是三种对话入口之一就交给 `handle`，**其余一律交给 `handle_raw` 原样转发** —— 客户端会发 `/v1/messages/count_tokens` 这类非对话接口，硬解成对话再编码回去会把它改坏 |
+
+**`pipeline/` 内部**（大致按请求流经顺序；`mod.rs` 的文档注释里也列了同一份清单）：
+
+| 文件 | 内容 |
+|---|---|
+| `mod.rs` | 三条入口：`handle`（对话）、`handle_raw`（非对话原样转发）、`reject_body`（请求体没读全）；`detect_client` 识别调用方；`peek_model` 从原始 body 只取模型名 |
+| `recorder.rs` | **`Recorder`**：一次请求的记账收口（`finish` / `fail` / `tag_session` / `apply_session_pin`）；`Drop` 兜住客户端断连；`save_session_title` 落对话标题 |
+| `candidates.rs` | `build_candidates`：模型策略 > selector，组装主渠道 + 故障转移候选；`prefer_native_protocol` 把能直通的渠道提前（稳定排序） |
+| `outbound.rs` | `try_outbound`：单渠道完整出站（编码 / 直通 / 流式 / 非 2xx / 假 200）；`forward_raw`：非对话请求原样收发 |
+| `buffered.rs` | `finish_buffered`：非流式收尾（解码 → 计费 → 改写 → 缓存 → 编码）；也处理「客户端要流式、上游回完整响应」 |
+| `finalize.rs` | `StreamContext` + `finalize_stream`：流真正结束后的计费、缓存、捕获；`decode_sse_as_response` 兜住「上游无视 `stream:false`」 |
+| `cache.rs` | `serve_from_cache`：命中重放（流式 / 非流式），照样记账并发结束事件 |
+| `body_patch.rs` | 直通路上对原始 JSON 的最小改写：`patch_outbound_body`（model + 思考参数）、`strip_unportable_thinking`、`count_tool_uses` |
+| `reply.rs` | 响应与错误报文：`build_response`、`fail_response` / `fail_raw_response`、`client_status_for`、`headers_to_json`（鉴权头隐去） |
 
 **两种"直通"别混**（`CLAUDE.md` 铁律 2 说的是前者）：
 
@@ -136,7 +184,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 ---
 
-### `routing/` — 模型选择、规则链与热切换（1874 行）
+### `routing/` — 模型选择、规则链与热切换（4197 行）
 
 借自 sing-box 的模型。**规则顺序求值，首个终结动作胜出。**
 
@@ -184,7 +232,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 ---
 
-### `upstream/` — 上游渠道（771 行）
+### `upstream/` — 上游渠道（1852 行）
 
 | 文件 | 内容 |
 |---|---|
@@ -298,7 +346,7 @@ GPT 系名字，就会落到 Codex 自己的兜底元数据上（那里没有 `a
 
 ---
 
-### `billing/` — 计费（848 行）
+### `billing/` — 计费（859 行）
 
 | 文件 | 内容 |
 |---|---|
@@ -322,7 +370,7 @@ quota           += tool_call_surcharge × 工具调用次数
 
 ---
 
-### `cache/` — 响应缓存（1109 行）
+### `cache/` — 响应缓存（1146 行）
 
 | 文件 | 内容 |
 |---|---|
@@ -338,7 +386,7 @@ quota           += tool_call_surcharge × 工具调用次数
 
 ---
 
-### `takeover/` — 客户端接管（1763 行）
+### `takeover/` — 客户端接管（2423 行）
 
 | 文件 | 内容 |
 |---|---|
@@ -414,7 +462,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 
 ---
 
-### `storage/` — 持久化（3316 行）
+### `storage/` — 持久化（10000 行）
 
 | 文件 | 内容 |
 |---|---|
@@ -449,7 +497,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 
 ---
 
-### `traffic/` — 实时统计与事件（1480 行）
+### `traffic/` — 实时统计与事件（3094 行）
 
 | 文件 | 内容 |
 |---|---|
@@ -490,7 +538,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 
 ---
 
-### `commands/` — Tauri 命令层（775 行）
+### `commands/` — Tauri 命令层（2706 行）
 
 | 文件 | 命令数 | 内容 |
 |---|---|---|
@@ -576,7 +624,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 ## 测试
 
-856 个测试，**与实现同文件**（`#[cfg(test)] mod tests`），`cargo test` 全量运行。
+1122 个测试，**与实现同文件**（`#[cfg(test)] mod tests`），`cargo test` 全量运行。
 
 | 层次 | 代表 |
 |---|---|

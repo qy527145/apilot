@@ -175,7 +175,7 @@ Codex 的 SSE 解析器（`codex-api/src/sse/responses.rs::process_responses_eve
 
 `Thinking.signature` / `RedactedThinking` 由 Anthropic 侧签名，转到别的协议再转回来必然失效，
 回传会让上游 400。所以跨协议时 Apilot 会**主动剥离**思考块
-（`gateway/pipeline.rs::strip_unportable_thinking`），并清掉 `reasoning.budget_tokens`
+（`gateway/pipeline/body_patch.rs::strip_unportable_thinking`），并清掉 `reasoning.budget_tokens`
 （清预算只在**目标不是 Anthropic** 时做：它本身没有签名这回事，反过来 Chat → Anthropic
 时它恰恰是那边唯一能用的思考参数）。
 
@@ -234,7 +234,7 @@ Anthropic 本来就是这口径；OpenAI / Responses 的 `prompt_tokens` **含**
 ### 7. 上游无视 `stream:false` 一律回 SSE 时，终止原因退化为 `Stop`
 
 有些中转不认 `stream: false`，永远回 SSE。Apilot 会把这段 SSE 解析成完整响应
-（`gateway/pipeline.rs::decode_sse_as_response`），但 `StreamDecoder` 没有把
+（`gateway/pipeline/finalize.rs::decode_sse_as_response`），但 `StreamDecoder` 没有把
 增量里的 stop_reason 暴露出来，所以这种情况下 `finish_reason` 固定是 `Stop`。
 正文是完整的，只有终止原因是近似值。
 
@@ -384,7 +384,7 @@ Moonshot 和百炼的预设就是这么配的。
 | 协议 IR 与三个 codec | `src-tauri/src/protocol/` |
 | 选协议（直通还是转换） | `upstream/channel.rs::Channel::wire_for` → `storage/models.rs::Provider::wire_for` |
 | 路径拼接 | `storage/models.rs::Provider::endpoint` / `endpoint_verbatim` |
-| 直通 / 转换的分叉 | `gateway/pipeline.rs::try_outbound` 的 `needs_conversion` |
+| 直通 / 转换的分叉 | `gateway/pipeline/outbound.rs::try_outbound` 的 `needs_conversion` |
 | 流式转码 | `gateway/stream.rs::translate_stream` |
 | 渠道协议声明 | `providers.protocols`（迁移 v2） |
 | 协议自动检测 | `commands/providers.rs::detect_provider_protocols` / `judge_protocol` |

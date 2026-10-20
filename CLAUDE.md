@@ -65,23 +65,23 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **改接管策略 / 模型策略什么时候生效** | **保存即重写**：`update_settings` / `set_model_policy` 之后跑 `commands/app.rs::reapply_after_policy_change` → `takeover/clients.rs::reapply_taken_over`（只碰**会消费 `ClientPlan`** 的客户端，目前只有 Codex；产出与现状一致就不写，网关没起时用配置里现存的地址）。判据是 `takeover/clients.rs::plan_inputs_differ`（只看真会写进客户端的那两样）—— 与「换地址」那条（`repoint_taken_over`，只看地址）**不是同一个判据**，别合并 |
 | **改「Codex 走不走 Responses Lite」** | **`use_responses_lite` 是唯一开关**（决定工具走 `input[].additional_tools` 还是顶层 `tools`），而它来自 Codex 的**内置模型目录** —— GPT 系名字内置就是 Lite，而上游对这形状常常「收下、200、静默忽略」。两条对策由 `AppSettings::client_model_mode` 四选一（默认 `both`，见 `takeover/clients.rs::codex_config`）：写模型名（`rename`，不依赖网关但没有 `apply_patch`）/ 下发目录（`catalog`，有 `apply_patch` 但要多两个开关 + 网关得可达）/ 都写（`both`）/ 不碰。目录内容在 `codex/mod.rs`（**分两半**：vendored 那半管 GPT 系名字，`entry` 那半管 Apilot 自己的模型名，**三个字段必须一起改**），出口是 `gateway/router.rs` 的 `/codex/models` |
 | **加一种渠道鉴权方式** | `storage/models.rs::AuthStyle` → 同文件 `Provider::auth_header()`（**鉴权头的唯一构造点**，出站转发、连通探测、拉模型列表都走它） |
-| **改「直通还是转换」的判定** | `storage/models.rs::Provider::wire_for`（渠道声明的协议集合命中就直通）+ `gateway/pipeline.rs::prefer_native_protocol`（多渠道路由时同协议优先）→ 同步更新 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md) |
+| **改「直通还是转换」的判定** | `storage/models.rs::Provider::wire_for`（渠道声明的协议集合命中就直通）+ `gateway/pipeline/candidates.rs::prefer_native_protocol`（多渠道路由时同协议优先）→ 同步更新 [docs/PROTOCOL_MATRIX.md](docs/PROTOCOL_MATRIX.md) |
 | **改出站 URL 拼接** | `storage/models.rs::Provider::endpoint`（协议默认路径，会补 `/v1`）/ `endpoint_verbatim`（用户手写路径，**不补** `/v1`） |
 | **改渠道启停 / 协议自动检测** | 启停走 `storage/providers.rs::set_enabled`（只改启用位，**别借道 `upsert`** —— 密钥不回显，改个开关就会把它抹掉）+ `commands/providers.rs::set_provider_enabled`（写完必须 `reload_providers`）。检测的判定全在 `commands/providers.rs::judge_protocol`，探测体 `PROBE_BODY` 是**故意的空对象**（不消耗 token）→ 前端 `ProviderDialog` 的「自动检测」 |
-| **改「用哪个模型」（模型名）** | 判定在 `routing/model_policy.rs::effective_model`（在 `gateway/pipeline.rs` 解码后、路由前应用）；两级配置（全局 + 客户端覆盖）在 `config/settings.rs::ModelPolicy::effective` 里拼成一条规则；模式 4 的 JS 沙箱在 `routing/model_script.rs`。**之后**是对话级固定（`routing/session_pin.rs`，经 `Recorder::apply_session_pin`，对话入口与 `handle_raw` 都要过），规则链的 `ModelOverride` 在最上面。优先级：**规则链 > 对话固定 > 客户端覆盖 > 全局**。固定存在 `session_model_pins` 表、常驻内存（`AppShell::session_pins`），改库后必须 `reload_session_pins` |
-| **改「接管思考」（是否思考 / 思考深度）** | 唯一真源是 `config/settings.rs::ThinkingMode`（一个全局档位，客户端页那个下拉）→ `AppSettings::apply_thinking` 在 `gateway/pipeline.rs::handle` 里写进 IR（**必须在缓存键之前**）→ 同协议直通再拿**同一份**去改原始 body（`patch_outbound_body`）。它改的是请求参数，**不写客户端配置**，所以每请求生效、不用重新接管。同协议那三个键分别是 `thinking` / `reasoning_effort` / `reasoning.effort` |
-| **改「用哪个渠道」（服务商）** | `routing/model_select.rs::order`（按模型策略排序）+ `gateway/pipeline.rs::build_candidates`（未配策略时回落 selector）。**优先级是「模型策略 > selector」，别反过来**。策略存在 `model_policies` 表，界面上在**路由页**改 |
+| **改「用哪个模型」（模型名）** | 判定在 `routing/model_policy.rs::effective_model`（在 `gateway/pipeline/mod.rs` 解码后、路由前应用）；两级配置（全局 + 客户端覆盖）在 `config/settings.rs::ModelPolicy::effective` 里拼成一条规则；模式 4 的 JS 沙箱在 `routing/model_script.rs`。**之后**是对话级固定（`routing/session_pin.rs`，经 `Recorder::apply_session_pin`，对话入口与 `handle_raw` 都要过），规则链的 `ModelOverride` 在最上面。优先级：**规则链 > 对话固定 > 客户端覆盖 > 全局**。固定存在 `session_model_pins` 表、常驻内存（`AppShell::session_pins`），改库后必须 `reload_session_pins` |
+| **改「接管思考」（是否思考 / 思考深度）** | 唯一真源是 `config/settings.rs::ThinkingMode`（一个全局档位，客户端页那个下拉）→ `AppSettings::apply_thinking` 在 `gateway/pipeline/mod.rs::handle` 里写进 IR（**必须在缓存键之前**）→ 同协议直通再拿**同一份**去改原始 body（`patch_outbound_body`）。它改的是请求参数，**不写客户端配置**，所以每请求生效、不用重新接管。同协议那三个键分别是 `thinking` / `reasoning_effort` / `reasoning.effort` |
+| **改「用哪个渠道」（服务商）** | `routing/model_select.rs::order`（按模型策略排序）+ `gateway/pipeline/candidates.rs::build_candidates`（未配策略时回落 selector）。**优先级是「模型策略 > selector」，别反过来**。策略存在 `model_policies` 表，界面上在**路由页**改 |
 | **改计费公式** | `billing/engine.rs::settle`（唯一真源）→ 对应更新其测试；倍率字段在 `billing/pricing.rs` |
 | **改「渠道的元数据来源 / 自动价格」** | 来源枚举在 `storage/models.rs::MetadataSource`（`auto` = models.dev、`litellm`、`off`）→ 保存渠道/模型声明后由 `commands/providers.rs::upsert_provider` 触发同步 → 实际写价在 `commands/catalog.rs::apply_catalog_prices_for`（**手填价格 `source = NULL` 一律不覆盖**）。手动补同步走 `sync_provider_metadata` |
-| **改「请求 / 响应改写脚本」** | 执行器在 `routing/rewrite_script.rs`，复用 `routing/model_script.rs` 的 QuickJS 引擎（无第二个 runtime）。请求脚本生效点在 `pipeline.rs::handle` 路由之后、**缓存键之前**；改过请求会 `force_encode` 放弃同协议直通。响应脚本有**两份契约**：`response_script` 吃完整响应、只作用于非流式（`finish_buffered`）；`response_delta_script` 每解出一条 `UnifiedDelta` 调一次、改完**立即**下发（`stream.rs::translate_stream_with_rewrite` + `StreamDeltaRewrite`），首字延迟不变，代价是不再走同协议直通。配置是 `request_script` / `response_script` / `response_delta_script` |
-| **改「Anthropic prompt cache 断点注入」** | `protocol/shared/prompt_cache.rs`（纯 JSON 处理，客户端已有断点就整体不碰）→ 只在 `pipeline.rs::try_outbound` 的**跨协议转 Anthropic** 分支调用，开关是 `AppSettings::prompt_cache_injection` |
+| **改「请求 / 响应改写脚本」** | 执行器在 `routing/rewrite_script.rs`，复用 `routing/model_script.rs` 的 QuickJS 引擎（无第二个 runtime）。请求脚本生效点在 `pipeline/mod.rs::handle` 路由之后、**缓存键之前**；改过请求会 `force_encode` 放弃同协议直通。响应脚本有**两份契约**：`response_script` 吃完整响应、只作用于非流式（`finish_buffered`）；`response_delta_script` 每解出一条 `UnifiedDelta` 调一次、改完**立即**下发（`stream.rs::translate_stream_with_rewrite` + `StreamDeltaRewrite`），首字延迟不变，代价是不再走同协议直通。配置是 `request_script` / `response_script` / `response_delta_script` |
+| **改「Anthropic prompt cache 断点注入」** | `protocol/shared/prompt_cache.rs`（纯 JSON 处理，客户端已有断点就整体不碰）→ 只在 `pipeline/outbound.rs::try_outbound` 的**跨协议转 Anthropic** 分支调用，开关是 `AppSettings::prompt_cache_injection` |
 | **改「请求回放 / A-B 对比」** | `replay.rs`（解码捕获 → 换渠道/模型 → 非流式重发）+ `commands/replay.rs`。走 `upstream/oneshot.rs::send_on`，**不写日志、不计费、不查缓存**；目标渠道选「自动」时由 `resolve_provider` 按**模型策略 > 原渠道（若声明了该模型）> 候选渠道**选，别退回"无脑沿用原渠道"——只改目标模型时那会打到一个不服务它的地址上。对比 UI 在 `src/components/traffic/ReplayDialog.tsx` |
 | **改「捕获存储 / 保留条数 / 空间回收」** | 压缩格式与读写都在 `storage/pack.rs`（`APZ1` 魔数 + zstd，旧行无魔数原样读）；`storage/logs.rs` 的 `save_capture` / `get_detail` / `fetch_payloads` 负责压/解；`payload_bytes` 记解压后大小供表达式预算用。保留条数在**流式与非流式两条收尾**都要调 `prune_captures`；数据库用 `auto_vacuum=incremental`，删除后 `db::reclaim_space` 才真正缩文件 |
 | **加一种路由匹配条件** | `routing/rule_item.rs` 加 `RuleItem` 变体（`matches` + `describe` + 测试）→ 前端 `src/components/routing/RuleEditor.tsx` |
 | **加一种路由动作** | `routing/rule.rs::RouteAction`（注意 `is_final` 的归类）→ `routing/engine.rs::route` 的 match → 前端 `ruleSummary.ts` |
 | **加一个 Tauri 命令** | 在 `commands/<域>.rs` 写 → `lib.rs` 的 `generate_handler!` 用**完整路径**（不能 re-export）→ 前端 `src/lib/api.ts` |
 | **改缓存策略** | `cache/policy.rs::is_cacheable` + `cache/key.rs`（键必须覆盖所有影响输出的因素） |
-| **改「请求属于哪个对话」** | 识别在 `traffic/session.rs`（会话 ID 只取客户端给的，**不按对话历史猜** —— 压缩会改写历史；线的指纹**不含工具集合**）→ `gateway/pipeline.rs::Recorder::tag_session`（三条入口都要调，流式那条经 `StreamContext.session` 带到收尾）→ 聚合与压缩判定在 `storage/sessions.rs`（查询时现算）→ 前端 `SessionsView` |
+| **改「请求属于哪个对话」** | 识别在 `traffic/session.rs`（会话 ID 只取客户端给的，**不按对话历史猜** —— 压缩会改写历史；线的指纹**不含工具集合**）→ `gateway/pipeline/recorder.rs::Recorder::tag_session`（三条入口都要调，流式那条经 `StreamContext.session` 带到收尾）→ 聚合与压缩判定在 `storage/sessions.rs`（查询时现算）→ 前端 `SessionsView` |
 | **改监控详情的可视化** | `protocol/inspect.rs`（把捕获报文解成 IR，只解码不搬运）+ `src/components/traffic/InspectViews.tsx`（渲染 IR）。**不要新建视图模型** —— IR 已经协议无关且字段齐备 |
 | **改 SSE 处理** | `gateway/sse.rs`（原语）→ `gateway/stream.rs`（转发管线） |
 | **加数据库表/字段** | `storage/migrations.rs` **追加**一条迁移（不要改已发布的），同步 `docs/CODE_MAP.md` |
@@ -98,7 +98,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
    → 有专门测试守着：`protocol/oai_chat/response.rs::cached_tokens_are_subtracted_from_prompt_tokens`
 
 2. **同协议直通，跨协议才重编码。**
-   `gateway/pipeline.rs` 里 `needs_conversion` 为 false 时转发**原始字节**，只旁路统计用量。
+   `gateway/pipeline/outbound.rs` 里 `needs_conversion` 为 false 时转发**原始字节**，只旁路统计用量。
    「同协议」指**入站协议 == 渠道实际使用的协议**，由 `Provider::wire_for` 按渠道声明的协议集合决定，
    不是"入站协议 == 渠道的 kind"。渠道声明了入站协议就直通，没声明才回落到 kind 做转换。
    但有个例外：响应若是从 SSE 还原出来的，必须重新编码 —— 见 `decoded_from_sse`。
@@ -116,7 +116,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 5. **缓存只对 `temperature` 显式为 `0` 的请求生效。** `None` 表示用服务商默认值（通常是 1.0），
    输出是随机的，缓存会返回错误结果。这条不能放宽。
 
-6. **鉴权头落库前必须隐去。** 见 `gateway/pipeline.rs::headers_to_json`。
+6. **鉴权头落库前必须隐去。** 见 `gateway/pipeline/reply.rs::headers_to_json`。
 
 7. **Tauri 命令不能用 `pub use` 转发**，`generate_handler!` 里必须写完整路径。
    原因：`#[tauri::command]` 生成的 `__cmd__*` 宏项不参与 re-export。
@@ -133,11 +133,11 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 10. **解不出不等于要失败。** 客户端与上游总在先用上新结构（Claude Code 带附件时发的
     `document` 内容块）。IR 不认识就**整块原样留着**（`ContentBlock::Unmodeled`）放请求过去，
     只在跨协议转换时才降级 —— 直通那条路本就不需要理解它们，报 400 挡掉的反而是完全正常的路。
-    响应侧同理：非流式解不出就透传原文（`gateway/pipeline.rs::try_outbound`），
+    响应侧同理：非流式解不出就透传原文（`gateway/pipeline/outbound.rs::try_outbound`），
     流式的坏帧原样转发给客户端（`gateway/stream.rs`）。
 
 11. **上游报错要看得见，且状态码原样透传。** 上游真的回了 HTTP 响应时，客户端收到的
-    就是它那个码（400 不是 502，由 `gateway/pipeline.rs::client_status_for` 判定），
+    就是它那个码（400 不是 502，由 `gateway/pipeline/reply.rs::client_status_for` 判定），
     只有连不上/超时才 502。**失败路径也必须把回给客户端的报文落进捕获**
     （`record_client_response`）—— 少了它，「上游 → Apilot」有原文、「Apilot → 客户端」
     空白，用户就只能猜那句报错是谁说的。折成 502 还会让客户端把 400 当网关抽风反复重试。
