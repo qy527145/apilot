@@ -31,6 +31,13 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { qk } from "@/hooks/queries";
 import {
   api,
@@ -56,11 +63,11 @@ interface FingerprintBatchDialogProps {
 }
 
 /**
- * 批量指纹检测：勾选多个模型，逐个跑完整检测。
+ * 批量指纹检测：勾选多个模型，按并发数并行跑完整检测。
  *
- * 模型之间**串行**（避免 N × 3 个请求同时打满渠道），每个模型内部仍按开关
- * 并行/串行发送 3 条挑战。结果逐个写入检测记录；每一行可以展开完整结果、
- * 加入本地样本库，或单独重测。
+ * 模型之间按「模型并发」并行（默认 3），每个模型内部仍按开关并行/串行发送
+ * 3 条挑战；峰值并发 = 模型并发 × (并行 ? 3 : 1)。结果逐个写入检测记录；
+ * 每一行可以展开完整结果、加入本地样本库，或单独重测。
  */
 export function FingerprintBatchDialog({
   open,
@@ -73,6 +80,7 @@ export function FingerprintBatchDialog({
   const [selected, setSelected] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [parallel, setParallel] = useState(true);
+  const [concurrency, setConcurrency] = useState(3);
   const [mode, setMode] = useState<ChallengeMode>("random");
   const [selectedChallenges, setSelectedChallenges] = useState<string[]>([]);
   const [confirmed, setConfirmed] = useState(false);
@@ -80,14 +88,18 @@ export function FingerprintBatchDialog({
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<Record<string, FingerprintDetection>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [activeModel, setActiveModel] = useState<string | null>(null);
+  /** 当前在飞的模型。并行批量时会有多个。 */
+  const [inFlight, setInFlight] = useState<string[]>([]);
   const [completed, setCompleted] = useState(0);
-  const [progress, setProgress] = useState<FingerprintProgress | null>(null);
-  const [challengeProgress, setChallengeProgress] = useState<
-    Record<number, FingerprintProgress>
+  const [progressByModel, setProgressByModel] = useState<
+    Record<string, FingerprintProgress>
+  >({});
+  const [challengeProgressByModel, setChallengeProgressByModel] = useState<
+    Record<string, Record<number, FingerprintProgress>>
   >({});
   const [expanded, setExpanded] = useState<string | null>(null);
-  const runIdRef = useRef<string | null>(null);
+  /** run_id → 模型名。并行时每条检测的进度事件靠它落到正确的行。 */
+  const runToModelRef = useRef(new Map<string, string>());
 
   useEffect(() => {
     if (!open) return;
@@ -96,6 +108,7 @@ export function FingerprintBatchDialog({
     setSelected(models.map((item) => item.model));
     setSearch("");
     setParallel(true);
+    setConcurrency(3);
     setMode("random");
     setSelectedChallenges([]);
     setConfirmed(false);
@@ -103,12 +116,12 @@ export function FingerprintBatchDialog({
     setRunning(false);
     setResults({});
     setErrors({});
-    setActiveModel(null);
+    setInFlight([]);
     setCompleted(0);
-    setProgress(null);
-    setChallengeProgress({});
+    setProgressByModel({});
+    setChallengeProgressByModel({});
     setExpanded(null);
-    runIdRef.current = null;
+    runToModelRef.current.clear();
   }, [open]);
 
   const challengesQuery = useQuery({
@@ -120,24 +133,39 @@ export function FingerprintBatchDialog({
 
   useApilotEvent("apilot://fingerprint", (event) => {
     if (event.phase === "started") {
-      runIdRef.current = event.run_id;
-      setChallengeProgress({});
-      setProgress(event);
+      runToModelRef.current.set(event.run_id, event.declared_model);
+      setProgressByModel((current) => ({
+        ...current,
+        [event.declared_model]: event,
+      }));
+      setChallengeProgressByModel((current) => ({
+        ...current,
+        [event.declared_model]: {},
+      }));
       return;
     }
-    if (runIdRef.current !== event.run_id) return;
-    setProgress(event);
+    const model = runToModelRef.current.get(event.run_id);
+    if (!model) return;
+    setProgressByModel((current) => ({ ...current, [model]: event }));
     if (event.challenge_index != null) {
       const index = event.challenge_index;
-      setChallengeProgress((current) => ({ ...current, [index]: event }));
+      setChallengeProgressByModel((current) => ({
+        ...current,
+        [model]: { ...(current[model] ?? {}), [index]: event },
+      }));
     }
   });
 
   const runModel = async (model: string): Promise<FingerprintDetection | null> => {
-    setActiveModel(model);
-    setProgress(null);
-    setChallengeProgress({});
-    runIdRef.current = null;
+    setInFlight((current) =>
+      current.includes(model) ? current : [...current, model],
+    );
+    setProgressByModel((current) => {
+      const next = { ...current };
+      delete next[model];
+      return next;
+    });
+    setChallengeProgressByModel((current) => ({ ...current, [model]: {} }));
     try {
       const detection = await api.detectModelFingerprint(
         providerId,
@@ -168,7 +196,7 @@ export function FingerprintBatchDialog({
       }));
       return null;
     } finally {
-      setActiveModel(null);
+      setInFlight((current) => current.filter((item) => item !== model));
     }
   };
 
@@ -179,12 +207,25 @@ export function FingerprintBatchDialog({
     setRunning(true);
     setResults({});
     setErrors({});
+    setInFlight([]);
     setCompleted(0);
+    setProgressByModel({});
+    setChallengeProgressByModel({});
     setExpanded(null);
-    for (const model of selected) {
-      await runModel(model);
-      setCompleted((current) => current + 1);
-    }
+    runToModelRef.current.clear();
+
+    // 小并发池：模型按 concurrency 并行，每个模型内部仍发 3 条挑战。
+    const queue = [...selected];
+    const workerCount = Math.max(1, Math.min(concurrency, queue.length));
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const model = queue.shift();
+        if (!model) break;
+        await runModel(model);
+        setCompleted((current) => current + 1);
+      }
+    });
+    await Promise.all(workers);
     setRunning(false);
     qc.invalidateQueries({ queryKey: qk.fingerprintDetections });
   };
@@ -207,6 +248,7 @@ export function FingerprintBatchDialog({
   const total = selected.length;
   const failed = Object.keys(errors).length;
   const percent = total > 0 ? Math.min(100, (completed / total) * 100) : 0;
+  const peak = concurrency * (parallel ? 3 : 1);
   const toggleModel = (model: string) => {
     setSelected((current) =>
       current.includes(model)
@@ -246,7 +288,7 @@ export function FingerprintBatchDialog({
             批量指纹检测 · {providerName}
           </DialogTitle>
           <DialogDescription className="text-xs">
-            模型之间串行执行，每个模型内部按设置发送 3 条挑战。结果会逐个写入检测记录。
+            模型之间按并发数并行，每个模型内部按设置发送 3 条挑战。结果会逐个写入检测记录。
           </DialogDescription>
         </DialogHeader>
 
@@ -259,7 +301,8 @@ export function FingerprintBatchDialog({
                   会消耗额度
                 </div>
                 已选 {selected.length} 个模型，共 {selected.length * 3} 次真实请求
-                （每个模型 3 条挑战）。模型之间串行，避免同时打满渠道。
+                （每个模型 3 条挑战）。模型之间按并发数并行；当前峰值并发约{" "}
+                {peak} 个请求，遇到限流就调小模型并发或关掉单模型并行。
               </div>
 
               <div className="space-y-2 rounded-md border px-3 py-3">
@@ -333,10 +376,32 @@ export function FingerprintBatchDialog({
                 <span>
                   <span className="font-medium">每个模型并行发送 3 条请求</span>
                   <span className="text-muted-foreground">
-                    （模型之间仍串行；容易限流的渠道可取消）
+                    （只影响单个模型内部；容易限流的渠道可取消）
                   </span>
                 </span>
               </label>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-medium">模型并发</span>
+                <Select
+                  value={String(concurrency)}
+                  onValueChange={(value) => setConcurrency(Number(value))}
+                >
+                  <SelectTrigger className="h-8 w-24 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {[1, 2, 3, 4, 5, 8, 10].map((value) => (
+                      <SelectItem key={value} value={String(value)}>
+                        {value} 个
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <span className="text-muted-foreground">
+                  同时检测的模型数；当前峰值并发约 {peak} 个请求
+                </span>
+              </div>
 
               <FingerprintChallengePicker
                 challenges={challengesQuery.data ?? []}
@@ -346,6 +411,12 @@ export function FingerprintBatchDialog({
                 selected={selectedChallenges}
                 onToggle={toggleChallenge}
               />
+              {mode === "random" && (
+                <p className="text-muted-foreground text-[11px]">
+                  批量随机模式下每个模型会各自抽 3 条；想用同一组挑战横向对比，
+                  请切到「手动选择」。
+                </p>
+              )}
 
               <label className="flex items-start gap-2 text-xs">
                 <Checkbox
@@ -363,11 +434,13 @@ export function FingerprintBatchDialog({
               <div className="space-y-1">
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span>
-                    {running && activeModel
-                      ? `正在检测：${activeModel}`
-                      : running
-                        ? "正在准备下一条…"
-                        : "批量检测结束"}
+                    {running
+                      ? inFlight.length > 0
+                        ? `正在检测 ${inFlight.length} 个模型：${inFlight
+                            .slice(0, 3)
+                            .join("、")}${inFlight.length > 3 ? "…" : ""}`
+                        : "正在准备下一条…"
+                      : "批量检测结束"}
                   </span>
                   <span className="text-muted-foreground tabular-nums">
                     已完成 {completed}/{total}
@@ -386,10 +459,12 @@ export function FingerprintBatchDialog({
                 {selected.map((model) => {
                   const result = results[model];
                   const error = errors[model];
-                  const active = activeModel === model;
+                  const active = inFlight.includes(model);
                   const waiting = !result && !error && !active;
                   const expandedRow = expanded === model;
                   const meta = modelsByName.get(model);
+                  const rowProgress = progressByModel[model];
+                  const rowChallenges = challengeProgressByModel[model] ?? {};
                   return (
                     <div key={model} className="rounded-md border">
                       <div className="flex flex-wrap items-center gap-2 px-3 py-2 text-xs">
@@ -448,7 +523,7 @@ export function FingerprintBatchDialog({
                               size="sm"
                               variant="outline"
                               className="ml-auto h-6 px-2 text-[11px]"
-                              disabled={running}
+                              disabled={running || active}
                               onClick={() => retryModel(model)}
                             >
                               <RefreshCw className="size-3" />
@@ -461,7 +536,7 @@ export function FingerprintBatchDialog({
                             size="sm"
                             variant="outline"
                             className="h-6 px-2 text-[11px]"
-                            disabled={running}
+                            disabled={running || active}
                             onClick={() => retryModel(model)}
                           >
                             <RefreshCw className="size-3" />
@@ -470,7 +545,7 @@ export function FingerprintBatchDialog({
                         )}
                         {waiting && (
                           <span className="text-muted-foreground text-[11px]">
-                            等待前面的模型完成
+                            等待队列中
                           </span>
                         )}
                       </div>
@@ -478,8 +553,8 @@ export function FingerprintBatchDialog({
                       {active && (
                         <div className="border-t px-3 py-2">
                           <FingerprintProgressCards
-                            total={progress?.total ?? 3}
-                            challenges={challengeProgress}
+                            total={rowProgress?.total ?? 3}
+                            challenges={rowChallenges}
                           />
                         </div>
                       )}

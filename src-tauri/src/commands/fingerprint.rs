@@ -65,12 +65,11 @@ pub async fn detect_model_fingerprint(
         .fingerprint
         .active()
         .map_err(|error| AppError::msg(error.to_string()))?;
-    let challenges = select_challenges(
-        &library.challenges,
-        challenge_ids.as_deref(),
-        now_ms() as u64,
-    )
-    .map_err(AppError::msg)?;
+    // 随机模式的种子必须每条检测独立：批量并行时几个模型可能在同一毫秒
+    // 发起，用 now_ms() 会让它们抽到同一组挑战。UUID 的随机性足够。
+    let seed = Uuid::new_v4().as_u128() as u64;
+    let challenges = select_challenges(&library.challenges, challenge_ids.as_deref(), seed)
+        .map_err(AppError::msg)?;
     let parallel = parallel.unwrap_or(true);
     let total = challenges.len();
     let run_id = Uuid::new_v4().to_string();
