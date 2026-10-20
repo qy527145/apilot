@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -106,6 +106,26 @@ export function FingerprintResultView({ result }: { result: FingerprintDetection
     return rows;
   })();
 
+  /**
+   * 分数占比：对**全部候选**的分数做 τ=1 的 softmax。
+   *
+   * 它只是把分数压到 0–100% 方便直观比较，不是校准概率：校准温度是按三条
+   * 有效回答拟合的，部分有效时不可用。三条有效时以「置信度」列为准。
+   */
+  const scoreShares = useMemo(() => {
+    const candidates = result.official?.candidates ?? [];
+    if (candidates.length === 0) return new Map<string, number>();
+    const maximum = Math.max(...candidates.map((item) => item.score));
+    const weights = candidates.map((item) => Math.exp(item.score - maximum));
+    const total = weights.reduce((sum, weight) => sum + weight, 0);
+    return new Map(
+      candidates.map((item, index) => [
+        item.model,
+        total > 0 ? weights[index] / total : 0,
+      ]),
+    );
+  }, [result.official]);
+
   const acceptedAttempts = result.attempts.filter((attempt) => attempt.accepted);
   const canAdd =
     (result.status === "ok" || result.status === "partial") &&
@@ -172,6 +192,7 @@ export function FingerprintResultView({ result }: { result: FingerprintDetection
                   <TableHead>模型</TableHead>
                   <TableHead>家族</TableHead>
                   <TableHead className="text-right">分数</TableHead>
+                  <TableHead className="text-right">占比*</TableHead>
                   <TableHead className="text-right">置信度</TableHead>
                 </TableRow>
               </TableHeader>
@@ -198,6 +219,11 @@ export function FingerprintResultView({ result }: { result: FingerprintDetection
                         {scoreText(item.score)}
                       </TableCell>
                       <TableCell className="text-right text-xs tabular-nums">
+                        {scoreShares.has(item.model)
+                          ? `≈ ${((scoreShares.get(item.model) ?? 0) * 100).toFixed(1)}%`
+                          : "—"}
+                      </TableCell>
+                      <TableCell className="text-right text-xs tabular-nums">
                         {probabilityText(item.probability)}
                       </TableCell>
                     </TableRow>
@@ -207,7 +233,11 @@ export function FingerprintResultView({ result }: { result: FingerprintDetection
             </Table>
             <p className="text-muted-foreground mt-1 text-[11px]">
               官方置信度是参考库内身份的闭集相对概率，不包含库外模型。
-              {!result.official.calibrated && " 本次校准不可用，只显示排名。"}
+              {!result.official.calibrated && " 本次校准不可用（有效回答不足 3 条）。"}
+            </p>
+            <p className="text-muted-foreground mt-1 text-[11px]">
+              占比* = 对全部候选分数做 softmax（τ=1）后的相对份额，只用于直观比较，
+              不是校准概率；三条有效回答时以「置信度」列为准。
             </p>
           </>
         ) : (
