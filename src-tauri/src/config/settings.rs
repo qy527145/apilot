@@ -479,20 +479,20 @@ pub struct AppSettings {
     #[serde(default)]
     pub request_script: String,
 
-    /// 响应改写脚本（JS）。空 = 不改写。
+    /// 响应改写脚本（JS，**只对非流式生效**）。空 = 不改写。
     ///
-    /// 默认只对非流式生效：流式响应边收边转，等收完再改时客户端早就看到了。
-    /// 想让流式也经过脚本，打开 [`Self::response_script_on_stream`]。
+    /// 契约是「完整响应进、完整响应出」。真正的流式响应边收边发，等收完再改
+    /// 客户端早就看到了 —— 所以流式走另一份 [`Self::response_delta_script`]。
     #[serde(default)]
     pub response_script: String,
 
-    /// 流式响应也执行改写脚本。
+    /// 流式增量改写脚本（JS，只对流式生效）。空 = 不改写。
     ///
-    /// **代价很大，所以默认关**：脚本契约吃的是完整响应，只能先把上游整条流收完、
-    /// 改写、再以 SSE 回放 —— 客户端要等整条回答生成完才看到第一个字。
-    /// 不打开时流式保持直通/转码，逐帧到达。
+    /// **与 `response_script` 是两份不同的契约**：这份每解出一个 `UnifiedDelta`
+    /// 调一次，改完**立即**编码下发，首字延迟不变。代价是脚本看不到完整回答，
+    /// 文本增量可能把一个词切成两半 —— 跨 chunk 的模式匹配要自己处理。
     #[serde(default)]
-    pub response_script_on_stream: bool,
+    pub response_delta_script: String,
 }
 
 /// 接管时对客户端模型配置做什么。
@@ -686,7 +686,7 @@ impl Default for AppSettings {
             prompt_cache_injection: true,         // Agent 会话的上下文通常会被复用
             request_script: String::new(),
             response_script: String::new(),
-            response_script_on_stream: false,
+            response_delta_script: String::new(),
         }
     }
 }
@@ -1394,7 +1394,7 @@ mod tests {
         assert!(s.prompt_cache_injection, "缺字段时默认开启提示缓存注入");
         assert!(s.request_script.is_empty());
         assert!(s.response_script.is_empty());
-        assert!(!s.response_script_on_stream, "流式改写默认关闭");
+        assert!(s.response_delta_script.is_empty());
     }
 
     #[test]

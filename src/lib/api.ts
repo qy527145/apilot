@@ -352,15 +352,15 @@ export interface AppSettings {  listen_host: string;
   prompt_cache_injection: boolean;
   /** 请求改写脚本（JS）。空 = 不改写。 */
   request_script: string;
-  /** 响应改写脚本（JS）。空 = 不改写。 */
+  /** 响应改写脚本（JS，只对非流式生效）。空 = 不改写。 */
   response_script: string;
   /**
-   * 流式响应也执行改写。默认关。
+   * 流式增量改写脚本（JS，只对流式生效）。空 = 不改写。
    *
-   * 打开后网关会先把整条上游流收完再改写、再以 SSE 回放 —— 内容能改，
-   * 但客户端要等整条回答生成完才看到第一个字。
+   * 每解出一个 delta 调一次，改完立即下发，首字延迟不变。脚本看不到完整回答，
+   * 文本增量可能把一个词切成两半。
    */
-  response_script_on_stream: boolean;
+  response_delta_script: string;
 }
 
 /* ------------------------------ 路由规则 ------------------------------ */

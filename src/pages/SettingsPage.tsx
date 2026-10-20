@@ -65,12 +65,17 @@ export default function SettingsPage() {
   const [scriptErrors, setScriptErrors] = useState<{
     request?: string | null;
     response?: string | null;
+    delta?: string | null;
   }>({});
 
-  const checkScript = async (kind: "request" | "response") => {
+  const checkScript = async (kind: "request" | "response" | "delta") => {
     if (!form) return;
     const source =
-      kind === "request" ? form.request_script : form.response_script;
+      kind === "request"
+        ? form.request_script
+        : kind === "response"
+          ? form.response_script
+          : form.response_delta_script;
     try {
       const err = await api.validateRewriteScript(source);
       setScriptErrors((e) => ({ ...e, [kind]: err }));
@@ -361,7 +366,7 @@ export default function SettingsPage() {
 
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <Label>响应改写</Label>
+                  <Label>响应改写（非流式）</Label>
                   <Button
                     variant="outline"
                     size="sm"
@@ -384,22 +389,44 @@ export default function SettingsPage() {
                     {scriptErrors.response}
                   </p>
                 ) : null}
-                <div className="flex items-center justify-between rounded-md border px-3 py-2">
-                  <div>
-                    <Label>流式响应也执行改写</Label>
-                    <p className="text-muted-foreground text-xs">
-                      关闭时流式逐帧直通/转码，只有非流式经过脚本。
-                      打开后，流式会先把上游整条流收完再改写、再以 SSE 回放：
-                      内容能改，但客户端要等整条回答生成完才看到第一个字。
-                    </p>
-                  </div>
-                  <Switch
-                    checked={form.response_script_on_stream}
-                    onCheckedChange={(v) =>
-                      set("response_script_on_stream", v)
-                    }
-                  />
+                <p className="text-muted-foreground text-xs">
+                  契约是「完整响应进、完整响应出」，所以只作用于非流式请求。
+                  流式请求请用下面的增量脚本。
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>流式增量改写</Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => checkScript("delta")}
+                  >
+                    校验语法
+                  </Button>
                 </div>
+                <Textarea
+                  value={form.response_delta_script}
+                  onChange={(e) => set("response_delta_script", e.target.value)}
+                  placeholder={
+                    "// ctx.kind === \"delta\"，ctx.json 是**一条**增量\nfunction resolve(ctx) {\n  const d = JSON.parse(ctx.json);\n  if (d.kind === \"text\") d.text = d.text.replace(/secret/gi, \"***\");\n  return JSON.stringify(d);\n}\n// 返回 [] 可以丢弃这条增量"
+                  }
+                  className="min-h-40 font-mono text-xs"
+                  spellCheck={false}
+                />
+                {scriptErrors.delta ? (
+                  <p className="text-destructive text-xs whitespace-pre-wrap">
+                    {scriptErrors.delta}
+                  </p>
+                ) : null}
+                <p className="text-muted-foreground text-xs">
+                  每解出一条增量调用一次，改完**立即**下发，首字延迟不变。
+                  代价是脚本看不到完整回答：文本增量可能把一个词切成两半，
+                  跨 chunk 的模式匹配要自己处理；且流式不再走同协议直通
+                  （必须重新编码）。返回单个对象、对象数组（可拆成多条）
+                  或 <code>[]</code>（丢弃这条）。
+                </p>
               </div>
             </CardContent>
           </Card>

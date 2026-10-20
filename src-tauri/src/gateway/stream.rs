@@ -322,21 +322,38 @@ fn stream_break_message(error: &str) -> String {
 /// `encoder` 为 `None` 时走直通：原样转发上游字节。
 /// `observer` 为 `None` 时不推实时事件流（测试与不需要该能力的调用方走这条）。
 /// `on_finish` 在流结束时调用一次，用于记账、写缓存与发事件。
-/// 流式响应的整条重写。
+/// 流式增量的逐条改写钩子。
 ///
-/// 脚本契约吃的是**完整响应**，所以只能先把上游整条流收完、再改写、再以 SSE
-/// 回放 —— 客户端要等整条回答生成完才看到第一个字。代价很实在，必须由调用方
-/// 显式开启（`AppSettings::response_script_on_stream`），不能替用户默认做。
-pub struct StreamRewrite {
-    /// 合成 SSE 时 `message_start` / `response.created` 用的 id 与模型。
-    pub id: String,
-    pub model: String,
-    /// 拿到完整响应后执行；`None` = 不改写。
-    pub apply: Box<dyn FnOnce(UnifiedResponse) -> Option<UnifiedResponse> + Send + 'static>,
+/// 每解出一条增量调用一次；返回 `Some` 表示替换成 0..n 条新增量
+/// （空数组 = 丢弃），`None` = 原样放行。**不缓冲整条流**：改完立刻编码下发，
+/// 首字延迟与没开脚本时一致。
+///
+/// 用 `FnMut` 而不是 `Fn`：将来若要支持需要跨增量状态的改写（例如把最后
+/// 一个字符先扣住、等下一块再匹配），实现方可以在闭包里维护状态。
+pub struct StreamDeltaRewrite {
+    pub apply: Box<dyn FnMut(&UnifiedDelta) -> Option<Vec<UnifiedDelta>> + Send + 'static>,
 }
 
-/// 不收尾改写的便捷入口，只给测试用：生产路径统一走
-/// [`translate_stream_with_rewrite`]（它多一个 `rewrite` 参数）。
+/// 对一批增量逐条跑改写钩子。钩子返回空数组时该条被丢弃。
+fn apply_delta_rewrite(
+    deltas: Vec<UnifiedDelta>,
+    rewrite: &mut Option<StreamDeltaRewrite>,
+) -> Vec<UnifiedDelta> {
+    let Some(rw) = rewrite.as_mut() else {
+        return deltas;
+    };
+    let mut out = Vec::with_capacity(deltas.len());
+    for d in deltas {
+        match (rw.apply)(&d) {
+            Some(replaced) => out.extend(replaced),
+            None => out.push(d),
+        }
+    }
+    out
+}
+
+/// 逐增量改写的便捷入口，只给测试用：生产路径统一走
+/// [`translate_stream_with_rewrite`]（它多一个 `delta_rewrite` 参数）。
 /// 二十多个流式用例都从这条路进来，给每个都补一个 `None` 只是噪音。
 #[cfg(test)]
 pub fn translate_stream_observed<F>(
@@ -355,26 +372,25 @@ where
     )
 }
 
-/// 与 [`translate_stream_observed`] 相同，额外支持「收完整条流再改写」。
+/// 与 [`translate_stream_observed`] 相同，额外支持逐增量改写。
 ///
-/// `rewrite` 为 `Some` 时**整条流期间不向客户端发任何字节**，收尾后用编码器把
-/// 改写后的完整响应重新合成 SSE。因此调用方必须传 `encoder`（不能走直通）。
+/// `delta_rewrite` 为 `Some` 时调用方必须传 `encoder`（改写后的增量要重新编码，
+/// 不能走直通）；否则钩子会被忽略，按普通流式处理。
 pub fn translate_stream_with_rewrite<F>(
     upstream: BoxStream<'static, reqwest::Result<Bytes>>,
     mut decoder: Box<dyn StreamDecoder>,
     mut encoder: Option<Box<dyn StreamEncoder>>,
     timeouts: StreamTimeouts,
     mut observer: Option<Box<dyn StreamObserver>>,
-    rewrite: Option<StreamRewrite>,
+    delta_rewrite: Option<StreamDeltaRewrite>,
     on_finish: F,
 ) -> Body
 where
     F: FnOnce(StreamOutcome) + Send + 'static,
 {
     let passthrough = encoder.is_none();
-    // 没有编码器就无从合成改写后的流。宁可按普通流式走，也不要把请求弄坏。
-    let mut rewrite = rewrite.filter(|_| !passthrough);
-    let buffered = rewrite.is_some();
+    // 没有编码器就无法把改写后的增量发出去。宁可按普通流式走，也不要把请求弄坏。
+    let mut delta_rewrite = delta_rewrite.filter(|_| !passthrough);
     let mut on_finish = Some(on_finish);
 
     let stream = async_stream::stream! {
@@ -450,9 +466,7 @@ where
                         // 只在**转码**这条路上补发：直通时这一个块的原始字节上面
                         // 已经发过了，再发一次就是重复。补上 `\n\n` 是因为
                         // `take_sse_block` 只回块内容，不回上游用的是哪种换行。
-                        // 缓冲改写这条路上什么都先不发：客户端要等收尾后的
-                        // 重写版，提前漏一帧原始块会破坏"整条流都是改写过的"。
-                        if !passthrough && !buffered {
+                        if !passthrough {
                             let bytes = Bytes::from(format!("{block}\n\n"));
                             raw_client.push(&bytes);
                             yield Ok::<Bytes, std::io::Error>(bytes);
@@ -460,6 +474,10 @@ where
                         Vec::new()
                     }
                 };
+
+                // 逐增量改写放在观察者 / 累加器 / 编码器**之前**：三者必须看到
+                // 同一份增量，否则实时视图、捕获内容与客户端收到的会互相矛盾。
+                let deltas = apply_delta_rewrite(deltas, &mut delta_rewrite);
 
                 if let Some(o) = observer.as_mut() {
                     o.on_event(&block, &deltas);
@@ -481,7 +499,7 @@ where
                     acc.apply(d);
                 }
 
-                if !passthrough && !buffered {
+                if !passthrough {
                     for d in &deltas {
                         if let Some(enc) = encoder.as_mut() {
                             for out in enc.on_delta(d) {
@@ -503,14 +521,15 @@ where
         let broken = outcome.error.is_some();
 
         if !broken {
-            for d in decoder.finish() {
+            // 收尾补出来的增量也要过脚本：否则客户端收到的流里，最后那帧
+            // （终止原因等）会绕过改写，出现"前面的都改了、最后一帧没改"。
+            let finished = apply_delta_rewrite(decoder.finish(), &mut delta_rewrite);
+            for d in finished {
                 if let UnifiedDelta::Finish(r) = &d {
                     outcome.finish_reason = Some(r.clone());
                 }
-                // 解码器的 `finish()` 正常只补终止帧，但万一带了内容增量，也必须
-                // 进累加器 —— 缓冲改写用的是累加器的结果，漏一段就是错答案。
                 acc.apply(&d);
-                if !passthrough && !buffered {
+                if !passthrough {
                     if let Some(enc) = encoder.as_mut() {
                         for out in enc.on_delta(&d) {
                             let bytes = encode_event(&out);
@@ -522,7 +541,7 @@ where
             }
         }
 
-        if !passthrough && !buffered {
+        if !passthrough {
             if let Some(enc) = encoder.as_mut() {
                 // 失败的流**不发**终止帧：`error` 之后再来一个 `message_stop`
                 // 就等于又说了一遍"正常结束"，正好抵消掉上面那句话。
@@ -550,64 +569,17 @@ where
         outcome.usage = decoder.usage();
         let accumulated = acc.finish();
 
-        if let Some(rw) = rewrite.take() {
-            // 完整响应先拼出来；上游没给终止帧时按正常结束处理，与其余分支同口径。
-            let base = UnifiedResponse {
-                id: rw.id,
-                model: rw.model,
-                content: accumulated,
-                finish_reason: outcome
-                    .finish_reason
-                    .clone()
-                    .unwrap_or(FinishReason::Stop),
-            };
-
-            if broken {
-                // 断流时不回放半截内容：客户端收到明确错误才能自己决定重试。
-                // 一条"看起来完整"的半截回答是最糟的结果。
-                if let Some(enc) = encoder.as_mut() {
-                    let message =
-                        stream_break_message(outcome.error.as_deref().unwrap_or(""));
-                    for out in enc.on_delta(&UnifiedDelta::Error {
-                        code: "api_error".into(),
-                        message,
-                    }) {
-                        let bytes = encode_event(&out);
-                        raw_client.push(&bytes);
-                        yield Ok::<Bytes, std::io::Error>(bytes);
-                    }
-                }
-                outcome.text = base.concat_text();
-                outcome.content = base.content;
-            } else {
-                let final_resp = (rw.apply)(base.clone()).unwrap_or(base);
-                let deltas = response_to_deltas(&final_resp, &outcome.usage);
-                if let Some(enc) = encoder.as_mut() {
-                    for d in &deltas {
-                        for out in enc.on_delta(d) {
-                            let bytes = encode_event(&out);
-                            raw_client.push(&bytes);
-                            yield Ok::<Bytes, std::io::Error>(bytes);
-                        }
-                    }
-                    for out in enc.finish() {
-                        let bytes = encode_event(&out);
-                        raw_client.push(&bytes);
-                        yield Ok::<Bytes, std::io::Error>(bytes);
-                    }
-                }
-                outcome.text = final_resp.concat_text();
-                outcome.content = final_resp.content;
-                outcome.finish_reason = Some(final_resp.finish_reason);
-            }
-            // 客户端收到的是合成出来的流，不能再套用"直通 = 上游字节"那条假设。
-            outcome.raw_client = Some(raw_client.bytes);
-        } else {
-            outcome.text = decoder.text();
-            outcome.content = accumulated;
-            // 直通时客户端收到的就是上游字节，客户端侧那份不必重复存。
-            outcome.raw_client = (!passthrough).then_some(raw_client.bytes);
-        }
+        // 文本从**累加器**取而不是 `decoder.text()`：后者是上游原文，逐增量
+        // 改写之后两者会不一致。捕获里的 `stream_text` 必须与 `response_content`
+        // 一样，反映客户端实际看到的内容。
+        outcome.text = accumulated
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<Vec<_>>()
+            .join("");
+        outcome.content = accumulated;
+        // 直通时客户端收到的就是上游字节，客户端侧那份不必重复存。
+        outcome.raw_client = (!passthrough).then_some(raw_client.bytes);
 
         outcome.raw_upstream = raw_upstream.bytes;
         outcome.raw_truncated = raw_upstream.truncated || raw_client.truncated;
@@ -626,8 +598,8 @@ where
 
 /// 把一份完整响应拆成 IR 增量序列，供编码器合成 SSE。
 ///
-/// 缓存命中与「收完整条流再改写」两条路共用同一份拆法 —— 两处一旦分叉，
-/// 客户端看到的流形态就会因为"命中缓存 / 被脚本改写"而不一样。
+/// 缓存命中与「非流式响应假装成流」两条路共用同一份拆法 —— 两处一旦分叉，
+/// 客户端看到的流形态就会因为"命中缓存 / 上游没用流"而不一样。
 fn response_to_deltas(response: &UnifiedResponse, usage: &UnifiedUsage) -> Vec<UnifiedDelta> {
     let mut deltas = vec![UnifiedDelta::MessageStart {
         id: response.id.clone(),
@@ -916,29 +888,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_buffered_rewrite_replaces_the_stream_before_the_client_sees_anything() {
+    async fn a_delta_rewrite_is_applied_before_the_client_sees_it() {
+        // 逐增量改写必须"边收边改边发"：这里不测时序，只钉住客户端拿到的
+        // 和捕获记录里存的都是改写后的内容，原始文本一个字都不漏。
         let chunks = vec![
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\",\"usage\":{\"input_tokens\":3}}}\n\n",
             "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"secret\"}}\n\n",
-            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" tail\"}}\n\n",
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         ];
 
-        let rewrite = StreamRewrite {
-            id: "req-1".into(),
-            model: "m".into(),
-            apply: Box::new(|resp| {
-                let content = resp
-                    .content
-                    .iter()
-                    .map(|b| match b {
-                        crate::protocol::dto::ContentBlock::Text { .. } => {
-                            crate::protocol::dto::ContentBlock::text("[redacted]")
-                        }
-                        other => other.clone(),
-                    })
-                    .collect();
-                Some(UnifiedResponse { content, ..resp })
+        let rewrite = StreamDeltaRewrite {
+            apply: Box::new(|d| match d {
+                UnifiedDelta::TextDelta { index, text } => {
+                    Some(vec![UnifiedDelta::TextDelta {
+                        index: *index,
+                        text: text.replace("secret", "[redacted]"),
+                    }])
+                }
+                _ => None,
             }),
         };
 
@@ -957,64 +926,23 @@ mod tests {
         let text = String::from_utf8_lossy(&run(body).await).to_string();
 
         assert!(
-            text.contains("[redacted]"),
-            "客户端应当收到改写后的内容: {text}"
+            text.contains("[redacted]") && text.contains(" tail"),
+            "客户端应当收到改写后的两个增量: {text}"
         );
         assert!(
             !text.contains("secret"),
-            "原始内容不能在改写前漏给客户端: {text}"
+            "原始文本不能在改写前漏给客户端: {text}"
         );
 
         let o = rx.await.unwrap();
-        assert!(o.text.contains("[redacted]"));
-        assert!(!o.text.contains("secret"));
+        assert_eq!(o.text, "[redacted] tail");
         assert!(
             o.raw_client
                 .as_deref()
                 .is_some_and(|b| String::from_utf8_lossy(b).contains("[redacted]")),
-            "客户端侧捕获必须是实际发出去的合成流"
+            "客户端侧捕获必须是实际发出去的流"
         );
         assert!(o.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_buffered_rewrite_on_a_broken_stream_emits_only_an_error() {
-        // 断流时**不能**回放已经缓冲的半截内容：客户端收到一条"看起来完整"的
-        // 半截回答，比收到明确错误更糟 —— 它不会重试，也不会报错。
-        let chunks = vec![
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n",
-            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"半截\"}}\n\n",
-        ];
-
-        let rewrite = StreamRewrite {
-            id: "req-2".into(),
-            model: "m".into(),
-            apply: Box::new(|_| None),
-        };
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let body = translate_stream_with_rewrite(
-            hanging_upstream(chunks),
-            Box::new(AnthropicStreamDecoder::new()),
-            Some(Box::new(AnthropicStreamEncoder::new())),
-            impatient(),
-            None,
-            Some(rewrite),
-            move |o| {
-                let _ = tx.send(o);
-            },
-        );
-        let text = String::from_utf8_lossy(&run(body).await).to_string();
-
-        assert!(text.contains("event: error"), "断流必须以 error 收尾: {text}");
-        assert!(!text.contains("半截"), "不能回放半截内容: {text}");
-        assert!(
-            !text.contains("message_stop"),
-            "失败的流不该再发终止帧: {text}"
-        );
-
-        let o = rx.await.unwrap();
-        assert!(o.error.is_some());
     }
 
     #[tokio::test]

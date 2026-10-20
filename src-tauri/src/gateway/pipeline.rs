@@ -20,8 +20,8 @@ use crate::billing::session::BillingSession;
 use crate::cache::{cache_key, policy::is_cacheable, store::CacheEntry};
 use crate::protocol::codec::ConvertError;
 use crate::protocol::dto::{
-    ContentBlock, FinishReason, Protocol, ReasoningConfig, UnifiedRequest, UnifiedResponse,
-    UnifiedUsage, UsageSource,
+    ContentBlock, FinishReason, Protocol, ReasoningConfig, UnifiedDelta, UnifiedRequest,
+    UnifiedResponse, UnifiedUsage, UsageSource,
 };
 use crate::protocol::shared::tokens::estimate_request_tokens;
 use crate::routing::{model_policy, RouteMetadata, RouteOutcome};
@@ -32,7 +32,7 @@ use crate::upstream::outbound::{Outbound, UpstreamBody, UpstreamError};
 
 use super::router::{protocol_family, upstream_path};
 use super::stream::{
-    translate_stream_with_rewrite, StreamOutcome, StreamRewrite, StreamTimeouts,
+    translate_stream_with_rewrite, StreamDeltaRewrite, StreamOutcome, StreamTimeouts,
 };
 
 /// 从请求头 / 路径识别调用方。
@@ -1248,30 +1248,31 @@ async fn try_outbound(
     if req.stream {
         let decoder = shell.codecs.codec(wire).new_stream_decoder();
         let settings = shell.settings();
-        let script = settings.response_script.clone();
+        let delta_script = settings.response_delta_script.clone();
 
-        // 响应脚本默认只管非流式。打开 `response_script_on_stream` 后必须先把
-        // 整条流收完再改写、再以 SSE 回放 —— 代价是首字延迟变成整条流的耗时，
-        // 所以这个取舍只能由用户显式打开。
-        let rewriting_stream =
-            !script.trim().is_empty() && settings.response_script_on_stream;
+        // 流式改写是**逐增量**的：每解出一条就改、立刻下发，绝不缓冲整条流。
+        // 因此只要有脚本就必须有编码器（不能走直通），仅此而已。
+        let rewriting_stream = !delta_script.trim().is_empty();
 
-        // 同协议走直通（不重编码），异协议或需要缓冲改写时才用编码器。
         let encoder = if needs_conversion || rewriting_stream {
             Some(shell.codecs.codec(protocol_in).new_stream_encoder())
         } else {
             None
         };
 
-        let rewrite = rewriting_stream.then(|| StreamRewrite {
-            id: recorder.record.request_id.clone(),
-            model: req.model.clone(),
+        let delta_rewrite = rewriting_stream.then(|| StreamDeltaRewrite {
             apply: Box::new({
-                let script = script.clone();
+                let script = delta_script.clone();
                 let client = recorder.record.client.clone();
                 let model = req.model.clone();
-                move |resp: UnifiedResponse| {
-                    rewrite_response_with(&script, protocol_in, &client, &model, resp)
+                move |delta: &UnifiedDelta| {
+                    crate::routing::rewrite_script::apply_delta(
+                        &script,
+                        &client,
+                        protocol_in.as_str(),
+                        &model,
+                        delta,
+                    )
                 }
             }),
         });
@@ -1365,7 +1366,7 @@ async fn try_outbound(
             encoder,
             timeouts,
             Some(observer),
-            rewrite,
+            delta_rewrite,
             move |outcome| finalize_stream(ctx, outcome),
         );
 
@@ -1551,8 +1552,8 @@ async fn finish_buffered(
     // ---- 响应改写脚本 ----
     //
     // 这条分支覆盖非流式（含"客户端要流式、上游却回了完整响应"这种伪流式）。
-    // 真正的流式走 `translate_stream_with_rewrite`：只有在设置里显式打开
-    // `response_script_on_stream` 时才会先缓冲整条流再改写。
+    // 真正的流式走 `translate_stream_with_rewrite` 的**逐增量**脚本
+    // （`AppSettings::response_delta_script`），不经过这里。
     //
     // 位置在计费之后：这次请求花了多少 token 是上游的客观事实，脚本不该能通过
     // 增删内容把它改小。位置在写缓存之前：缓存里存的必须是客户端真正看到的那份。

@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
-use rquickjs::{Context, Ctx, Function, Object, Runtime};
+use rquickjs::{Context, Ctx, Function, Object, Persistent, Runtime};
 
 use super::model_policy::ScriptInput;
 
@@ -161,6 +161,14 @@ thread_local! {
 }
 
 struct Engine {
+    /// 增量改写脚本的已编译函数缓存：源码 hash → (源码, 持久化函数)。
+    ///
+    /// 流式改写**每条 delta** 都会调用一次脚本；不复用已编译函数的话，同一段
+    /// 脚本会被重新求值/解析上千次，白白加在每一个增量的延迟上。
+    ///
+    /// **必须声明在 `ctx` 之前**：字段按声明顺序析构，`Persistent` 不能比
+    /// 它所属的 Runtime 活得更久（QuickJS 会直接 abort 进程）。
+    compiled: RefCell<HashMap<u64, (String, Persistent<Function<'static>>)>>,
     /// 不另存一个 `Runtime` 字段：`Context::full` 会 clone 一份 runtime 的
     /// 引用计数，它自己就把 JSRuntime 养着了。内存上限与 interrupt handler
     /// 都设在同一个 JSRuntime 上，跟着它一起活。多存一个字段只是摆设，
@@ -200,7 +208,11 @@ impl Engine {
         })));
 
         let ctx = Context::full(&rt)?;
-        Ok(Self { ctx, deadline })
+        Ok(Self {
+            compiled: RefCell::new(HashMap::new()),
+            ctx,
+            deadline,
+        })
     }
 
     fn call(&self, source: &str, input: &ScriptInput<'_>) -> Option<String> {
@@ -211,8 +223,40 @@ impl Engine {
 
     fn call_json(&self, source: &str, input: &JsonScriptInput<'_>) -> Option<String> {
         self.run("改写脚本执行失败，按不改写处理", |ctx| {
-            Self::invoke_json(ctx, source, input)
+            self.invoke_json(ctx, source, input)
         })
+    }
+
+    /// 取（必要时编译）脚本对应的函数。
+    ///
+    /// 缓存只给 `invoke_json` 用：模型脚本本来就有一层结果 memo，命中时根本
+    /// 不进引擎，没必要再存一份。缓存上限很小 —— 实际只会有一两份脚本。
+    fn compiled_function<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        source: &str,
+    ) -> rquickjs::Result<Function<'js>> {
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        let key = hasher.finish();
+
+        {
+            let cache = self.compiled.borrow();
+            if let Some((cached_source, func)) = cache.get(&key) {
+                if cached_source == source {
+                    return func.clone().restore(ctx);
+                }
+            }
+        }
+
+        let func: Function<'js> = ctx.eval(wrapped(source))?;
+        let persistent = Persistent::save(ctx, func.clone());
+        let mut cache = self.compiled.borrow_mut();
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+        cache.insert(key, (source.to_string(), persistent));
+        Ok(func)
     }
 
     /// 两种脚本共用的外壳：设截止时刻 → 求值 → 清异常 → 收尾。
@@ -283,11 +327,12 @@ impl Engine {
     }
 
     fn invoke_json(
+        &self,
         ctx: &Ctx<'_>,
         source: &str,
         input: &JsonScriptInput<'_>,
     ) -> rquickjs::Result<Option<String>> {
-        let func: Function = ctx.eval(wrapped(source))?;
+        let func = self.compiled_function(ctx, source)?;
 
         let arg = Object::new(ctx.clone())?;
         arg.set("model", input.model)?;
