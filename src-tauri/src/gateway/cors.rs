@@ -1,8 +1,9 @@
 //! 跨源放行（CORS）。
 //!
-//! 只在设置里的 [`crate::config::settings::AppSettings::allow_browser_origins`] 打开时生效。默认关闭是
-//! 有意的：网关默认只服务本机，而任意网页都能向回环发请求 —— 放行跨源等于
-//! 让用户访问的每一个页面都能花掉他的渠道额度。见 [`super::guard`] 的说明。
+//! 受设置里的 [`crate::config::settings::AppSettings::allow_browser_origins`] 控制，
+//! 默认开：公网上的网页客户端指向本机网关是最常见的用法。关掉后这一层完全透明，
+//! 由 [`super::guard`] 把跨源网页请求挡回去 —— 放行跨源等于让用户访问的每一个
+//! 页面都能花掉他的渠道额度。
 //!
 //! 打开之后两种请求分开处理：
 //!

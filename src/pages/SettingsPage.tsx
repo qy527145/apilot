@@ -164,9 +164,9 @@ export default function SettingsPage() {
                 <div>
                   <Label>允许任意网页调用（CORS）</Label>
                   <p className="text-muted-foreground text-xs">
-                    默认只服务本机客户端。要把部署在公网上的网页客户端（如
-                    https://lm.example.com）指向本网关时才打开 ——
-                    打开后任何网页都能花掉你的渠道额度。
+                    让公网上的网页客户端（如 https://lm.example.com）能直接调用
+                    本网关。关掉后跨源网页请求会被挡回去；开着的代价是任何网页
+                    都能花掉你的渠道额度。
                   </p>
                 </div>
                 <Switch

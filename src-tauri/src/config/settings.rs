@@ -460,13 +460,14 @@ pub struct AppSettings {
     #[serde(default)]
     pub allow_lan: bool,
 
-    /// 允许任意源站的网页调用网关（CORS）。默认关。
+    /// 允许任意源站的网页调用网关（CORS）。**默认开**。
     ///
     /// 关着时 [`crate::gateway::guard`] 会把跨源网页请求挡回去：用户访问的
-    /// 任意页面都能向回环发 POST，花掉他的渠道额度。要把部署在公网上的网页
-    /// 客户端（`https://lm.example.com` → `http://127.0.0.1:8787`）接进来，
-    /// 只能显式打开这个开关 —— 打开后那道防线对这些页面就是敞开的。
-    #[serde(default)]
+    /// 任意页面都能向回环发 POST，花掉他的渠道额度。但网关最现实的用法就是
+    /// 「公网上的网页客户端 + 本机网关」（`https://lm.example.com` →
+    /// `http://127.0.0.1:8787`），默认拦着会让这条路看起来完全是坏的。
+    /// 打开后那道防线对这些页面就是敞开的 —— 不想要的人可以关掉。
+    #[serde(default = "default_true_setting")]
     pub allow_browser_origins: bool,
 
     /// 上游首字节超时：连接建立后多久没收到第一个字节就判失败。
@@ -712,8 +713,8 @@ impl Default for AppSettings {
             listen_host: "127.0.0.1".to_string(),
             listen_port: DEFAULT_PORT,
             autostart_gateway: true,
-            allow_lan: false,            // 默认只服务本机
-            allow_browser_origins: false, // 默认挡住外来网页，见 guard.rs 的说明
+            allow_lan: false,           // 默认只服务本机
+            allow_browser_origins: true, // 公网网页客户端指向本机是最常见的用法
 
             first_byte_timeout_ms: 60_000,
             idle_timeout_ms: 300_000,
@@ -998,6 +999,18 @@ mod tests {
         let s = AppSettings::load(&pool).await.unwrap();
         assert!(!s.allow_lan);
         assert_eq!(s.bind_host(), "127.0.0.1");
+    }
+
+    #[test]
+    fn browser_origins_default_to_open_even_for_old_archives() {
+        // 默认开：老存档里没有这个键，读出来就该是放行 —— 否则用户升级后
+        // 网页客户端还是被挡，看起来就像"修复没生效"。
+        let s: AppSettings = serde_json::from_str(r#"{"listen_port":9999}"#).unwrap();
+        assert!(s.allow_browser_origins);
+
+        let off: AppSettings =
+            serde_json::from_str(r#"{"allow_browser_origins":false}"#).unwrap();
+        assert!(!off.allow_browser_origins, "显式关掉要尊重");
     }
 
     #[test]

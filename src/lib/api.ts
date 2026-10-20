@@ -330,10 +330,9 @@ export interface AppSettings {
   /** 局域网访问。默认关 —— 关着只绑回环。 */
   allow_lan: boolean;
   /**
-   * 允许任意源站的网页调用网关（CORS）。默认关。
+   * 允许任意源站的网页调用网关（CORS）。默认开。
    *
-   * 关着时跨源网页请求会被网关挡回去：任意页面都能向本机发请求、花掉渠道额度。
-   * 把公网上的网页客户端接到本机网关时才需要打开。
+   * 关掉后跨源网页请求会被网关挡回去：任意页面都能向本机发请求、花掉渠道额度。
    */
   allow_browser_origins: boolean;
   first_byte_timeout_ms: number;
