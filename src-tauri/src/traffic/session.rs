@@ -19,8 +19,10 @@
 //! 请求，子代理也共用同一个会话 ID。它们混在一起，主线的消息数就会忽高忽低，
 //! 压缩点也就认不出来了。所以再按「线」细分：
 //!
-//! - 线的身份 = **system 提示**的指纹。同一条线每轮都发同一份 system（只有对话
-//!   历史在长），换一个子代理或旁路任务它就会变。工具集合**不算** —— 见 [`thread_key`]。
+//! - 线的身份：子代理用客户端给的 `x-claude-code-agent-id`（并行派出的子代理
+//!   system 提示可能一模一样，只有这个头分得开）；其余用 **system 提示**的指纹。
+//!   同一条线每轮都发同一份 system（只有对话历史在长），换一个子代理或旁路任务
+//!   它就会变。工具集合**不算** —— 见 [`thread_key`]。
 //! - `count_tokens` 这类非对话请求也带会话 ID，但它们拿着各种工具子集来估算，
 //!   不是任何一条线上的一轮。它们记在会话里，不参与分线，见 [`is_conversation_path`]。
 //! - 主线 / 子代理 / 旁路的**分类**在查询时按整个会话来定（谁的请求最多谁是主线），
@@ -123,7 +125,7 @@ pub fn tag(headers: &HeaderMap, path: &str, body: &[u8]) -> SessionTag {
 
     SessionTag {
         session_id,
-        thread_key: Some(thread_key(&json)),
+        thread_key: Some(thread_key(headers, &json)),
         message_count,
         has_tools,
         title: first_user_line(&json),
@@ -284,14 +286,37 @@ fn strip_tag_blocks(text: &str) -> String {
     out
 }
 
+/// 子代理的身份：Claude Code 给每个派出去的 agent 一个 ID（`x-claude-code-agent-id`），
+/// 同一条子代理线的每一次请求都带同一个值。
+///
+/// **不能只看 system 提示**。实测同一个会话里并行派出的 5 个 Explore 子代理，
+/// system 一字不差 —— 单靠指纹它们会挤成一条线，5 条各自增长的消息数交错在一起，
+/// 每切换一次就「消息数骤降」，全被认成上下文压缩。
+fn agent_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-claude-code-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
 /// 线的指纹：system 稳定部分的短哈希。
 ///
-/// **不含工具集合**。实测主线会在对话中途多出两个工具（MCP 连上了、技能加载了），
-/// 而 system 没变 —— 带上工具的话，一条主线会被劈成"主线 + 一个只有 1 次请求的
-/// 子代理"。真正的子代理有自己的 system 提示，靠它就分得开。
-fn thread_key(body: &Value) -> String {
+/// 带了 agent ID 就**只用它**：它是客户端对"哪条子代理线"的明确声明，比从
+/// system 里推断可靠。有的客户端（还有主线自己）不发这个头，那就退回 system 指纹。
+///
+/// system 指纹**不含工具集合**。实测主线会在对话中途多出两个工具（MCP 连上了、
+/// 技能加载了），而 system 没变 —— 带上工具的话，一条主线会被劈成"主线 + 一个
+/// 只有 1 次请求的子代理"。真正不同的子代理靠各自的 agent ID 或 system 提示分开。
+fn thread_key(headers: &HeaderMap, body: &Value) -> String {
     let mut h = Fnv::new();
-    h.write(system_fingerprint(body).as_bytes());
+    match agent_id(headers) {
+        Some(id) => {
+            h.write(b"agent\x1e");
+            h.write(id.as_bytes());
+        }
+        None => h.write(system_fingerprint(body).as_bytes()),
+    }
     format!("{:016x}", h.finish())
 }
 
@@ -526,6 +551,31 @@ mod tests {
         assert_eq!(before.session_id, after.session_id);
         assert_eq!(before.thread_key, after.thread_key);
         assert!(is_compaction(300, 2));
+    }
+
+    #[test]
+    fn parallel_sub_agents_with_identical_system_prompts_get_distinct_threads() {
+        // 实测：同一会话并行派出 5 个 Explore 子代理，system 一字不差。只按 system
+        // 分线的话它们会挤成一条，各自增长的消息数交错，每次切换都像一次压缩。
+        let session = |agent: &'static str| {
+            headers(&[("x-claude-code-session-id", "s"), ("x-claude-code-agent-id", agent)])
+        };
+        let a = tag(&session("a787f936296d52512"), "/v1/messages", &cc_body("", &["Read", "Grep"], 2));
+        let b = tag(&session("a2535407d86e617a1"), "/v1/messages", &cc_body("", &["Read", "Grep"], 2));
+        let c = tag(&session("a787f936296d52512"), "/v1/messages", &cc_body("", &["Read", "Grep"], 17));
+        assert_ne!(a.thread_key, b.thread_key, "不同子代理是两条线");
+        assert_eq!(a.thread_key, c.thread_key, "同一个子代理的消息增长不换线");
+        assert_eq!(a.session_id, b.session_id, "仍归同一个会话");
+    }
+
+    #[test]
+    fn agent_id_outranks_the_system_fingerprint() {
+        // 子代理的 system 可能在两轮之间变（工具增减、环境块变化），身份以客户端
+        // 给的头为准，不能因此劈成两条。
+        let h = headers(&[("x-claude-code-session-id", "s"), ("x-claude-code-agent-id", "a1")]);
+        let a = tag(&h, "/v1/messages", &cc_body("", &["Read"], 2));
+        let b = tag(&h, "/v1/messages", &cc_body(" 换了个 system 尾巴", &["Read", "Grep"], 5));
+        assert_eq!(a.thread_key, b.thread_key);
     }
 
     #[test]
