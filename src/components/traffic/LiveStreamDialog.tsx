@@ -160,6 +160,16 @@ export function LiveStreamDialog({
   const [follow, setFollow] = useState(true);
   const timelineRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  /**
+   * 两个滚动区上一次的 `scrollTop`。
+   *
+   * 判断"用户往上翻了"必须看**方向**，不能只看"离底部多远"：程序化跟滚
+   * （`scrollTop = scrollHeight`）触发 scroll 事件时，新帧可能已经让
+   * `scrollHeight` 又长了一截 —— 按距离判断会把这次跟滚误判成用户上翻，
+   * 于是刚点「回到末尾」就立刻又停止跟随。方向判据不会：跟滚只会让
+   * scrollTop 变大。
+   */
+  const lastTop = useRef({ timeline: 0, content: 0 });
 
   const frames = live?.frames ?? [];
   const blocks = useMemo(() => accumulate(frames), [frames]);
@@ -176,6 +186,8 @@ export function LiveStreamDialog({
     if (live) {
       setSelectedSeq(null);
       setFollow(true);
+      // 新请求的两个面板可能带着上一条的滚动位置，方向判据得同步归零。
+      lastTop.current = { timeline: 0, content: 0 };
     }
   }, [live?.request_id]);
 
@@ -190,15 +202,33 @@ export function LiveStreamDialog({
   }, [frames.length, follow, live?.request_id]);
 
   /**
-   * 用户自己往上滚了就停止跟随，别让下一批帧把他拽回底部。
+   * 用户自己往上滚了就停止跟随，别让下一批帧把他拽回底部；
+   * 滚回底部则自动恢复跟随。
    *
-   * 用"离底部还有多远"判断而不是监听滚动方向：程序化的跟滚也走这个回调，
-   * 它每次都停在底部（距离 0），不会误伤；而内容变长本身不会触发 scroll。
+   * 判据是**方向**（scrollTop 变小）而不是"离底部多远"。后者有个很难查的
+   * 竞态：点「回到末尾」后程序化跟滚触发 scroll 事件时，新帧可能已经让
+   * scrollHeight 又长了一截，距离判断会把这次跟滚当成用户上翻，于是刚恢复
+   * 的跟随立刻又被关掉 —— 表现就是"点了回到末尾，跳一下就不跟了"。
+   * 程序化跟滚只会让 scrollTop 变大，方向判据不会误伤。
    */
   const handleScroll = (e: UIEvent<HTMLDivElement>) => {
-    if (!follow) return;
     const el = e.currentTarget;
-    if (el.scrollHeight - el.scrollTop - el.clientHeight > 16) setFollow(false);
+    const panel = el === timelineRef.current ? "timeline" : "content";
+    const prev = lastTop.current[panel];
+    const next = el.scrollTop;
+    lastTop.current[panel] = next;
+
+    // 变大 = 跟滚或用户往下翻；变小才是用户往上翻。
+    if (next < prev - 1) {
+      setFollow(false);
+      return;
+    }
+    if (
+      !follow &&
+      el.scrollHeight - el.scrollTop - el.clientHeight <= 16
+    ) {
+      setFollow(true);
+    }
   };
 
   // 稳定引用：时间轴的行按 props 记忆，回调每次渲染都换新的话，
