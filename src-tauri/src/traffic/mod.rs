@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::traffic::stream_events::{RequestStarted, StreamFrame};
+use crate::traffic::stream_events::{RequestStarted, StreamFrame, MAX_FRAMES_PER_REQUEST};
 
 /// 「进行中」底账里的一条：请求本身，加上**已经推出去的帧**。
 ///
@@ -38,10 +38,10 @@ pub struct InflightEntry {
 
 /// 每条请求在底账里最多留多少帧。
 ///
-/// 与前端 `MAX_LIVE_FRAMES` 同值：那是界面真正会显示的量，多留没有意义，
-/// 而每帧原文上限 8KB，留太多会把内存撑起来。超出就丢最老的 ——
-/// 实时视图看的是"当下"，更早的内容在请求结束后能从明细里完整看到。
-const MAX_RETAINED_FRAMES: usize = 500;
+/// 与推送上限同值：底账是给"半路才进监控页"的人补帧用的，补回来的就该是
+/// 已经推出去的全部。真正的内存兜底在推送那一侧（帧数 + 字节双上限），
+/// 这里再按帧数留一道环形边界，防的是配置被改出异常值。
+const MAX_RETAINED_FRAMES: usize = MAX_FRAMES_PER_REQUEST as usize;
 
 /// 正在进行的请求快照，供「进入监控页时补齐遗漏的进行中请求」用。
 ///

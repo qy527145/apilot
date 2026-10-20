@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 
 import { cn, formatMs } from "@/lib/utils";
 
@@ -68,6 +68,77 @@ function tier(ms: number): string {
   return "bg-foreground/15";
 }
 
+/**
+ * 一行事件。
+ *
+ * 单独拆成 memo 组件，是因为实时视图现在会保留整条流（几千上万个事件），
+ * 而它每 120ms 就随一批新帧重渲染一次。只传基本类型，旧行的 props 不变，
+ * 重渲染就只剩新增的那几行；再配上 `content-visibility: auto`，浏览器也不必
+ * 为视口外的行做布局。少了这一层，一条长回答能把监控页拖到卡住。
+ */
+const TimelineRow = memo(function TimelineRow({
+  seq,
+  name,
+  gap,
+  at_ms,
+  active,
+  max,
+  barClassName,
+  showAbsolute,
+  onSelect,
+}: {
+  seq: number;
+  name: string;
+  gap: number;
+  at_ms: number;
+  active: boolean;
+  max: number;
+  barClassName: string;
+  showAbsolute: boolean;
+  onSelect?: (seq: number) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect ? () => onSelect(seq) : undefined}
+      style={{ contentVisibility: "auto", containIntrinsicSize: "auto 26px" }}
+      className={cn(
+        "flex w-full items-center gap-2 border-b px-2 py-1 text-left text-[11px] last:border-b-0",
+        onSelect && "cursor-pointer",
+        active && "bg-accent",
+      )}
+    >
+      <span className="text-muted-foreground w-8 shrink-0 tabular-nums">
+        {seq}
+      </span>
+
+      <span
+        className={cn(
+          "bg-muted h-1.5 shrink-0 overflow-hidden rounded-full",
+          barClassName,
+        )}
+      >
+        <span
+          className={cn("block h-full rounded-full", tier(gap))}
+          style={{ width: `${(gap / max) * 100}%` }}
+        />
+      </span>
+
+      <span className="min-w-0 flex-1 truncate font-mono">{name}</span>
+
+      <span className="w-16 shrink-0 text-right tabular-nums">
+        {formatMs(gap)}
+      </span>
+
+      {showAbsolute && (
+        <span className="text-muted-foreground w-16 shrink-0 text-right tabular-nums">
+          +{formatMs(at_ms)}
+        </span>
+      )}
+    </button>
+  );
+});
+
 export function StreamTimeline({
   entries,
   truncated,
@@ -121,46 +192,19 @@ export function StreamTimeline({
       <div className="overflow-hidden rounded-md border">
         {rows.map((e, i) => {
           const seq = i + 1;
-          const active = selected === seq;
           return (
-            <button
+            <TimelineRow
               key={seq}
-              type="button"
-              onClick={onSelect ? () => onSelect(seq) : undefined}
-              className={cn(
-                "flex w-full items-center gap-2 border-b px-2 py-1 text-left text-[11px] last:border-b-0",
-                onSelect && "cursor-pointer",
-                active && "bg-accent",
-              )}
-            >
-              <span className="text-muted-foreground w-8 shrink-0 tabular-nums">
-                {seq}
-              </span>
-
-              <span
-                className={cn(
-                  "bg-muted h-1.5 shrink-0 overflow-hidden rounded-full",
-                  barClassName,
-                )}
-              >
-                <span
-                  className={cn("block h-full rounded-full", tier(e.gap))}
-                  style={{ width: `${(e.gap / max) * 100}%` }}
-                />
-              </span>
-
-              <span className="min-w-0 flex-1 truncate font-mono">{e.name}</span>
-
-              <span className="w-16 shrink-0 text-right tabular-nums">
-                {formatMs(e.gap)}
-              </span>
-
-              {showAbsolute && (
-                <span className="text-muted-foreground w-16 shrink-0 text-right tabular-nums">
-                  +{formatMs(e.at_ms)}
-                </span>
-              )}
-            </button>
+              seq={seq}
+              name={e.name}
+              gap={e.gap}
+              at_ms={e.at_ms}
+              active={selected === seq}
+              max={max}
+              barClassName={barClassName}
+              showAbsolute={showAbsolute}
+              onSelect={onSelect}
+            />
           );
         })}
       </div>

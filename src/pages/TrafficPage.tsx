@@ -8,7 +8,7 @@ import { ErrorState, TableSkeleton } from "@/components/common/StatCard";
 import { PageShell } from "@/components/layout/PageShell";
 import { FilterExprPanel } from "@/components/traffic/FilterExprPanel";
 import { TimeRangePicker } from "@/components/traffic/TimeRangePicker";
-import { LiveStreamDialog, MAX_LIVE_FRAMES, type LiveRequest } from "@/components/traffic/LiveStreamDialog";
+import { LiveStreamDialog, type LiveRequest } from "@/components/traffic/LiveStreamDialog";
 import { RequestDetailDialog } from "@/components/traffic/RequestDetailDialog";
 import { SessionsView } from "@/components/traffic/SessionsView";
 import { Badge } from "@/components/ui/badge";
@@ -70,6 +70,13 @@ const MAX_LIMIT = 1000;
 
 /** 流结束后，实时条目在内存里再留多久。够用户看完最后几帧，又不至于一直占着。 */
 const DONE_TTL_MS = 120_000;
+
+/** 清掉已经过了保留期的结束条目。原地改 `m`。 */
+function pruneDone(m: Map<string, LiveRequest>, now: number) {
+  for (const [id, r] of m) {
+    if (r.done && now - (r.done_at ?? now) > DONE_TTL_MS) m.delete(id);
+  }
+}
 
 type RangePreset = "all" | "5m" | "1h" | "24h" | "today" | "custom";
 
@@ -256,11 +263,18 @@ export default function TrafficPage() {
     error: error ?? cur.error,
   });
 
-  const pruneDone = (m: Map<string, LiveRequest>, now: number) => {
-    for (const [id, r] of m) {
-      if (r.done && now - (r.done_at ?? now) > DONE_TTL_MS) m.delete(id);
-    }
-  };
+  // 结束的条目留着是为了让用户看完最后几帧。之前只在"下一条请求开始"时才清，
+  // 空闲下来它们就会一直占着整条流的帧内存 —— 定时扫一遍，保留期一过就放掉。
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setInflight((prev) => {
+        const next = new Map(prev);
+        pruneDone(next, Date.now());
+        return next.size === prev.size ? prev : next;
+      });
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useApilotEvent("apilot://request-start", (p) => {
     setInflight((prev) => {
@@ -296,22 +310,24 @@ export default function TrafficPage() {
       // 「进行中」里的幽灵。丢的只是进页瞬间那一两批，后面的都会接上。
       if (!cur) return prev;
 
-      const next = new Map(prev);
-      if (batch.done) {
-        next.set(batch.request_id, markDone(cur, batch.error));
-        return next;
-      }
-
       // 按序号去重，不盲接。进页时补回来的那批帧与"此刻正在路上"的这批可能重叠
       //（`seq` 从 1 起单调递增，就是为这个留的），续上就行，别把同一帧显示两遍。
       const lastSeq = cur.frames.length > 0 ? cur.frames[cur.frames.length - 1].seq : 0;
       const fresh = batch.frames.filter((f) => f.seq > lastSeq);
-
-      next.set(batch.request_id, {
+      const merged: LiveRequest = {
         ...cur,
-        frames: [...cur.frames, ...fresh].slice(-MAX_LIVE_FRAMES),
+        frames: fresh.length > 0 ? [...cur.frames, ...fresh] : cur.frames,
         truncated: cur.truncated || batch.truncated,
-      });
+      };
+
+      // 收尾那一批**也要接上**：后端的 `on_finish` 会先把攒着的帧 flush 出来，
+      // 再带 `done` 一起发 —— 直接 markDone 就把最后这段（含 finish / usage）丢了，
+      // 表现是流明明结束了，内容却停在倒数第二三批。
+      const next = new Map(prev);
+      next.set(
+        batch.request_id,
+        batch.done ? markDone(merged, batch.error) : merged,
+      );
       return next;
     });
   });

@@ -1,5 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Loader2, Radio } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type UIEvent,
+} from "react";
+import { ArrowDownToLine, Loader2, Radio } from "lucide-react";
 
 import { CopyButton } from "@/components/common/CopyButton";
 import { StreamTimeline } from "@/components/traffic/StreamTimeline";
@@ -44,15 +51,6 @@ export interface LiveRequest {
   truncated: boolean;
   error?: string | null;
 }
-
-/**
- * 单条请求保留多少帧。
- *
- * 后端已经按每请求 2000 帧封顶了，这里再收一道：前端是长驻进程，用户开着
- * 监控页过夜的话，几百条请求各留 2000 帧会把内存吃光。实时视图看的是"当下"，
- * 完整内容在请求结束后本来就能从明细里看到。
- */
-export const MAX_LIVE_FRAMES = 500;
 
 /** 把增量折叠成可读的内容块。 */
 interface Block {
@@ -149,7 +147,8 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
   // 不用 frames[frames.length-1] 作默认值，避免每帧都触发 raw 面板重渲染。
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
   const [follow, setFollow] = useState(true);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   const frames = live?.frames ?? [];
   const blocks = useMemo(() => accumulate(frames), [frames]);
@@ -169,12 +168,34 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
     }
   }, [live?.request_id]);
 
-  // 跟随最新：不这么做的话，长回答滚上去之后就再也看不到新内容了。
+  // 跟随末尾：两个滚动区都跟，只看一边的话另一边照样会停在半路。
+  // 直接设 `scrollTop` 而不是 `scrollIntoView` —— 后者会连带滚动外层弹窗，
+  // 而且滚动消息面板时可能把整页拽走。
   useEffect(() => {
-    if (follow && frames.length > 0) {
-      bottomRef.current?.scrollIntoView({ block: "end" });
+    if (!follow) return;
+    for (const el of [timelineRef.current, contentRef.current]) {
+      if (el) el.scrollTop = el.scrollHeight;
     }
-  }, [frames.length, follow]);
+  }, [frames.length, follow, live?.request_id]);
+
+  /**
+   * 用户自己往上滚了就停止跟随，别让下一批帧把他拽回底部。
+   *
+   * 用"离底部还有多远"判断而不是监听滚动方向：程序化的跟滚也走这个回调，
+   * 它每次都停在底部（距离 0），不会误伤；而内容变长本身不会触发 scroll。
+   */
+  const handleScroll = (e: UIEvent<HTMLDivElement>) => {
+    if (!follow) return;
+    const el = e.currentTarget;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight > 16) setFollow(false);
+  };
+
+  // 稳定引用：时间轴的行按 props 记忆，回调每次渲染都换新的话，
+  // 整条流（可能几千行）会在每批帧到达时全部重渲染。
+  const selectFrame = useCallback((seq: number) => {
+    setSelectedSeq(seq);
+    setFollow(false);
+  }, []);
 
   // 把「选中帧」的计算收进 memo：selectedSeq 为 null 时取最后一帧，
   // 有值时找匹配，找不到也回落到最后一帧。
@@ -223,7 +244,7 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
         )}
         {live?.done && !live.error && (
           <p className="text-muted-foreground text-xs">
-            流已结束。这里只保留最近若干帧，完整报文在列表里点这一行看明细。
+            流已结束。完整报文在列表里点这一行看明细。
           </p>
         )}
 
@@ -233,19 +254,33 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium">事件时间轴</span>
               <Button
-                variant="ghost"
+                variant={follow ? "secondary" : "ghost"}
                 size="sm"
                 className="h-6 px-2 text-[11px]"
+                title={
+                  follow
+                    ? "正在跟随末尾；手动向上滚动会停止跟随"
+                    : "回到末尾并继续跟随"
+                }
                 onClick={() => {
-                  setFollow((v) => !v);
+                  if (follow) {
+                    setFollow(false);
+                    return;
+                  }
                   // 切回跟随时也清掉固定选中，让视图跟着走。
-                  if (!follow) setSelectedSeq(null);
+                  setSelectedSeq(null);
+                  setFollow(true);
                 }}
               >
-                {follow ? "停止跟随" : "跟随最新"}
+                <ArrowDownToLine className="size-3" />
+                {follow ? "跟随末尾" : "回到末尾"}
               </Button>
             </div>
-            <div className="max-h-[52vh] min-h-32 overflow-y-auto pr-1">
+            <div
+              ref={timelineRef}
+              onScroll={handleScroll}
+              className="max-h-[52vh] min-h-32 overflow-y-auto pr-1"
+            >
               {frames.length === 0 ? (
                 <p className="text-muted-foreground flex items-center justify-center gap-2 py-8 text-xs">
                   <Loader2 className="size-3 animate-spin" />
@@ -256,15 +291,11 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
                   entries={entries}
                   truncated={live?.truncated}
                   selected={selected?.seq ?? null}
-                  onSelect={(seq) => {
-                    setSelectedSeq(seq);
-                    setFollow(false);
-                  }}
+                  onSelect={selectFrame}
                   barClassName="w-12"
                   showAbsolute={false}
                 />
               )}
-              <div ref={bottomRef} />
             </div>
           </div>
 
@@ -275,7 +306,12 @@ export function LiveStreamDialog({ live, onOpenChange }: Props) {
               <TabsTrigger value="raw">原文</TabsTrigger>
             </TabsList>
 
-            <TabsContent value="content" className="max-h-[52vh] space-y-3 overflow-y-auto pt-3">
+            <TabsContent
+              ref={contentRef}
+              onScroll={handleScroll}
+              value="content"
+              className="max-h-[52vh] space-y-3 overflow-y-auto pt-3"
+            >
               {blocks.length === 0 ? (
                 <p className="text-muted-foreground py-8 text-center text-xs">
                   还没有可展示的内容增量。

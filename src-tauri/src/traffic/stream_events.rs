@@ -22,6 +22,19 @@ use crate::protocol::dto::{
     ContentBlock, FinishReason, UnifiedDelta, UsageDelta,
 };
 
+/// 每个请求最多推多少帧。
+///
+/// 这不是"只给你看这么多"，而是防病态流把内存打爆的兜底：实测最长的一条
+/// 请求有八千多个 SSE 事件、约 1MB 原文，两万帧留了足够余量。真的越过时
+/// 置 `truncated`，界面会明确标出来，不会让人误以为看到了全部。
+pub const MAX_FRAMES_PER_REQUEST: u64 = 20_000;
+
+/// 每个请求最多推多少字节的帧原文。
+///
+/// 与帧数上限是一对：单帧最长 8KB，只按帧数封顶的话极端情况下是 160MB。
+/// 按字节封顶在真实流上几乎不会触发（最长的那条约 1MB），但能把最坏情况摁住。
+pub const MAX_TOTAL_RAW_BYTES: usize = 16 * 1024 * 1024;
+
 /// 攒批与截断的上限。
 #[derive(Debug, Clone)]
 pub struct BatchCaps {
@@ -29,6 +42,8 @@ pub struct BatchCaps {
     pub flush_interval: Duration,
     /// 单个请求最多推多少帧。超了就置 `truncated` 并停止推送。
     pub max_frames_per_request: u64,
+    /// 单个请求累计推送的原文最多多少字节。与帧数上限取"先到者"。
+    pub max_total_raw_bytes: usize,
     /// 一批最多带多少帧。
     pub max_frames_per_batch: usize,
     /// 单帧原文的上限（字节）。
@@ -39,7 +54,8 @@ impl Default for BatchCaps {
     fn default() -> Self {
         Self {
             flush_interval: Duration::from_millis(120),
-            max_frames_per_request: 2000,
+            max_frames_per_request: MAX_FRAMES_PER_REQUEST,
+            max_total_raw_bytes: MAX_TOTAL_RAW_BYTES,
             max_frames_per_batch: 32,
             max_raw_frame_bytes: 8 * 1024,
         }
@@ -186,6 +202,8 @@ pub struct StreamBatcher {
     last_flush: Instant,
     /// 已收到的帧数（含被丢弃的）。
     seq: u64,
+    /// 已推送的原文累计字节数，用于字节上限。
+    pushed_bytes: usize,
     pending: Vec<StreamFrame>,
     /// 是否已越过每请求帧上限。
     pub truncated: bool,
@@ -199,6 +217,7 @@ impl StreamBatcher {
             started: now,
             last_flush: now,
             seq: 0,
+            pushed_bytes: 0,
             pending: Vec::new(),
             truncated: false,
         }
@@ -206,7 +225,9 @@ impl StreamBatcher {
 
     /// 收一帧。攒够了就返回这一批，否则返回 `None`。
     pub fn push(&mut self, raw: &str, deltas: &[UnifiedDelta]) -> Option<Vec<StreamFrame>> {
-        if self.seq >= self.caps.max_frames_per_request {
+        if self.seq >= self.caps.max_frames_per_request
+            || self.pushed_bytes >= self.caps.max_total_raw_bytes
+        {
             // 到顶了不再攒：缓冲保持不变，调用方下次 flush 会带上 truncated 标记。
             self.truncated = true;
             return None;
@@ -214,6 +235,7 @@ impl StreamBatcher {
         self.seq += 1;
 
         let (raw, raw_truncated) = truncate_raw(raw, self.caps.max_raw_frame_bytes);
+        self.pushed_bytes += raw.len();
         self.pending.push(StreamFrame {
             seq: self.seq,
             at_ms: self.started.elapsed().as_millis() as i64,
@@ -486,6 +508,7 @@ mod tests {
         BatchCaps {
             flush_interval: Duration::from_secs(3600), // 测试里不靠时间触发
             max_frames_per_request: 100,
+            max_total_raw_bytes: MAX_TOTAL_RAW_BYTES, // 测试里不靠字节触发
             max_frames_per_batch: 3,
             max_raw_frame_bytes: 16,
         }
@@ -553,6 +576,20 @@ mod tests {
 
         assert!(b.push("x", &[]).is_none(), "越过上限后不再收帧");
         assert!(b.truncated, "必须立起 truncated 标记，否则前端不知道后面没了");
+    }
+
+    #[test]
+    fn the_byte_cap_stops_the_stream_before_the_frame_cap_does() {
+        // 单帧上限 8KB 时，两万帧最坏是 160MB —— 字节上限才是真正兜住内存的那道。
+        let mut b = StreamBatcher::new(BatchCaps {
+            max_total_raw_bytes: 10,
+            ..caps()
+        });
+        assert!(b.push("12345", &[]).is_none());
+        assert!(b.push("12345", &[]).is_none());
+        assert!(b.push("x", &[]).is_none(), "累计 10 字节之后就不再收了");
+        assert!(b.truncated);
+        assert_eq!(b.flush().len(), 2, "到顶之前的帧一帧都不能少");
     }
 
     #[test]
