@@ -59,7 +59,7 @@ export function FingerprintHistoryDialog({
           {query.data && <FingerprintResultView result={query.data} />}
         </ScrollArea>
 
-        <DialogFooter className="shrink-0">
+        <DialogFooter className="bg-background relative z-10 shrink-0 pt-2">
           <Button onClick={() => onOpenChange(false)}>关闭</Button>
         </DialogFooter>
       </DialogContent>

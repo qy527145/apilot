@@ -1320,6 +1320,8 @@ export interface FingerprintAttempt {
   minimum_numbers: number;
   accepted: boolean;
   text_preview: string;
+  /** 原始回答全文；老记录可能没有。 */
+  text?: string;
   /** 解析后的整数；前端不展示，加入样本库由后端按检测 id 回查。 */
   numbers?: number[];
 }
@@ -1543,6 +1545,12 @@ export const api = {
   /** 读取一次历史检测的完整结果；返回的 id 可用于加入样本库。 */
   getFingerprintDetection: (detectionId: number) =>
     call<FingerprintDetection>("get_fingerprint_detection", { detectionId }),
+  /** 只重试某一条挑战，保留其余两条并重新计算排名。 */
+  retryFingerprintAttempt: (detectionId: number, attemptIndex: number) =>
+    call<FingerprintDetection>("retry_fingerprint_attempt", {
+      detectionId,
+      attemptIndex,
+    }),
   deleteFingerprintDetection: (detectionId: number) =>
     call<null>("delete_fingerprint_detection", { detectionId }),
   /** 从 GitHub（或镜像）拉检测器和指纹库；base_url 省略用默认地址。 */

@@ -193,6 +193,25 @@ pub async fn delete_detection(pool: &SqlitePool, id: i64) -> AppResult<()> {
     Ok(())
 }
 
+/// 单条挑战重试后覆盖检测结果。状态与完整 JSON 一起更新，避免列表摘要
+/// 与详情看到两个不同版本。
+pub async fn update_detection_result(
+    pool: &SqlitePool,
+    id: i64,
+    status: &str,
+    result_json: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE fingerprint_detections SET status = ?1, result_json = ?2 WHERE id = ?3",
+    )
+    .bind(status)
+    .bind(result_json)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn list_labels(pool: &SqlitePool) -> AppResult<Vec<LocalLabelSummary>> {
     let rows = sqlx::query(
         "SELECT label, COUNT(*) AS samples, MAX(created_at) AS last_added_at
@@ -446,5 +465,17 @@ mod tests {
             1,
             "删除检测记录不应连带删除本地样本"
         );
+    }
+
+    #[tokio::test]
+    async fn updating_a_detection_replaces_status_and_result() {
+        let pool = pool().await;
+        let id = insert_detection(&pool, &detection()).await.unwrap();
+        update_detection_result(&pool, id, "partial", r#"{"updated":true}"#)
+            .await
+            .unwrap();
+        let row = get_detection(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "partial");
+        assert_eq!(row.result_json, r#"{"updated":true}"#);
     }
 }

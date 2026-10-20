@@ -97,6 +97,7 @@ pub fn run() {
             commands::catalog::test_model,
             // --- 指纹检测与样本库 ---
             commands::fingerprint::detect_model_fingerprint,
+            commands::fingerprint::retry_fingerprint_attempt,
             commands::fingerprint::fingerprint_library_info,
             commands::fingerprint::list_fingerprint_challenges,
             commands::fingerprint::list_fingerprint_detections,

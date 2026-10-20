@@ -16,7 +16,7 @@ Tauri 2 + React 19，后端约 21k 行 Rust。
 ```bash
 source scripts/msvc-env.sh     # 每个新 shell 都要执行一次
 cd src-tauri
-cargo test                     # 1173 个测试
+cargo test                     # 1174 个测试
 cargo check --all-targets      # 期望零警告
 cargo build
 ```

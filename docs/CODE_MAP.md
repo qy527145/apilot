@@ -577,7 +577,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 | `models.rs` | 8 | 模型视角：`list_model_catalog` / `list_model_options`、`get_model_policy`（模型替换，与 `app.rs` 的 `set_model_policy` 一对）、`upsert_model_policy` / `reset_model_policy` / `switch_model_channel`（每模型选渠道）、`set_model_candidates`、`probe_model_candidates` |
 | `logs.rs` | 11 | `query_logs`、`list_log_facets`（筛选下拉的候选值）、`get_request_detail`、`clear_logs` / `delete_log`（只清明细与捕获，不动 `usage_hourly`；单条删除只是多一个 `request_id` 条件）、会话相关命令 |
 | `replay.rs` | 1 | `replay_request`：把捕获的请求重发到指定渠道 / 模型。**不写日志、不计费** |
-| `fingerprint.rs` | 13 | `detect_model_fingerprint`（默认并行 3 条挑战，可手动指定/切串行；逐条推 `apilot://fingerprint` 进度；官方排名 + 本地证据 + 结论，落一条检测记录）、`fingerprint_library_info` / `list_fingerprint_challenges` / `update_fingerprint_library` / `reset_fingerprint_library`、检测记录的 `list_fingerprint_detections` / `get_fingerprint_detection` / `delete_fingerprint_detection`、本地样本的 `list_fingerprint_labels` / `list_fingerprint_samples` / `add_fingerprint_samples` / `delete_fingerprint_sample` / `delete_fingerprint_label`。检测走 `oneshot`，**不写日志、不计费、不查缓存** |
+| `fingerprint.rs` | 14 | `detect_model_fingerprint`（默认并行 3 条挑战，可手动指定/切串行；逐条推 `apilot://fingerprint` 进度；官方排名 + 本地证据 + 结论，落一条检测记录）、`fingerprint_library_info` / `list_fingerprint_challenges` / `update_fingerprint_library` / `reset_fingerprint_library`、检测记录的 `list_fingerprint_detections` / `get_fingerprint_detection` / `retry_fingerprint_attempt` / `delete_fingerprint_detection`、本地样本的 `list_fingerprint_labels` / `list_fingerprint_samples` / `add_fingerprint_samples` / `delete_fingerprint_sample` / `delete_fingerprint_label`。检测走 `oneshot`，**不写日志、不计费、不查缓存** |
 
 **命令注册**：全部在 `lib.rs` 的 `generate_handler!` 里，用**完整路径**。
 `#[tauri::command]` 生成的 `__cmd__*` 宏项不参与 re-export，不能用 `pub use` 转发。
@@ -633,7 +633,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 | 位置 | 内容 |
 |---|---|
-| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 78 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
+| `src/lib/api.ts` | **契约的唯一真源**：全部类型定义 + 79 个命令的类型化封装 + 统一错误处理。`Protocol` / `PROTOCOL_LABEL` / `PROTOCOL_DEFAULT_PATH` 也在这里，与后端 `Protocol` 的 JSON 名一一对应 |
 | `src/lib/events.ts` | `useApilotEvent<T>` hook + 事件负载类型 |
 | `src/lib/logExpr.ts` | 监控页自定义表达式筛选的**前端那一半**：为「进行中」请求组装内置对象并求值（已落库的走后端 QuickJS）。两边必须同语义，改一个就要改另一个 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
@@ -652,7 +652,7 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 
 ## 测试
 
-1173 个测试，**与实现同文件**（`#[cfg(test)] mod tests`），`cargo test` 全量运行。
+1174 个测试，**与实现同文件**（`#[cfg(test)] mod tests`），`cargo test` 全量运行。
 
 | 层次 | 代表 |
 |---|---|

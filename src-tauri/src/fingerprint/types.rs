@@ -198,6 +198,9 @@ pub struct AttemptResult {
     pub minimum_numbers: usize,
     pub accepted: bool,
     pub text_preview: String,
+    /// 原始回答全文；用于历史详情回看与单条重试。老记录可能为空。
+    #[serde(default)]
+    pub text: String,
     /// 解析后的整数；加入本地样本库时由后端从这里取，前端不需要展示。
     #[serde(default)]
     pub numbers: Vec<i32>,

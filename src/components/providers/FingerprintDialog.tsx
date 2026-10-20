@@ -414,7 +414,7 @@ export function FingerprintDialog({
           {result && !running && <FingerprintResultView result={result} />}
         </ScrollArea>
 
-        <DialogFooter className="shrink-0">
+        <DialogFooter className="bg-background relative z-10 shrink-0 pt-2">
           {result ? (
             <>
               <Button variant="outline" onClick={start} disabled={running}>

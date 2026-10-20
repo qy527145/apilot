@@ -287,6 +287,7 @@ fn attempt_and_output(
         minimum_numbers: minimum,
         accepted,
         text_preview: preview,
+        text: outcome.text.clone(),
         numbers,
     };
     let output = Output {
@@ -313,6 +314,7 @@ fn fallback_attempt(index: usize, challenge: &Challenge, error: String) -> Attem
         minimum_numbers: minimum,
         accepted: false,
         text_preview: String::new(),
+        text: String::new(),
         numbers: Vec::new(),
     }
 }
@@ -382,6 +384,112 @@ fn answered_event(
     event.error = attempt.error.clone();
     event.preview = Some(attempt.text_preview.clone());
     event
+}
+
+/// 单独重试一次检测里的某条挑战，保留其余两条结果并重新计算排名。
+///
+/// 用于某条请求失败/数字不足，或者用户就是想再确认一次。重试结果覆盖原检测
+/// 记录；原始回答（`AttemptResult.text`）也一起存进去，历史详情可以回看。
+#[tauri::command]
+pub async fn retry_fingerprint_attempt(
+    shell: State<'_, Arc<AppShell>>,
+    detection_id: i64,
+    attempt_index: usize,
+) -> AppResult<FingerprintDetection> {
+    let shell = shell.inner().clone();
+    let row = store::get_detection(&shell.db, detection_id)
+        .await?
+        .ok_or_else(|| AppError::msg("找不到该检测记录"))?;
+    let provider_id = row
+        .provider_id
+        .ok_or_else(|| AppError::msg("这条检测记录没有关联渠道，无法重试"))?;
+    let provider = provider_store::get(&shell.db, provider_id)
+        .await?
+        .ok_or_else(|| AppError::ProviderNotFound(provider_id.to_string()))?;
+
+    let mut result: FingerprintDetection = serde_json::from_str(&row.result_json)
+        .map_err(|_| AppError::msg("该检测记录的结果已损坏"))?;
+    result.id = row.id;
+    let attempt = result
+        .attempts
+        .get(attempt_index)
+        .cloned()
+        .ok_or_else(|| AppError::msg("回答索引越界"))?;
+    let library = shell
+        .fingerprint
+        .active()
+        .map_err(|error| AppError::msg(error.to_string()))?;
+    let challenge = match library
+        .challenges
+        .iter()
+        .find(|challenge| challenge.challenge_id == attempt.challenge_id)
+    {
+        Some(challenge) => challenge.clone(),
+        None if !attempt.challenge_prompt.is_empty() => Challenge {
+            condition: String::new(),
+            system: String::new(),
+            user_prefix: String::new(),
+            transport: String::new(),
+            challenge_id: attempt.challenge_id.clone(),
+            expected_count: attempt.expected_count,
+            prompt: attempt.challenge_prompt.clone(),
+        },
+        None => {
+            return Err(AppError::msg(
+                "找不到这条挑战的提示词，无法重试",
+            ))
+        }
+    };
+
+    let started = Instant::now();
+    let outcome = send_challenge(&shell, &provider, &result.upstream_model, &challenge).await;
+    let (new_attempt, _) = attempt_and_output(attempt_index, &challenge, &outcome);
+    result.attempts[attempt_index] = new_attempt;
+
+    let outputs: Vec<Output> = result
+        .attempts
+        .iter()
+        .map(|attempt| Output {
+            // 新记录存了原文；老记录没有，就用解析后的数字重建一份，
+            // 足够让分析器复算特征。
+            text: if attempt.text.is_empty() {
+                attempt
+                    .numbers
+                    .iter()
+                    .map(|number| number.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                attempt.text.clone()
+            },
+            expected_count: attempt.expected_count,
+        })
+        .collect();
+
+    let analysis =
+        analyze_shared_outputs(&outputs, &library.metadata, &library.artifact, true)
+            .map_err(AppError::msg)?;
+    let official = build_official(&analysis, &result.declared_model, &result.upstream_model);
+    let local = if analysis.decision == "not_model" {
+        None
+    } else {
+        build_local(&shell, &library, &result.attempts).await?
+    };
+    result.conclusion = build_conclusion(official.as_ref(), local.as_ref(), &library);
+    result.official = official;
+    result.local = local;
+    result.status = analysis.decision;
+    result.elapsed_ms += started.elapsed().as_millis() as i64;
+    result.library = LibraryInfoLite {
+        source: library.source,
+        built_at: library.built_at.clone(),
+        model_count: library.metadata.models.len(),
+        sha256: library.sha256.clone(),
+    };
+
+    let result_json = serde_json::to_string(&result)?;
+    store::update_detection_result(&shell.db, detection_id, &result.status, &result_json).await?;
+    Ok(result)
 }
 
 fn build_official(analysis: &Analysis, declared: &str, upstream: &str) -> Option<OfficialResult> {

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Loader2 } from "lucide-react";
+import { CheckCircle2, Loader2, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -45,12 +45,18 @@ function levelVariant(level: string) {
  * 检测对话框与历史记录详情共用这个组件；「加入样本库」按检测 id 回查
  * 后端落库的原始回答，所以历史记录里的按钮同样可用。
  */
-export function FingerprintResultView({ result }: { result: FingerprintDetection }) {
+export function FingerprintResultView({ result: initial }: { result: FingerprintDetection }) {
   const qc = useQueryClient();
+  /** 单条挑战重试后要原地更新结果，所以这里保留一份可变状态。 */
+  const [result, setResult] = useState(initial);
   const [label, setLabel] = useState(result.declared_model);
   const [selected, setSelected] = useState<number[]>([]);
   const [note, setNote] = useState("");
   const [added, setAdded] = useState<number | null>(null);
+
+  useEffect(() => {
+    setResult(initial);
+  }, [initial.id]);
 
   useEffect(() => {
     setLabel(result.declared_model);
@@ -62,6 +68,16 @@ export function FingerprintResultView({ result }: { result: FingerprintDetection
     setNote("");
     setAdded(null);
   }, [result.id, result.declared_model]);
+
+  const retry = useMutation({
+    mutationFn: (index: number) => api.retryFingerprintAttempt(result.id, index),
+    onSuccess: (updated) => {
+      setResult(updated);
+      qc.invalidateQueries({ queryKey: qk.fingerprintDetections });
+      qc.invalidateQueries({ queryKey: qk.fingerprintDetection(updated.id) });
+      toast.success("已重试该挑战并更新检测结果");
+    },
+  });
 
   const add = useMutation({
     mutationFn: () =>
@@ -330,6 +346,22 @@ export function FingerprintResultView({ result }: { result: FingerprintDetection
                     {attempt.error}
                   </span>
                 )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="ml-auto h-6 px-2 text-[11px]"
+                  disabled={retry.isPending}
+                  onClick={() => retry.mutate(attempt.index)}
+                >
+                  {retry.isPending && retry.variables === attempt.index ? (
+                    <Loader2 className="size-3 animate-spin" />
+                  ) : (
+                    <RefreshCw className="size-3" />
+                  )}
+                  {retry.isPending && retry.variables === attempt.index
+                    ? "重试中…"
+                    : "重试这条"}
+                </Button>
               </div>
               <details className="mt-1">
                 <summary className="text-muted-foreground cursor-pointer text-[11px]">
@@ -348,6 +380,16 @@ export function FingerprintResultView({ result }: { result: FingerprintDetection
                     <p className="text-muted-foreground whitespace-pre-wrap">
                       回包预览：{attempt.text_preview}
                     </p>
+                  )}
+                  {attempt.text && (
+                    <details>
+                      <summary className="text-muted-foreground cursor-pointer">
+                        查看原始回答
+                      </summary>
+                      <p className="mt-1 break-all whitespace-pre-wrap">
+                        {attempt.text}
+                      </p>
+                    </details>
                   )}
                   {attempt.numbers && attempt.numbers.length > 0 && (
                     <details>
