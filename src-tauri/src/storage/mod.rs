@@ -3,6 +3,7 @@
 pub mod aggregates;
 pub mod capabilities;
 pub mod db;
+pub mod fingerprint;
 pub mod logs;
 pub mod migrations;
 pub mod model_policies;

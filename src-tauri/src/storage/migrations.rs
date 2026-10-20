@@ -497,6 +497,57 @@ ALTER TABLE captures ADD COLUMN payload_bytes INTEGER NOT NULL DEFAULT 0;
     r#"
 ALTER TABLE providers ADD COLUMN metadata_source TEXT NOT NULL DEFAULT 'auto';
 "#,
+    // --- v17: 指纹检测记录与本地样本库 ---
+    //
+    // 本地样本是用户显式确认过的权威模型标注，独立于官方冻结检测器：
+    // 官方概率保持原样，本地样本只在同一套 429 维特征上做 kNN 证据层。
+    //
+    // `detection_id` 记录样本来自哪次检测，便于回溯和去重；不建外键是因为
+    // 删除检测记录不应该连带删掉用户已经收进样本库的数据。
+    //
+    // `UNIQUE(label, challenge_id, text_hash)` 防止同一回答被重复计数；
+    // 同一段数字在不同 challenge 或不同 label 下仍可保留（用户可能是在纠正标注）。
+    r#"
+CREATE TABLE IF NOT EXISTS fingerprint_detections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_id INTEGER,
+  provider_tag TEXT NOT NULL DEFAULT '',
+  declared_model TEXT NOT NULL,
+  upstream_model TEXT NOT NULL,
+  wire TEXT NOT NULL,
+  library_source TEXT NOT NULL,
+  library_built_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_detections_model
+  ON fingerprint_detections(provider_id, declared_model);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_detections_created
+  ON fingerprint_detections(created_at);
+
+CREATE TABLE IF NOT EXISTS fingerprint_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  detection_id INTEGER,
+  label TEXT NOT NULL,
+  challenge_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  expected_count INTEGER NOT NULL,
+  numbers TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  provider_id INTEGER,
+  provider_tag TEXT NOT NULL DEFAULT '',
+  declared_model TEXT NOT NULL DEFAULT '',
+  upstream_model TEXT NOT NULL DEFAULT '',
+  note TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(label, challenge_id, text_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_samples_label
+  ON fingerprint_samples(label);
+CREATE INDEX IF NOT EXISTS idx_fingerprint_samples_created
+  ON fingerprint_samples(created_at);
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -508,7 +559,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 16);
+        assert_eq!(SCHEMA_VERSION, 17);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 

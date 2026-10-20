@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CloudDownload,
+  Fingerprint,
   FlaskConical,
   ListChecks,
   Loader2,
@@ -12,6 +13,7 @@ import {
 import { toast } from "sonner";
 
 import { CatalogCapabilitiesDialog } from "@/components/providers/CatalogCapabilitiesDialog";
+import { FingerprintDialog } from "@/components/providers/FingerprintDialog";
 import { ModelPickerDialog } from "@/components/providers/ModelPickerDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -82,6 +84,8 @@ export function ProviderModelsPanel({
   const [probing, setProbing] = useState<ProbeState>({});
   /** 每个模型最近一次连通测试的结果。 */
   const [tests, setTests] = useState<Record<string, OneshotOutcome | "loading">>({});
+  /** 正在做指纹检测的模型；非空即打开检测对话框。 */
+  const [fingerprintModel, setFingerprintModel] = useState<string | null>(null);
 
   useEffect(() => {
     if (data) {
@@ -323,6 +327,22 @@ export function ProviderModelsPanel({
                     onTest={() => runTest(declared)}
                   />
                 )}
+                {declared && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => setFingerprintModel(declared)}
+                      >
+                        <Fingerprint className="size-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-xs text-xs">
+                      检测实际调用的模型：串行发送 3 次真实请求，会消耗额度
+                    </TooltipContent>
+                  </Tooltip>
+                )}
                 <Button
                   variant="ghost"
                   size="icon"
@@ -380,6 +400,16 @@ export function ProviderModelsPanel({
         onOpenChange={setCapsOpen}
         providerId={providerId}
         providerName={providerName}
+      />
+
+      <FingerprintDialog
+        open={fingerprintModel !== null}
+        onOpenChange={(open) => {
+          if (!open) setFingerprintModel(null);
+        }}
+        providerId={providerId}
+        providerName={providerName}
+        model={fingerprintModel ?? ""}
       />
     </div>
   );

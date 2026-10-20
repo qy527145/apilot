@@ -4,6 +4,7 @@ import {
   BarChart3,
   Boxes,
   Database,
+  Fingerprint,
   GitBranch,
   LayoutDashboard,
   MonitorSmartphone,
@@ -16,6 +17,7 @@ export type ViewKey =
   | "clients"
   | "providers"
   | "models"
+  | "samples"
   | "routing"
   | "traffic"
   | "billing"
@@ -53,6 +55,12 @@ export const NAV_ITEMS: NavItem[] = [
     label: "模型",
     icon: Boxes,
     description: "各渠道声明的模型与协议可达性",
+  },
+  {
+    key: "samples",
+    label: "指纹样本",
+    icon: Fingerprint,
+    description: "远端参考库与本地模型样本",
   },
   {
     key: "routing",

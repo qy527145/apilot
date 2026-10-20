@@ -1224,6 +1224,191 @@ async function call<T>(
 /* 命令封装（名称与后端清单完全一致）                                 */
 /* ================================================================== */
 
+/* ================================================================== */
+/* 指纹检测与两级样本库                                                */
+/* ================================================================== */
+
+export type FingerprintLibrarySource = "embedded" | "remote";
+
+export interface FingerprintModelInfo {
+  id: string;
+  display_name: string;
+  family: string;
+  family_name: string;
+  response_count: number;
+  valid_number_count: number;
+  sources: Record<string, number>;
+  conditions: Record<string, number>;
+}
+
+export interface FingerprintLibraryInfo {
+  source: FingerprintLibrarySource;
+  built_at: string;
+  model_count: number;
+  sha256: string;
+  source_url?: string | null;
+  source_commit?: string | null;
+  models: FingerprintModelInfo[];
+  challenges: number;
+  error?: string | null;
+}
+
+export interface FingerprintDiagnostic {
+  index: number;
+  parsed_numbers: number;
+  minimum_numbers: number;
+  accepted: boolean;
+  raw_out_of_range_count: number;
+}
+
+export interface FingerprintSequence {
+  autocorrelation: number;
+  small_step_share: number;
+  model_like: boolean;
+}
+
+export interface FingerprintCandidate {
+  model: string;
+  display_name: string;
+  family: string;
+  family_name: string;
+  score: number;
+  probability?: number | null;
+}
+
+export interface FingerprintDeclaredRank {
+  model: string;
+  rank: number;
+  score: number;
+  probability?: number | null;
+  matched_as: string;
+}
+
+export interface FingerprintEvidence {
+  insufficient: boolean;
+  label: string;
+  reason: string;
+  threshold?: number | null;
+  method: string;
+}
+
+export interface FingerprintOfficialResult {
+  decision: string;
+  used_outputs: number;
+  calibrated: boolean;
+  probability_status: string;
+  diagnostics: FingerprintDiagnostic[];
+  sequence?: FingerprintSequence | null;
+  candidates: FingerprintCandidate[];
+  declared?: FingerprintDeclaredRank | null;
+  evidence: FingerprintEvidence;
+}
+
+export interface FingerprintAttempt {
+  index: number;
+  challenge_id: string;
+  expected_count: number;
+  ok: boolean;
+  status?: number | null;
+  latency_ms: number;
+  wire: string;
+  url: string;
+  error?: string | null;
+  parsed_numbers: number;
+  minimum_numbers: number;
+  accepted: boolean;
+  text_preview: string;
+  /** 解析后的整数；前端不展示，加入样本库由后端按检测 id 回查。 */
+  numbers?: number[];
+}
+
+export interface FingerprintLocalCandidate {
+  label: string;
+  samples: number;
+  distance_ratio: number;
+  score: number;
+  probability?: number | null;
+  official: boolean;
+}
+
+export interface FingerprintLocalResult {
+  candidates: FingerprintLocalCandidate[];
+  calibrated: boolean;
+  eligible_labels: number;
+  total_labels: number;
+}
+
+export interface FingerprintConclusion {
+  model?: string | null;
+  display_name?: string | null;
+  basis: string;
+  level: string;
+  note: string;
+}
+
+export interface FingerprintDetection {
+  /** 落库后的检测记录 id；加入本地样本库时用。 */
+  id: number;
+  declared_model: string;
+  upstream_model: string;
+  wire: string;
+  status: string;
+  library: {
+    source: FingerprintLibrarySource;
+    built_at: string;
+    model_count: number;
+    sha256: string;
+  };
+  attempts: FingerprintAttempt[];
+  official?: FingerprintOfficialResult | null;
+  local?: FingerprintLocalResult | null;
+  conclusion: FingerprintConclusion;
+  elapsed_ms: number;
+}
+
+export interface FingerprintLocalLabel {
+  label: string;
+  samples: number;
+  last_added_at: number;
+  official: boolean;
+}
+
+export interface FingerprintLocalSample {
+  id: number;
+  label: string;
+  challenge_id: string;
+  expected_count: number;
+  numbers_count: number;
+  provider_tag: string;
+  declared_model: string;
+  created_at: number;
+  note?: string | null;
+}
+
+export const FINGERPRINT_BASIS_LABEL: Record<string, string> = {
+  official: "官方参考库",
+  agreement: "官方与本地一致",
+  conflict: "存在分歧",
+  local_only: "仅本地样本",
+  insufficient: "证据不足",
+};
+
+export const FINGERPRINT_LEVEL_LABEL: Record<string, string> = {
+  high: "高",
+  medium: "中",
+  low: "低",
+};
+
+export const FINGERPRINT_STATUS_LABEL: Record<string, string> = {
+  ok: "完成",
+  partial: "部分有效",
+  unscorable: "无法评分",
+  not_model: "不像语言模型回答",
+};
+
+export const FINGERPRINT_REMOTE_BASE =
+  "https://raw.githubusercontent.com/Ikaleio/lm-detector/main/data";
+
 export const api = {
   /* ---- app / settings ---- */
   appInfo: () => call<AppInfo>("app_info"),
@@ -1302,6 +1487,47 @@ export const api = {
   /** 单次模型测试：往这个渠道真发一条最短的对话请求。 */
   testModel: (providerId: number, model: string) =>
     call<OneshotOutcome>("test_model", { providerId, model }),
+
+  /* ---- 指纹检测与两级样本库 ---- */
+  /**
+   * 检测这个渠道背后的实际模型：串行发 3 条挑战，返回官方排名、本地样本
+   * 证据和一致性结论。**会消耗 3 次真实请求的额度**。
+   */
+  detectModelFingerprint: (providerId: number, model: string) =>
+    call<FingerprintDetection>("detect_model_fingerprint", { providerId, model }),
+  fingerprintLibraryInfo: () =>
+    call<FingerprintLibraryInfo>("fingerprint_library_info"),
+  /** 从 GitHub（或镜像）拉检测器和指纹库；base_url 省略用默认地址。 */
+  updateFingerprintLibrary: (baseUrl?: string | null) =>
+    call<FingerprintLibraryInfo>("update_fingerprint_library", {
+      baseUrl: baseUrl ?? null,
+    }),
+  /** 停用远端库，回到内置快照。 */
+  resetFingerprintLibrary: () =>
+    call<FingerprintLibraryInfo>("reset_fingerprint_library"),
+  listFingerprintLabels: () =>
+    call<FingerprintLocalLabel[]>("list_fingerprint_labels"),
+  listFingerprintSamples: (label?: string | null) =>
+    call<FingerprintLocalSample[]>("list_fingerprint_samples", {
+      label: label ?? null,
+    }),
+  /** 把一次检测里的有效回答加入本地样本库；数字由后端从落库结果里取。 */
+  addFingerprintSamples: (
+    detectionId: number,
+    label: string,
+    sampleIndexes: number[],
+    note?: string | null,
+  ) =>
+    call<number>("add_fingerprint_samples", {
+      detectionId,
+      label,
+      sampleIndexes,
+      note: note ?? null,
+    }),
+  deleteFingerprintSample: (id: number) =>
+    call<null>("delete_fingerprint_sample", { id }),
+  deleteFingerprintLabel: (label: string) =>
+    call<number>("delete_fingerprint_label", { label }),
 
   /* ---- routing: rules ---- */
   listRouteRules: () => call<RouteRule[]>("list_route_rules"),

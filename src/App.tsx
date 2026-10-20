@@ -24,6 +24,7 @@ import OverviewPage from "@/pages/OverviewPage";
 import ClientsPage from "@/pages/ClientsPage";
 import ProvidersPage from "@/pages/ProvidersPage";
 import ModelsPage from "@/pages/ModelsPage";
+import SamplesPage from "@/pages/SamplesPage";
 import RoutingPage from "@/pages/RoutingPage";
 import TrafficPage from "@/pages/TrafficPage";
 import BillingPage from "@/pages/BillingPage";
@@ -105,6 +106,7 @@ function Shell() {
         {view === "clients" && <ClientsPage onNavigate={selectView} />}
         {view === "providers" && <ProvidersPage />}
         {view === "models" && <ModelsPage onNavigate={selectView} />}
+        {view === "samples" && <SamplesPage />}
         {view === "routing" && <RoutingPage />}
         {view === "traffic" && <TrafficPage />}
         {view === "billing" && <BillingPage />}

@@ -1,0 +1,13 @@
+{
+  "model_like": {
+    "autocorrelation": -0.5769825819095752,
+    "small_step_share": 0,
+    "model_like": true
+  },
+  "programmatic": {
+    "autocorrelation": 0.02007011317487528,
+    "small_step_share": 0.13377926421404682,
+    "model_like": false
+  },
+  "programmatic_decision": "not_model"
+}

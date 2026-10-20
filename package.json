@@ -10,6 +10,8 @@
     "build:mac": "bun scripts/build.mjs mac",
     "build:linux": "bun scripts/build.mjs linux",
     "build:web": "tsc && vite build",
+    "fingerprint:vendor": "bun scripts/vendor-fingerprint.mjs",
+    "fingerprint:fixtures": "bun scripts/generate-fingerprint-fixtures.mjs",
     "upgrade": "bun scripts/upgrade.mjs",
     "preview": "vite preview",
     "tauri": "tauri"

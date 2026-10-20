@@ -7,6 +7,7 @@ mod codex;
 mod commands;
 mod config;
 mod error;
+mod fingerprint;
 mod gateway;
 mod probe;
 mod protocol;
@@ -94,6 +95,16 @@ pub fn run() {
             commands::catalog::list_capabilities,
             commands::catalog::probe_capability,
             commands::catalog::test_model,
+            // --- 指纹检测与样本库 ---
+            commands::fingerprint::detect_model_fingerprint,
+            commands::fingerprint::fingerprint_library_info,
+            commands::fingerprint::update_fingerprint_library,
+            commands::fingerprint::reset_fingerprint_library,
+            commands::fingerprint::list_fingerprint_labels,
+            commands::fingerprint::list_fingerprint_samples,
+            commands::fingerprint::add_fingerprint_samples,
+            commands::fingerprint::delete_fingerprint_sample,
+            commands::fingerprint::delete_fingerprint_label,
             // --- 模型（模型视角：这个模型在哪些渠道上有、优先走哪个） ---
             commands::models::get_model_policy,
             commands::models::list_model_catalog,

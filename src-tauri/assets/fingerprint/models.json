@@ -1,0 +1,1569 @@
+{
+  "schema": "apilot-fingerprint-models-v1",
+  "built_at": "2026-10-17T09:36:07.798950+00:00",
+  "source_commit": "70410db4522387c7d4a6dff8c7a4b6ce0f0239f1",
+  "models": [
+    {
+      "id": "claude-haiku-4.5",
+      "display_name": "claude-haiku-4.5",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10642,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-03": 3,
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-08": 3,
+        "environment-07": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "claude-sonnet-4.6",
+      "display_name": "claude-sonnet-4.6",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10755,
+      "sources": {
+        "oaipro": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-06": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3,
+        "environment-09": 3
+      }
+    },
+    {
+      "id": "claude-sonnet-5",
+      "display_name": "claude-sonnet-5",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10688,
+      "sources": {
+        "oaipro": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-06": 3,
+        "environment-05": 3,
+        "environment-04": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-07": 3,
+        "environment-12": 3,
+        "environment-10": 3,
+        "environment-11": 3
+      }
+    },
+    {
+      "id": "claude-opus-4.6",
+      "display_name": "claude-opus-4.6",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10588,
+      "sources": {
+        "oaipro": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-10": 3,
+        "environment-09": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "claude-opus-4.7",
+      "display_name": "claude-opus-4.7",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10441,
+      "sources": {
+        "oaipro": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "claude-opus-4.8",
+      "display_name": "claude-opus-4.8",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10880,
+      "sources": {
+        "oaipro": 36
+      },
+      "conditions": {
+        "environment-02": 3,
+        "environment-01": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-06": 3,
+        "environment-05": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "claude-opus-5",
+      "display_name": "claude-opus-5",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 61,
+      "valid_number_count": 18814,
+      "sources": {
+        "oaipro": 36,
+        "mono": 25
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 5,
+        "environment-06": 3,
+        "environment-05": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3,
+        "environment-07:no-prefix-v3": 1,
+        "environment-07:minimal-en-v3": 1,
+        "environment-08:no-prefix-v3": 2,
+        "environment-09:no-prefix-v3": 3,
+        "environment-10:no-prefix-v3": 3,
+        "environment-11:no-prefix-v3": 2,
+        "environment-12:no-prefix-v3": 2,
+        "environment-12:minimal-en-v3": 1,
+        "holdout-clean": 8
+      }
+    },
+    {
+      "id": "claude-fable-5.1",
+      "display_name": "claude-fable-5.1",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 49,
+      "valid_number_count": 14867,
+      "sources": {
+        "mono": 49
+      },
+      "conditions": {
+        "environment-01": 4,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 2,
+        "environment-06": 2,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3,
+        "environment-05:minimal-en-v3": 1,
+        "environment-06:minimal-en-v3": 1,
+        "environment-01:neutral-prefix-v2": 1,
+        "holdout-clean": 11
+      }
+    },
+    {
+      "id": "claude-fable-5",
+      "display_name": "claude-fable-5",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 38,
+      "valid_number_count": 11340,
+      "sources": {
+        "mono": 38
+      },
+      "conditions": {
+        "environment-01": 5,
+        "environment-02": 3,
+        "environment-03": 2,
+        "environment-04": 1,
+        "environment-05": 3,
+        "environment-06": 2,
+        "environment-07": 1,
+        "environment-08": 2,
+        "environment-09": 2,
+        "environment-10": 3,
+        "environment-11": 2,
+        "environment-12": 2,
+        "environment-04:format-priority-v5": 1,
+        "environment-04:minimal-en-v3": 1,
+        "environment-06:minimal-en-v3": 1,
+        "environment-07:neutral-workflow-v3": 1,
+        "environment-07:minimal-en-v3": 1,
+        "environment-08:minimal-en-v3": 1,
+        "environment-09:neutral-workflow-v3": 1,
+        "environment-11:neutral-workflow-v3": 1,
+        "environment-12:format-priority-v5": 1,
+        "environment-03:neutral-prefix-v2": 1
+      }
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "display_name": "gemini-2.5-pro",
+      "family": "gemini",
+      "family_name": "Gemini",
+      "response_count": 36,
+      "valid_number_count": 10461,
+      "sources": {
+        "mono": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "display_name": "gemini-3.1-pro-preview",
+      "family": "gemini",
+      "family_name": "Gemini",
+      "response_count": 36,
+      "valid_number_count": 10584,
+      "sources": {
+        "mono": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "display_name": "gemini-3.5-flash",
+      "family": "gemini",
+      "family_name": "Gemini",
+      "response_count": 36,
+      "valid_number_count": 10584,
+      "sources": {
+        "mono": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "display_name": "gemini-3.6-flash",
+      "family": "gemini",
+      "family_name": "Gemini",
+      "response_count": 36,
+      "valid_number_count": 10584,
+      "sources": {
+        "mono": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "display_name": "gemini-3.7-flash",
+      "family": "gemini",
+      "family_name": "Gemini",
+      "response_count": 36,
+      "valid_number_count": 10794,
+      "sources": {
+        "mono": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "display_name": "gemini-3.8-flash",
+      "family": "gemini",
+      "family_name": "Gemini",
+      "response_count": 36,
+      "valid_number_count": 10674,
+      "sources": {
+        "mono": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "grok-4.5",
+      "display_name": "grok-4.5",
+      "family": "grok",
+      "family_name": "Grok",
+      "response_count": 36,
+      "valid_number_count": 14348,
+      "sources": {
+        "mono": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "grok-4.6",
+      "display_name": "grok-4.6",
+      "family": "grok",
+      "family_name": "Grok",
+      "response_count": 36,
+      "valid_number_count": 10584,
+      "sources": {
+        "mono": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gpt-4o",
+      "display_name": "gpt-4o",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 36,
+      "valid_number_count": 10306,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "glm-5.2",
+      "display_name": "glm-5.2",
+      "family": "glm",
+      "family_name": "GLM",
+      "response_count": 36,
+      "valid_number_count": 24371,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "glm-5.3",
+      "display_name": "glm-5.3",
+      "family": "glm",
+      "family_name": "GLM",
+      "response_count": 36,
+      "valid_number_count": 16263,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "qwen3.8-max-0902",
+      "display_name": "qwen3.8-max-0902",
+      "family": "qwen",
+      "family_name": "Qwen",
+      "response_count": 36,
+      "valid_number_count": 13647,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "qwen3.8-27b",
+      "display_name": "qwen3.8-27b",
+      "family": "qwen",
+      "family_name": "Qwen",
+      "response_count": 36,
+      "valid_number_count": 9478,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "kimi-k3",
+      "display_name": "kimi-k3",
+      "family": "kimi",
+      "family_name": "Kimi",
+      "response_count": 36,
+      "valid_number_count": 22423,
+      "sources": {
+        "openrouter/moonshotai": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "hy4-preview",
+      "display_name": "hy4-preview",
+      "family": "hunyuan",
+      "family_name": "Hunyuan",
+      "response_count": 36,
+      "valid_number_count": 12141,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "muse-spark-1.2",
+      "display_name": "muse-spark-1.2",
+      "family": "muse",
+      "family_name": "Muse",
+      "response_count": 36,
+      "valid_number_count": 10586,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "muse-spark-1.3",
+      "display_name": "muse-spark-1.3",
+      "family": "muse",
+      "family_name": "Muse",
+      "response_count": 36,
+      "valid_number_count": 10585,
+      "sources": {
+        "openrouter/unknown": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "kimi-k2.8-preview",
+      "display_name": "kimi-k2.8-preview",
+      "family": "kimi",
+      "family_name": "Kimi",
+      "response_count": 36,
+      "valid_number_count": 10559,
+      "sources": {
+        "kimi-code-subscription": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "grok-4.7",
+      "display_name": "grok-4.7",
+      "family": "grok",
+      "family_name": "Grok",
+      "response_count": 36,
+      "valid_number_count": 10583,
+      "sources": {
+        "openrouter/xai": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3,
+        "environment-08": 3
+      }
+    },
+    {
+      "id": "mimo-v2.5",
+      "display_name": "mimo-v2.5",
+      "family": "mimo",
+      "family_name": "MiMo",
+      "response_count": 36,
+      "valid_number_count": 15786,
+      "sources": {
+        "openrouter/xiaomi/fp8": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3,
+        "environment-06": 3
+      }
+    },
+    {
+      "id": "mimo-v2.5-pro",
+      "display_name": "mimo-v2.5-pro",
+      "family": "mimo",
+      "family_name": "MiMo",
+      "response_count": 36,
+      "valid_number_count": 11889,
+      "sources": {
+        "openrouter/xiaomi/fp8": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "mimo-v2.6-flash",
+      "display_name": "mimo-v2.6-flash",
+      "family": "mimo",
+      "family_name": "MiMo",
+      "response_count": 36,
+      "valid_number_count": 17566,
+      "sources": {
+        "openrouter/xiaomi/fp8": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-12": 3,
+        "environment-06": 3,
+        "environment-11": 3
+      }
+    },
+    {
+      "id": "mimo-v2.6-pro",
+      "display_name": "mimo-v2.6-pro",
+      "family": "mimo",
+      "family_name": "MiMo",
+      "response_count": 36,
+      "valid_number_count": 25744,
+      "sources": {
+        "openrouter/xiaomi/fp8": 36
+      },
+      "conditions": {
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3,
+        "environment-04": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-05": 3,
+        "environment-08": 3
+      }
+    },
+    {
+      "id": "step-5-preview",
+      "display_name": "step-5-preview",
+      "family": "step",
+      "family_name": "Step",
+      "response_count": 36,
+      "valid_number_count": 10588,
+      "sources": {
+        "stepfun-api": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "claude-opus-5.5",
+      "display_name": "claude-opus-5.5",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10752,
+      "sources": {
+        "openrouter/anthropic": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gpt-6-luna",
+      "display_name": "gpt-6-luna",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 36,
+      "valid_number_count": 10612,
+      "sources": {
+        "openrouter/openai": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "glm-5.3-flashx",
+      "display_name": "glm-5.3-flashx",
+      "family": "glm",
+      "family_name": "GLM",
+      "response_count": 36,
+      "valid_number_count": 10645,
+      "sources": {
+        "openrouter/z-ai/fp8": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "glm-5.3-flash",
+      "display_name": "glm-5.3-flash",
+      "family": "glm",
+      "family_name": "GLM",
+      "response_count": 36,
+      "valid_number_count": 10588,
+      "sources": {
+        "openrouter/z-ai/fp8": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "display_name": "deepseek-v4.1-flash",
+      "family": "deepseek",
+      "family_name": "DeepSeek",
+      "response_count": 36,
+      "valid_number_count": 10584,
+      "sources": {
+        "openrouter/deepseek": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "display_name": "deepseek-v4-flash",
+      "family": "deepseek",
+      "family_name": "DeepSeek",
+      "response_count": 36,
+      "valid_number_count": 12322,
+      "sources": {
+        "openrouter/novita": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "deepseek-v4-pro-0813",
+      "display_name": "deepseek-v4-pro-0813",
+      "family": "deepseek",
+      "family_name": "DeepSeek",
+      "response_count": 36,
+      "valid_number_count": 10584,
+      "sources": {
+        "openrouter/deepseek": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "display_name": "deepseek-v4-pro",
+      "family": "deepseek",
+      "family_name": "DeepSeek",
+      "response_count": 36,
+      "valid_number_count": 10584,
+      "sources": {
+        "openrouter/novita": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "deepseek-v4-flash-0731",
+      "display_name": "deepseek-v4-flash-0731",
+      "family": "deepseek",
+      "family_name": "DeepSeek",
+      "response_count": 36,
+      "valid_number_count": 10635,
+      "sources": {
+        "openrouter/novita": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 2,
+        "environment-04-e5841a80a1942": 1,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 2,
+        "environment-08-e14ca3c7c619a": 1,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "deepseek-v3.2",
+      "display_name": "deepseek-v3.2",
+      "family": "deepseek",
+      "family_name": "DeepSeek",
+      "response_count": 36,
+      "valid_number_count": 12735,
+      "sources": {
+        "openrouter/novita": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gpt-6-sol",
+      "display_name": "gpt-6-sol",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 36,
+      "valid_number_count": 11213,
+      "sources": {
+        "openai/direct": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "claude-sonnet-5.5",
+      "display_name": "claude-sonnet-5.5",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10597,
+      "sources": {
+        "openrouter/anthropic": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gpt-6-astra",
+      "display_name": "gpt-6-astra/6.1-sol",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 72,
+      "valid_number_count": 21210,
+      "sources": {
+        "openrouter/openai": 36,
+        "openai/direct": 36
+      },
+      "conditions": {
+        "environment-01": 6,
+        "environment-02": 6,
+        "environment-03": 6,
+        "environment-04": 6,
+        "environment-05": 6,
+        "environment-06": 6,
+        "environment-07": 6,
+        "environment-08": 6,
+        "environment-09": 6,
+        "environment-10": 6,
+        "environment-11": 6,
+        "environment-12": 6
+      }
+    },
+    {
+      "id": "gpt-5.4",
+      "display_name": "gpt-5.4",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 36,
+      "valid_number_count": 10739,
+      "sources": {
+        "openai/direct": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gpt-5.5",
+      "display_name": "gpt-5.5",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 36,
+      "valid_number_count": 10563,
+      "sources": {
+        "openai/direct": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "display_name": "gpt-5.6-sol",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 36,
+      "valid_number_count": 10589,
+      "sources": {
+        "openai/direct": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "display_name": "gpt-5.6-terra",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 36,
+      "valid_number_count": 10716,
+      "sources": {
+        "openai/direct": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "display_name": "gpt-5.6-luna",
+      "family": "gpt",
+      "family_name": "GPT",
+      "response_count": 36,
+      "valid_number_count": 12076,
+      "sources": {
+        "openai/direct": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "seed-2.0-mini",
+      "display_name": "seed-2.0-mini",
+      "family": "seed",
+      "family_name": "Seed",
+      "response_count": 36,
+      "valid_number_count": 12254,
+      "sources": {
+        "openrouter/seed/fp8": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "seed-2.0-lite",
+      "display_name": "seed-2.0-lite",
+      "family": "seed",
+      "family_name": "Seed",
+      "response_count": 36,
+      "valid_number_count": 12991,
+      "sources": {
+        "openrouter/seed/fp8": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "qwen3.8-omni-flash",
+      "display_name": "qwen3.8-omni-flash",
+      "family": "qwen",
+      "family_name": "Qwen",
+      "response_count": 36,
+      "valid_number_count": 11484,
+      "sources": {
+        "openrouter/alibaba": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11-ee072668192fc": 1,
+        "environment-11-e2e4d1376b709": 1,
+        "environment-11-e9d57620ce9c5": 1,
+        "environment-12-ea1cbd16f65a8": 1,
+        "environment-12-e501a7a541449": 1,
+        "environment-12-e49a8f325e848": 1
+      }
+    },
+    {
+      "id": "seed-2.1-turbo",
+      "display_name": "seed-2.1-turbo",
+      "family": "seed",
+      "family_name": "Seed",
+      "response_count": 36,
+      "valid_number_count": 12035,
+      "sources": {
+        "openrouter/seed/fp8": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 2,
+        "environment-05-e0747b3604149": 1,
+        "environment-06": 2,
+        "environment-06-e35edc0222e64": 1,
+        "environment-07": 3,
+        "environment-08-e45550d8d0e48": 1,
+        "environment-08": 2,
+        "environment-09": 1,
+        "environment-09-eb49c8be13cfa": 1,
+        "environment-09-ea8e45f8459cb": 1,
+        "environment-10-e609663afdab0": 1,
+        "environment-10-e015ae0649e14": 1,
+        "environment-10-ed73a10b8835d": 1,
+        "environment-11-ee072668192fc": 1,
+        "environment-11-e2e4d1376b709": 1,
+        "environment-11-e9d57620ce9c5": 1,
+        "environment-12-ea1cbd16f65a8": 1,
+        "environment-12-e501a7a541449": 1,
+        "environment-12-e49a8f325e848": 1
+      }
+    },
+    {
+      "id": "qwen3.8-flash",
+      "display_name": "qwen3.8-flash",
+      "family": "qwen",
+      "family_name": "Qwen",
+      "response_count": 36,
+      "valid_number_count": 10478,
+      "sources": {
+        "openrouter/alibaba": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 1,
+        "environment-03-e3240046370ab": 1,
+        "environment-03-e89bbb5f57ad6": 1,
+        "environment-04-eb6baa7fe2147": 1,
+        "environment-04-eced610ebc4d7": 1,
+        "environment-04-eee7e4580873f": 1,
+        "environment-05-e607d80362ab5": 1,
+        "environment-05-ef8fba3769699": 1,
+        "environment-05-eef111dd90677": 1,
+        "environment-06-e885ad94c905f": 1,
+        "environment-06-e475216f76295": 1,
+        "environment-06-e35edc0222e64": 1,
+        "environment-07-e14c8412fd2ee": 1,
+        "environment-07-e90b7aa446641": 1,
+        "environment-07-ea51709c3a381": 1,
+        "environment-08-e45550d8d0e48": 1,
+        "environment-08-e0c0c6f55ecdd": 1,
+        "environment-08-e220b9cfb3cd9": 1,
+        "environment-09-ec6d3f7411ef3": 1,
+        "environment-09-eb49c8be13cfa": 1,
+        "environment-09-ea8e45f8459cb": 1,
+        "environment-10-e609663afdab0": 1,
+        "environment-10-e015ae0649e14": 1,
+        "environment-10-ed73a10b8835d": 1,
+        "environment-11-ee072668192fc": 1,
+        "environment-11-e2e4d1376b709": 1,
+        "environment-11-e9d57620ce9c5": 1,
+        "environment-12-ea1cbd16f65a8": 1,
+        "environment-12-e501a7a541449": 1,
+        "environment-12-e49a8f325e848": 1
+      }
+    },
+    {
+      "id": "claude-haiku-5.5",
+      "display_name": "claude-haiku-5.5",
+      "family": "claude",
+      "family_name": "Claude",
+      "response_count": 36,
+      "valid_number_count": 10313,
+      "sources": {
+        "openrouter/anthropic": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "muse-wonder",
+      "display_name": "muse-wonder",
+      "family": "muse",
+      "family_name": "Muse",
+      "response_count": 36,
+      "valid_number_count": 10573,
+      "sources": {
+        "openrouter/meta": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "gemini-4-argon",
+      "display_name": "gemini-4-argon",
+      "family": "gemini",
+      "family_name": "Gemini",
+      "response_count": 36,
+      "valid_number_count": 11373,
+      "sources": {
+        "openrouter/google-ai-studio": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    },
+    {
+      "id": "deepseek-v4.1-flash-1017",
+      "display_name": "deepseek-v4.1-flash-1017",
+      "family": "deepseek",
+      "family_name": "DeepSeek",
+      "response_count": 36,
+      "valid_number_count": 10584,
+      "sources": {
+        "openrouter/deepseek": 36
+      },
+      "conditions": {
+        "environment-01": 3,
+        "environment-02": 3,
+        "environment-03": 3,
+        "environment-04": 3,
+        "environment-05": 3,
+        "environment-06": 3,
+        "environment-07": 3,
+        "environment-08": 3,
+        "environment-09": 3,
+        "environment-10": 3,
+        "environment-11": 3,
+        "environment-12": 3
+      }
+    }
+  ]
+}

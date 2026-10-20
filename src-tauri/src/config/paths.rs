@@ -53,6 +53,18 @@ pub fn live_first_write_backup_dir() -> PathBuf {
     backups_dir().join("live-first-write")
 }
 
+/// 指纹参考库根目录：`~/.apilot/fingerprint`。
+///
+/// 内置快照在二进制里；这里只放用户主动更新的远端版本。
+pub fn fingerprint_dir() -> PathBuf {
+    apilot_home().join("fingerprint")
+}
+
+/// 远端指纹参考库：`~/.apilot/fingerprint/remote`。
+pub fn fingerprint_remote_dir() -> PathBuf {
+    fingerprint_dir().join("remote")
+}
+
 // ---------------------------------------------------------------------------
 // 客户端配置文件路径
 // ---------------------------------------------------------------------------

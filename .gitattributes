@@ -11,4 +11,5 @@
 *.png binary
 *.ico binary
 *.icns binary
+*.zst binary
 *.svg text eol=lf

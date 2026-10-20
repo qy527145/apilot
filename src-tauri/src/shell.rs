@@ -50,6 +50,9 @@ pub struct AppShell {
     /// 对话级模型固定。每请求都要查，所以常驻内存，改库后 `reload_session_pins`。
     pub session_pins: Arc<crate::routing::session_pin::SessionPins>,
 
+    /// 指纹参考库。启动时加载内置/远端快照；远端更新后原子热切换。
+    pub fingerprint: Arc<crate::fingerprint::FingerprintEngine>,
+
     /// 最近一次测速的延迟（provider_tag → 毫秒）。
     ///
     /// 只活在内存里：它是易变的遥测数据，重启后重新测即可，落库反而会让人
@@ -131,6 +134,7 @@ impl AppShell {
             events: Arc::new(EventBus::new(app)),
             gateway: Arc::new(crate::gateway::server::GatewayServer::new()),
             session_pins: Arc::new(session_pins),
+            fingerprint: Arc::new(crate::fingerprint::FingerprintEngine::load()),
             probe_latency: Arc::new(dashmap::DashMap::new()),
             catalog_cache: Arc::new(dashmap::DashMap::new()),
             started_at: now_ms(),
