@@ -121,6 +121,7 @@ pub fn run() {
             commands::models::probe_model_candidates,
             // --- 路由 ---
             commands::routing::list_route_rules,
+            commands::routing::simulate_route,
             commands::routing::upsert_route_rule,
             commands::routing::delete_route_rule,
             commands::routing::reorder_route_rules,

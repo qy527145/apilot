@@ -29,6 +29,38 @@ pub(super) async fn build_candidates(
     model: &str,
     protocol_in: Protocol,
 ) -> Vec<Arc<dyn Outbound>> {
+    build_candidates_explained(shell, primary, model, protocol_in, crate::util::rand_unit())
+        .await
+        .0
+}
+
+/// 候选顺序是凭哪条依据排出来的。规则测试把它给用户看。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CandidateBasis {
+    /// 模型配了渠道策略（路由页「模型的渠道选择」）。
+    ModelPolicy {
+        strategy: crate::storage::models::ModelStrategy,
+        /// 手动切换到的渠道盖过了策略。
+        pinned: bool,
+    },
+    /// 配了策略，但声明了这个模型的渠道一个都用不了，落回 selector。
+    ModelPolicyFallback,
+    /// 没配策略，有渠道声明了这个模型，selector 选的不在其中 —— 它退到末位兜底。
+    DeclaredChannels,
+    /// selector 选的就是主渠道（通吃渠道 / 它本身就声明了这个模型）。
+    Selector,
+}
+
+/// [`build_candidates`] 的本体，外加排序依据。`roll` 是加权策略用的 [0,1) 随机数，
+/// 与 `model_select::order` 一样从外面传，不在这里偷偷取随机数。
+pub(crate) async fn build_candidates_explained(
+    shell: &Arc<AppShell>,
+    primary: &Arc<dyn Outbound>,
+    model: &str,
+    protocol_in: Protocol,
+    roll: f64,
+) -> (Vec<Arc<dyn Outbound>>, CandidateBasis) {
     let channels = crate::storage::providers::candidate_channels(&shell.db, model)
         .await
         .unwrap_or_default();
@@ -38,7 +70,7 @@ pub(super) async fn build_candidates(
         .ok()
         .flatten();
 
-    let mut out = match policy {
+    let (mut out, basis) = match policy {
         Some(ref p) => {
             // 延迟策略要有测速结果；没测过的候选在 order() 里会被排到最后。
             let ranked: Vec<crate::routing::model_select::Candidate> = channels
@@ -51,8 +83,11 @@ pub(super) async fn build_candidates(
                 })
                 .collect();
 
-            let ordered =
-                crate::routing::model_select::order(Some(p), ranked, crate::util::rand_unit());
+            let pinned = p
+                .active_provider
+                .as_deref()
+                .is_some_and(|a| ranked.iter().any(|c| c.tag == a));
+            let ordered = crate::routing::model_select::order(Some(p), ranked, roll);
 
             let mut cs: Vec<Arc<dyn Outbound>> = Vec::new();
             for tag in ordered {
@@ -64,9 +99,9 @@ pub(super) async fn build_candidates(
             // 模型页配的渠道一个都用不了（全被停用/删了）时不要就此失败，
             // 落回 selector 选出的那个，让请求还有救。
             if cs.is_empty() {
-                vec![primary.clone()]
+                (vec![primary.clone()], CandidateBasis::ModelPolicyFallback)
             } else {
-                cs
+                (cs, CandidateBasis::ModelPolicy { strategy: p.strategy, pinned })
             }
         }
         None => {
@@ -93,13 +128,13 @@ pub(super) async fn build_candidates(
                 }
                 if cs.is_empty() {
                     // 渠道全挂或全停用，才落回 selector。
-                    vec![primary.clone()]
+                    (vec![primary.clone()], CandidateBasis::Selector)
                 } else {
                     // 追加 selector primary 作兜底：模型候选全部失败时还有退路。
                     if let Some(o) = shell.registry.get(primary.tag()) {
                         cs.push(o);
                     }
-                    cs
+                    (cs, CandidateBasis::DeclaredChannels)
                 }
             } else {
                 // channels 为空（通吃渠道）或 primary 本身就在 channels 里：原逻辑。
@@ -111,13 +146,13 @@ pub(super) async fn build_candidates(
                         }
                     }
                 }
-                cs
+                (cs, CandidateBasis::Selector)
             }
         }
     };
 
     prefer_native_protocol(&mut out, primary, protocol_in);
-    out
+    (out, basis)
 }
 
 /// 管线侧的 [`model_policy::ModelEnv`]。

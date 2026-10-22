@@ -18,6 +18,7 @@
 //! - [`cache`] —— 缓存命中时的重放
 //! - [`body_patch`] —— 直通路上对原始 JSON 的最小改写
 //! - [`reply`] —— 回给客户端的响应与错误报文
+//! - [`simulate`] —— 规则测试：同一套判定空跑一遍，不出站
 
 mod body_patch;
 mod buffered;
@@ -27,6 +28,7 @@ mod finalize;
 mod outbound;
 mod recorder;
 mod reply;
+pub mod simulate;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,15 +64,47 @@ const MAX_TOKEN_LABEL_CHARS: usize = 32;
 /// **每个请求都必带**的东西（接管时按客户端写进它的配置，见 `takeover::floor::client_token`），
 /// 不依赖 UA 的写法，也不要求客户端支持自定义请求头。它只是标签，不是鉴权。
 pub fn detect_client(headers: &HeaderMap, path: &str) -> String {
+    detect_client_with_source(headers, path).0
+}
+
+/// [`detect_client`] 外加「凭哪一条认出来的」。规则测试要把依据给用户看 ——
+/// 结果不符合预期时，用户得知道是令牌没生效还是 UA 抢了先。
+pub fn detect_client_with_source(headers: &HeaderMap, path: &str) -> (String, ClientSource) {
     if let Some(label) = token_label(headers) {
-        return label;
+        return (label, ClientSource::Token);
     }
 
     if let Some(v) = headers.get("x-apilot-client").and_then(|v| v.to_str().ok()) {
         if !v.is_empty() {
-            return v.to_string();
+            return (v.to_string(), ClientSource::Header);
         }
     }
+
+    if let Some(name) = client_from_ua(headers) {
+        return (name.into(), ClientSource::UserAgent);
+    }
+
+    // 兜底：按协议路径推断，至少让统计能区分流量来源。
+    let name = match Protocol::from_path(path) {
+        Some(Protocol::AnthropicMessages) => "claude-code",
+        Some(Protocol::OpenAiResponses) => "codex",
+        _ => return ("unknown".into(), ClientSource::Unknown),
+    };
+    (name.into(), ClientSource::Path)
+}
+
+/// 客户端名的来源，按 [`detect_client`] 的优先级排列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientSource {
+    Token,
+    Header,
+    UserAgent,
+    Path,
+    Unknown,
+}
+
+fn client_from_ua(headers: &HeaderMap) -> Option<&'static str> {
 
     let ua = headers
         .get(http::header::USER_AGENT)
@@ -79,23 +113,15 @@ pub fn detect_client(headers: &HeaderMap, path: &str) -> String {
         .to_ascii_lowercase();
 
     if ua.contains("claude-cli") || ua.contains("claude-code") || ua.contains("anthropic") {
-        return "claude-code".into();
-    }
-    if ua.contains("codex") {
-        return "codex".into();
-    }
-    if ua.contains("gemini") {
-        return "gemini-cli".into();
-    }
-    if ua.contains("cursor") {
-        return "cursor".into();
-    }
-
-    // 兜底：按协议路径推断，至少让统计能区分流量来源。
-    match Protocol::from_path(path) {
-        Some(Protocol::AnthropicMessages) => "claude-code".into(),
-        Some(Protocol::OpenAiResponses) => "codex".into(),
-        _ => "unknown".into(),
+        Some("claude-code")
+    } else if ua.contains("codex") {
+        Some("codex")
+    } else if ua.contains("gemini") {
+        Some("gemini-cli")
+    } else if ua.contains("cursor") {
+        Some("cursor")
+    } else {
+        None
     }
 }
 
@@ -151,6 +177,39 @@ fn truncate_label(s: &str) -> String {
         Some((cut, _)) => format!("{}…", &s[..cut]),
         None => s.to_string(),
     }
+}
+
+/// 模型策略（全局 + 客户端覆盖）算出的生效模型。不含会话固定与规则链。
+///
+/// 两条请求入口与规则测试共用这一份：测试要的正是「线上会怎么算」，各写一遍
+/// 迟早会漂。
+pub(crate) async fn policy_model(
+    shell: &AppShell,
+    client: &str,
+    model: &str,
+    protocol: &str,
+) -> String {
+    // `settings()` 给的是 Arc，`ArcSwap` 没有守卫，跨下面那次 await 持有它是安全的；
+    // 而 policy 装着映射表与脚本文本，每请求深拷贝一次纯属浪费。
+    let settings = shell.settings();
+    let policy = &settings.model_policy;
+
+    let has_channels = if model_policy::needs_channel_check(policy, client) {
+        // 只有兜底模式需要这个判据，其余模式不白查一次库。
+        crate::storage::providers::channels_for_model(&shell.db, model)
+            .await
+            .map(|v| !v.is_empty())
+            .unwrap_or(true) // 查库失败时按"有渠道"处理：宁可不动，也不要把请求改道
+    } else {
+        true
+    };
+
+    let ctx = model_policy::RequestCtx {
+        client,
+        model,
+        protocol,
+    };
+    model_policy::effective_model(policy, &ctx, &ShellModelEnv { has_channels })
 }
 
 /// 处理一次网关请求。
@@ -234,32 +293,8 @@ pub async fn handle(
     //
     // `request_model` 在 Recorder 初始化时已经填成了原始值，这里只动 `req.model`，
     // 让它带着生效模型往下走。
-    // 这里**不再 clone 整份 policy**：`settings()` 给的是 Arc，`ArcSwap` 没有守卫，
-    // 跨下面那次 await 持有它是安全的；而 policy 现在装着映射表与脚本文本，
-    // 每请求深拷贝一次纯属浪费。
     let settings = shell.settings();
-    let policy = &settings.model_policy;
-
-    let has_channels = if model_policy::needs_channel_check(policy, &client) {
-        // 只有兜底模式需要这个判据，其余模式不白查一次库。
-        crate::storage::providers::channels_for_model(&shell.db, &req.model)
-            .await
-            .map(|v| !v.is_empty())
-            .unwrap_or(true) // 查库失败时按"有渠道"处理：宁可不动，也不要把请求改道
-    } else {
-        true
-    };
-
-    // 先算到临时变量再赋值：`RequestCtx` 借着 `req.model`，让它在该借用的
-    // 生命周期里干净结束，别把"借用中又改写"这件事交给 NLL 去赌。
-    let effective = {
-        let ctx = model_policy::RequestCtx {
-            client: &client,
-            model: &req.model,
-            protocol: protocol.as_str(),
-        };
-        model_policy::effective_model(policy, &ctx, &ShellModelEnv { has_channels })
-    };
+    let effective = policy_model(&shell, &client, &req.model, protocol.as_str()).await;
     // 会话固定排在策略之后：用户点名"这个对话用 X"，比"所有请求都走 Y"更具体。
     // 也必须在思考接管与缓存键之前 —— 键里含模型名。
     req.model = recorder.apply_session_pin(effective, true);
@@ -616,26 +651,9 @@ pub async fn handle_raw(
     //
     // 照样过策略。不过的话会变成「按 A 计数、按 B 对话」—— 两个数字对不上，
     // 而且上游可能根本没有 A。
-    let policy_settings = shell.settings();
-    let policy = &policy_settings.model_policy;
-    let has_channels = if model_policy::needs_channel_check(policy, &client) {
-        crate::storage::providers::channels_for_model(&shell.db, &requested_model)
-            .await
-            .map(|v| !v.is_empty())
-            .unwrap_or(true)
-    } else {
-        true
-    };
-    let effective = {
-        // 非对话请求没有"入站协议"，给策略看的是空串 —— 自定义规则里按协议分支的
-        // 写法在这里自然落到 else 上，而不是拿到一个假的协议名。
-        let ctx = model_policy::RequestCtx {
-            client: &client,
-            model: &requested_model,
-            protocol: "",
-        };
-        model_policy::effective_model(policy, &ctx, &ShellModelEnv { has_channels })
-    };
+    // 非对话请求没有"入站协议"，给策略看的是空串 —— 自定义规则里按协议分支的
+    // 写法在这里自然落到 else 上，而不是拿到一个假的协议名。
+    let effective = policy_model(&shell, &client, &requested_model, "").await;
     // count_tokens 也跟着会话固定走：按 A 计数、按 B 对话，客户端的上下文估算就错了。
     let effective = recorder.apply_session_pin(effective, false);
     recorder.record.model = effective.clone();
@@ -821,6 +839,20 @@ mod tests {
         assert_eq!(detect_client(&h, "/v1/messages"), "claude-code");
         let h = headers_with(&[("x-goog-api-key", "AIzaSySecret")]);
         assert_eq!(detect_client(&h, "/v1/chat/completions"), "unknown");
+    }
+
+    #[test]
+    fn detection_reports_which_signal_decided() {
+        let h = headers_with(&[("authorization", "Bearer apilot-codex")]);
+        assert_eq!(detect_client_with_source(&h, "/v1/messages").1, ClientSource::Token);
+        let h = headers_with(&[("user-agent", "codex_cli_rs/0.9")]);
+        assert_eq!(detect_client_with_source(&h, "/v1/messages").1, ClientSource::UserAgent);
+        let h = HeaderMap::new();
+        assert_eq!(detect_client_with_source(&h, "/v1/messages").1, ClientSource::Path);
+        assert_eq!(
+            detect_client_with_source(&h, "/v1/chat/completions"),
+            ("unknown".into(), ClientSource::Unknown)
+        );
     }
 
     #[test]

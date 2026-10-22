@@ -6,6 +6,7 @@ import { PageShell } from "@/components/layout/PageShell";
 import { ModelChannelPicker } from "@/components/models/ModelChannelPicker";
 import { RuleEditor } from "@/components/routing/RuleEditor";
 import { RuleList } from "@/components/routing/RuleList";
+import { RouteSimulator } from "@/components/routing/RouteSimulator";
 import { SelectorPanel } from "@/components/routing/SelectorPanel";
 import { qk } from "@/hooks/queries";
 import { api, type RouteRule } from "@/lib/api";
@@ -88,6 +89,8 @@ export default function RoutingPage() {
             setEditorOpen(true);
           }}
         />
+
+        <RouteSimulator />
       </div>
 
       <RuleEditor

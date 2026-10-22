@@ -141,14 +141,15 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 
 | 文件 | 内容 |
 |---|---|
-| `mod.rs` | 三条入口：`handle`（对话）、`handle_raw`（非对话原样转发）、`reject_body`（请求体没读全）；`detect_client` 识别调用方；`peek_model` 从原始 body 只取模型名 |
+| `mod.rs` | 三条入口：`handle`（对话）、`handle_raw`（非对话原样转发）、`reject_body`（请求体没读全）；`detect_client` 识别调用方（令牌 > `x-apilot-client` > UA > 路径）；`policy_model` 算模型策略（两条入口与规则测试共用）；`peek_model` 从原始 body 只取模型名 |
 | `recorder.rs` | **`Recorder`**：一次请求的记账收口（`finish` / `fail` / `tag_session` / `apply_session_pin`）；`Drop` 兜住客户端断连；`save_session_title` 落对话标题 |
-| `candidates.rs` | `build_candidates`：模型策略 > selector，组装主渠道 + 故障转移候选；`prefer_native_protocol` 把能直通的渠道提前（稳定排序） |
+| `candidates.rs` | `build_candidates`（`build_candidates_explained` 额外报出排序依据）：模型策略 > selector，组装主渠道 + 故障转移候选；`prefer_native_protocol` 把能直通的渠道提前（稳定排序） |
 | `outbound.rs` | `try_outbound`：单渠道完整出站（编码 / 直通 / 流式 / 非 2xx / 假 200）；`forward_raw`：非对话请求原样收发 |
 | `buffered.rs` | `finish_buffered`：非流式收尾（解码 → 计费 → 改写 → 缓存 → 编码）；也处理「客户端要流式、上游回完整响应」 |
 | `finalize.rs` | `StreamContext` + `finalize_stream`：流真正结束后的计费、缓存、捕获；`decode_sse_as_response` 兜住「上游无视 `stream:false`」 |
 | `cache.rs` | `serve_from_cache`：命中重放（流式 / 非流式），照样记账并发结束事件 |
 | `body_patch.rs` | 直通路上对原始 JSON 的最小改写：`patch_outbound_body`（model + 思考参数）、`strip_unportable_thinking`、`count_tool_uses` |
+| `simulate.rs` | 规则测试：按给定条件空跑选路（客户端 → 模型策略 → 对话固定 → 规则链 → selector → 候选 → 映射），只串联线上同一份判定，不发请求 |
 | `reply.rs` | 响应与错误报文：`build_response`、`fail_response` / `fail_raw_response`、`client_status_for`、`headers_to_json`（鉴权头隐去） |
 
 **两种"直通"别混**（`CLAUDE.md` 铁律 2 说的是前者）：

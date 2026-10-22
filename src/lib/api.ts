@@ -433,6 +433,70 @@ export interface ProbeResult {
   error?: string | null;
 }
 
+/* ------------------------------ 规则测试 ------------------------------ */
+
+/** 与后端 `gateway/pipeline/simulate.rs::SimulateInput` 对应。 */
+export interface SimulateInput {
+  protocol: Protocol;
+  model: string;
+  token?: string | null;
+  user_agent?: string | null;
+  headers?: [string, string][];
+  path?: string | null;
+  stream?: boolean;
+  est_input_tokens?: number;
+  session_id?: string | null;
+  has_tools?: boolean;
+}
+
+export type ClientSource = "token" | "header" | "user_agent" | "path" | "unknown";
+
+export type CandidateBasis =
+  | { kind: "model_policy"; strategy: ModelStrategy; pinned: boolean }
+  | { kind: "model_policy_fallback" }
+  | { kind: "declared_channels" }
+  | { kind: "selector" };
+
+export interface SimulateCandidate {
+  tag: string;
+  name: string;
+  upstream_model: string;
+  wire: Protocol;
+  passthrough: boolean;
+  url: string;
+}
+
+export type SimulateOutcome =
+  | { kind: "rejected"; reason: string; rule_id: number | null }
+  | { kind: "no_channel"; selector: string }
+  | {
+      kind: "routed";
+      selector: string;
+      rule_id: number | null;
+      model: string;
+      basis: CandidateBasis;
+      candidates: SimulateCandidate[];
+      notes: string[];
+    };
+
+export interface SimulateResult {
+  client: string;
+  client_source: ClientSource;
+  protocol: Protocol;
+  path: string;
+  model_steps: { stage: "request" | "policy" | "session_pin" | "rule"; model: string }[];
+  rules: {
+    id: number;
+    name: string;
+    enabled: boolean;
+    matched: boolean;
+    conditions: string;
+    action: string;
+    decisive: boolean;
+  }[];
+  outcome: SimulateOutcome;
+}
+
 /* ------------------------------ 计费 ------------------------------ */
 
 export interface PricingInput {
@@ -1594,6 +1658,8 @@ export const api = {
 
   /* ---- routing: rules ---- */
   listRouteRules: () => call<RouteRule[]>("list_route_rules"),
+  simulateRoute: (input: SimulateInput) =>
+    call<SimulateResult>("simulate_route", { input }),
   upsertRouteRule: (input: RouteRuleInput) =>
     call<RouteRule>("upsert_route_rule", { input }),
   deleteRouteRule: (id: number) => call<null>("delete_route_rule", { id }),

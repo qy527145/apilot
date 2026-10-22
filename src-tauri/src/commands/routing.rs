@@ -14,6 +14,15 @@ use crate::storage::routing::{SelectorInput, SelectorRecord};
 // 路由规则
 // ---------------------------------------------------------------------------
 
+/// 规则测试：按给定条件空跑一遍选路，不发请求、不落日志、不计费。
+#[tauri::command]
+pub async fn simulate_route(
+    shell: State<'_, Arc<AppShell>>,
+    input: crate::gateway::pipeline::simulate::SimulateInput,
+) -> AppResult<crate::gateway::pipeline::simulate::SimulateResult> {
+    Ok(crate::gateway::pipeline::simulate::simulate(&shell, input).await)
+}
+
 #[tauri::command]
 pub async fn list_route_rules(shell: State<'_, Arc<AppShell>>) -> AppResult<Vec<RouteRule>> {
     crate::storage::routing::list_rules(&shell.db).await

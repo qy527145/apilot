@@ -56,7 +56,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | 指纹 | `src-tauri/src/fingerprint/` | lm-detector 移植、两级参考库与本地 kNN 证据层 |
 | 接管 | `src-tauri/src/takeover/` | 客户端配置的保序补丁与原子写入 |
 | 存储 | `src-tauri/src/storage/` | SQLite 连接、迁移、各领域读写 |
-| 命令 | `src-tauri/src/commands/` | Tauri 命令层（62 个） |
+| 命令 | `src-tauri/src/commands/` | Tauri 命令层（89 个） |
 | 前端 | `src/` | 9 个页面 + shadcn/ui 组件 |
 
 ## 改什么去哪里
@@ -87,6 +87,7 @@ CI 打包在 [.github/workflows/build-installers.yml](.github/workflows/build-in
 | **加一个 Tauri 命令** | 在 `commands/<域>.rs` 写 → `lib.rs` 的 `generate_handler!` 用**完整路径**（不能 re-export）→ 前端 `src/lib/api.ts` |
 | **改缓存策略** | `cache/policy.rs::is_cacheable` + `cache/key.rs`（键必须覆盖所有影响输出的因素） |
 | **改「请求属于哪个客户端」** | `gateway/pipeline/mod.rs::detect_client`：**令牌 > `x-apilot-client` > UA > 路径**。接管时按客户端写 `apilot-<名字>`（`takeover/floor.rs::client_token`），其他令牌原样回显（截断），`sk-` / `AIza` 开头的真密钥**绝不回显**。旧版统一占位 `apilot-local` 由 `repoint_taken_over` 在网关启动时换掉 |
+| **改「规则测试」（空跑选路）** | `gateway/pipeline/simulate.rs`（命令 `commands/routing.rs::simulate_route`，前端 `src/components/routing/RouteSimulator.tsx`）。**只串联、不重写判据**：客户端识别、`policy_model`、会话固定、`Router::route_traced`、`build_candidates_explained` 都是线上同一份。改了线上选路的任何一步，确认它仍经过这些共用函数，否则测试结果会和线上悄悄分叉 |
 | **改「请求属于哪个对话」** | 识别在 `traffic/session.rs`（会话 ID 只取客户端给的，**不按对话历史猜** —— 压缩会改写历史；线的指纹**不含工具集合**）→ `gateway/pipeline/recorder.rs::Recorder::tag_session`（三条入口都要调，流式那条经 `StreamContext.session` 带到收尾）→ 聚合与压缩判定在 `storage/sessions.rs`（查询时现算）→ 前端 `SessionsView` |
 | **改监控详情的可视化** | `protocol/inspect.rs`（把捕获报文解成 IR，只解码不搬运）+ `src/components/traffic/InspectViews.tsx`（渲染 IR）。**不要新建视图模型** —— IR 已经协议无关且字段齐备 |
 | **改 SSE 处理** | `gateway/sse.rs`（原语）→ `gateway/stream.rs`（转发管线） |

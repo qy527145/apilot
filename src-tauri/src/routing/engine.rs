@@ -71,10 +71,25 @@ impl Router {
     /// `meta` 是 `&mut`，因为非终结动作会改写它（模型名、路由选项），
     /// 调用方在拿到结果后应当继续使用被改写过的 `meta`。
     pub fn route(&self, meta: &mut RouteMetadata) -> RouteOutcome {
+        self.route_traced(meta, |_, _| {})
+    }
+
+    /// 与 [`Router::route`] 同一套求值，外加逐条回报「这条规则命中没有」。
+    ///
+    /// 给规则测试用（见 `gateway::pipeline::simulate`）。不另写一份求值逻辑：
+    /// 两份一旦不同步，测试结果就成了另一套路由的结果，比没有测试更误导。
+    /// 回报只覆盖**真的被求值过**的规则 —— 终结动作之后的那些压根没看。
+    pub fn route_traced(
+        &self,
+        meta: &mut RouteMetadata,
+        mut on_rule: impl FnMut(&RouteRule, bool),
+    ) -> RouteOutcome {
         let rules = self.rules.load();
 
         for rule in rules.iter() {
-            if !rule.matches(meta) {
+            let hit = rule.matches(meta);
+            on_rule(rule, hit);
+            if !hit {
                 continue;
             }
 
@@ -155,6 +170,32 @@ mod tests {
                 matched_rule: None
             }
         );
+    }
+
+    #[test]
+    fn trace_reports_rules_up_to_the_decisive_one_and_no_further() {
+        let r = Router::new(
+            vec![
+                rule(1, vec![model_matches("gpt-*")], RouteAction::Final { selector: "a".into() }),
+                rule(
+                    2,
+                    vec![],
+                    RouteAction::ModelOverride {
+                        model: "claude-opus-5".into(),
+                    },
+                ),
+                rule(3, vec![model_matches("claude-opus-*")], RouteAction::Final { selector: "b".into() }),
+                rule(4, vec![], RouteAction::Final { selector: "never".into() }),
+            ],
+            "default",
+        );
+        let mut m = meta("claude-sonnet-5");
+        let mut seen = Vec::new();
+        let out = r.route_traced(&mut m, |rule, hit| seen.push((rule.id, hit)));
+
+        // 第 3 条看到的是第 2 条改写后的模型；第 4 条根本没被求值。
+        assert_eq!(seen, vec![(1, false), (2, true), (3, true)]);
+        assert_eq!(out, r.route(&mut meta("claude-sonnet-5")), "带不带回报，结果必须一样");
     }
 
     #[test]
