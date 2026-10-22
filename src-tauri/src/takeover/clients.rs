@@ -108,6 +108,17 @@ impl ClientId {
         }
     }
 
+    /// 读配置里当前写着的本地令牌。
+    ///
+    /// 只用于认出旧版接管留下的 [`floor::LOCAL_PLACEHOLDER_KEY`]（见 [`repoint_taken_over`]）。
+    pub fn current_token(&self) -> Option<String> {
+        match self {
+            Self::ClaudeCode => read_claude_env("ANTHROPIC_AUTH_TOKEN"),
+            Self::Codex => read_codex_provider_str("experimental_bearer_token"),
+            Self::GeminiCli => read_gemini_env("GEMINI_API_KEY"),
+        }
+    }
+
     /// 生成接管改动。
     ///
     /// `plan` 是接管时要写进它配置的东西（见 [`ClientPlan`]）。
@@ -213,8 +224,8 @@ pub fn describe_all(engine: &TakeoverEngine) -> Vec<ClientInfo> {
 /// 太脆。
 ///
 /// `settings` 用来取每个客户端各自要写的模型名（`AppSettings::client_model` 是按客户端
-/// 算的 —— 模型策略允许给单个客户端单独指定）。判据**只看地址**：策略变了而地址没变
-/// 时这里不动 —— 那是 [`reapply_taken_over`] 的活。
+/// 算的 —— 模型策略允许给单个客户端单独指定）。判据**只看地址**（外加旧版占位令牌，
+/// 见循环里的注释）：策略变了而地址没变时这里不动 —— 那是 [`reapply_taken_over`] 的活。
 pub fn repoint_taken_over(
     base_url: &str,
     settings: &crate::config::AppSettings,
@@ -232,7 +243,14 @@ pub fn repoint_taken_over(
         // 拿内容逐字节比会把用户自己加的东西（模型覆盖、密钥……）也算成"不一致"，
         // 然后被 `plan_apply` 顺手抹掉 —— 一次启动就悄悄回退掉用户的手改，
         // 比不改还糟。地址一样就什么都不做。
-        if id.current_base_url().as_deref() == Some(id.stored_base_url(base_url).as_str()) {
+        //
+        // 唯一的例外是旧版接管留下的 `apilot-local`：所有客户端同一个值，网关凭它
+        // 认不出是谁，顺带换成按客户端区分的令牌。只认这一个值 —— 用户自己改成的
+        // 别的令牌是有意为之（网关会原样回显它），不能当成"过期"覆盖掉。
+        let address_ok =
+            id.current_base_url().as_deref() == Some(id.stored_base_url(base_url).as_str());
+        let legacy_token = id.current_token().as_deref() == Some(floor::LOCAL_PLACEHOLDER_KEY);
+        if address_ok && !legacy_token {
             continue;
         }
 
@@ -365,10 +383,10 @@ fn plan_claude(base_url: &str) -> AppResult<Vec<FilePatch>> {
                 path: vec!["env".into(), "ANTHROPIC_BASE_URL".into()],
                 value: json!(base_url),
             },
-            // 占位密钥：真实上游密钥在渠道里配，客户端只需别去读环境变量。
+            // 本地令牌：真实上游密钥在渠道里配；按客户端区分是为了让网关认出是谁。
             JsonOp::Set {
                 path: vec!["env".into(), "ANTHROPIC_AUTH_TOKEN".into()],
-                value: json!(floor::LOCAL_PLACEHOLDER_KEY),
+                value: json!(floor::client_token(ClientId::ClaudeCode.as_str())),
             },
         ],
     )?;
@@ -380,12 +398,13 @@ fn plan_claude(base_url: &str) -> AppResult<Vec<FilePatch>> {
 }
 
 fn read_claude_base_url() -> Option<String> {
+    read_claude_env("ANTHROPIC_BASE_URL")
+}
+
+fn read_claude_env(key: &str) -> Option<String> {
     let raw = patch::read_optional(&paths::claude_settings_path()).ok()??;
     let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    v.get("env")?
-        .get("ANTHROPIC_BASE_URL")?
-        .as_str()
-        .map(String::from)
+    v.get("env")?.get(key)?.as_str().map(String::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +468,7 @@ fn codex_config(
             // 后面两半还要用这个名字，所以这里只克隆。
             table: table.clone(),
             key: "experimental_bearer_token".into(),
-            value: TomlValue::Str(floor::LOCAL_PLACEHOLDER_KEY.into()),
+            value: TomlValue::Str(floor::client_token(ClientId::Codex.as_str())),
         },
     ];
 
@@ -523,12 +542,16 @@ fn codex_config(
 }
 
 fn read_codex_base_url() -> Option<String> {
+    read_codex_provider_str("base_url")
+}
+
+fn read_codex_provider_str(key: &str) -> Option<String> {
     let raw = patch::read_optional(&paths::codex_config_path()).ok()??;
     let text = String::from_utf8(raw).ok()?;
     let doc: toml_edit::DocumentMut = text.parse().ok()?;
     doc.get("model_providers")?
         .get(floor::CODEX_PROVIDER_NAME)?
-        .get("base_url")?
+        .get(key)?
         .as_str()
         .map(String::from)
 }
@@ -550,7 +573,7 @@ fn plan_gemini(base_url: &str) -> AppResult<Vec<FilePatch>> {
             },
             DotenvOp::Set {
                 key: "GEMINI_API_KEY".into(),
-                value: floor::LOCAL_PLACEHOLDER_KEY.to_string(),
+                value: floor::client_token(ClientId::GeminiCli.as_str()),
             },
         ],
     )?;
@@ -562,11 +585,16 @@ fn plan_gemini(base_url: &str) -> AppResult<Vec<FilePatch>> {
 }
 
 fn read_gemini_base_url() -> Option<String> {
+    read_gemini_env("GOOGLE_GEMINI_BASE_URL")
+}
+
+fn read_gemini_env(key: &str) -> Option<String> {
     let raw = patch::read_optional(&paths::gemini_env_path()).ok()??;
     let text = String::from_utf8(raw).ok()?;
     text.lines().find_map(|l| {
-        let t = l.trim();
-        t.strip_prefix("GOOGLE_GEMINI_BASE_URL=")
+        l.trim()
+            .strip_prefix(key)?
+            .strip_prefix('=')
             .map(|v| v.trim().to_string())
     })
 }
@@ -602,7 +630,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
-        assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], floor::LOCAL_PLACEHOLDER_KEY);
+        assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "apilot-claude-code");
     }
 
     #[test]
@@ -682,7 +710,7 @@ base_url = "http://192.168.31.1:3000/v1"
         assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
         assert_eq!(
             provider["experimental_bearer_token"].as_str(),
-            Some(floor::LOCAL_PLACEHOLDER_KEY)
+            Some("apilot-codex")
         );
         // 开关关着时（这是默认）一个字都不碰模型设置。
         assert_eq!(doc["model"].as_str(), Some("gpt-6-sol"));
@@ -784,7 +812,7 @@ keep_me = true
         let patches = plan_gemini("http://127.0.0.1:8787").unwrap();
         let text = String::from_utf8(patches[0].content.clone().unwrap()).unwrap();
         assert!(text.contains("GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787"));
-        assert!(text.contains(&format!("GEMINI_API_KEY={}", floor::LOCAL_PLACEHOLDER_KEY)));
+        assert!(text.contains("GEMINI_API_KEY=apilot-gemini-cli"));
     }
 
     #[test]

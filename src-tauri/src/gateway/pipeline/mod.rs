@@ -52,7 +52,20 @@ use self::recorder::Recorder;
 use self::reply::{client_status_for, fail_raw_response, fail_response, headers_to_json};
 use super::router::{protocol_family, upstream_path};
 
+/// 令牌回显成客户端名时的长度上限（按字符）。客户端名要进日志列表和路由条件，
+/// 太长的串在界面上只会是一团噪音。
+const MAX_TOKEN_LABEL_CHARS: usize = 32;
+
+/// 判断请求来自哪个客户端。
+///
+/// 优先级：本地令牌 > `x-apilot-client` > UA > 协议路径。令牌排第一是因为它是客户端
+/// **每个请求都必带**的东西（接管时按客户端写进它的配置，见 `takeover::floor::client_token`），
+/// 不依赖 UA 的写法，也不要求客户端支持自定义请求头。它只是标签，不是鉴权。
 pub fn detect_client(headers: &HeaderMap, path: &str) -> String {
+    if let Some(label) = token_label(headers) {
+        return label;
+    }
+
     if let Some(v) = headers.get("x-apilot-client").and_then(|v| v.to_str().ok()) {
         if !v.is_empty() {
             return v.to_string();
@@ -83,6 +96,60 @@ pub fn detect_client(headers: &HeaderMap, path: &str) -> String {
         Some(Protocol::AnthropicMessages) => "claude-code".into(),
         Some(Protocol::OpenAiResponses) => "codex".into(),
         _ => "unknown".into(),
+    }
+}
+
+/// 从入站鉴权头里取出令牌，换成客户端名。
+///
+/// - `apilot-<名字>` → `<名字>`（接管写进去的就是这个形状）
+/// - 旧版统一占位 `apilot-local` → 不认，交给后面的 UA / 路径判断
+/// - 其他字符串 → 原样回显（截断）：用户手动接入别的工具时填个 `cursor` 就能区分
+/// - 像真密钥的（`sk-` / `AIza` 开头）→ 不认。客户端名会落库、上界面，回显真密钥
+///   等于绕过了「鉴权头落库前必须隐去」那条规矩
+fn token_label(headers: &HeaderMap) -> Option<String> {
+    let token = inbound_token(headers)?;
+    if token == crate::takeover::floor::LOCAL_PLACEHOLDER_KEY || looks_like_secret(token) {
+        return None;
+    }
+    let label = token
+        .strip_prefix(crate::takeover::floor::CLIENT_TOKEN_PREFIX)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(token);
+    Some(truncate_label(label))
+}
+
+/// 客户端可能把令牌放在的几个头。Anthropic SDK 的 api key 模式发 `x-api-key`，
+/// 走 `ANTHROPIC_AUTH_TOKEN` / OpenAI 系发 `Authorization: Bearer`，Gemini 发 `x-goog-api-key`。
+fn inbound_token(headers: &HeaderMap) -> Option<&str> {
+    let bearer = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let v = v.trim();
+            // 大小写不敏感地剥掉方案名；没带方案名的就当整串是令牌。
+            match v.split_once(' ') {
+                Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => rest.trim(),
+                _ => v,
+            }
+        });
+    bearer
+        .into_iter()
+        .chain(
+            ["x-api-key", "x-goog-api-key", "api-key"]
+                .iter()
+                .filter_map(|h| headers.get(*h)?.to_str().ok().map(str::trim)),
+        )
+        .find(|t| !t.is_empty())
+}
+
+fn looks_like_secret(token: &str) -> bool {
+    token.starts_with("sk-") || token.starts_with("AIza")
+}
+
+fn truncate_label(s: &str) -> String {
+    match s.char_indices().nth(MAX_TOKEN_LABEL_CHARS) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
     }
 }
 
@@ -700,6 +767,59 @@ mod tests {
         let h = HeaderMap::new();
         assert_eq!(detect_client(&h, "/v1/messages"), "claude-code");
         assert_eq!(detect_client(&h, "/v1/responses"), "codex");
+        assert_eq!(detect_client(&h, "/v1/chat/completions"), "unknown");
+    }
+
+    #[test]
+    fn local_token_names_the_client_and_beats_everything_else() {
+        let h = headers_with(&[
+            ("authorization", "Bearer apilot-codex"),
+            ("x-apilot-client", "cursor"),
+            ("user-agent", "claude-cli/2.1.0"),
+        ]);
+        assert_eq!(detect_client(&h, "/v1/messages"), "codex");
+
+        // Anthropic SDK 的 api key 模式、Gemini 的头也认。
+        let h = headers_with(&[("x-api-key", "apilot-claude-code")]);
+        assert_eq!(detect_client(&h, "/v1/chat/completions"), "claude-code");
+        let h = headers_with(&[("x-goog-api-key", "apilot-gemini-cli")]);
+        assert_eq!(detect_client(&h, "/v1/chat/completions"), "gemini-cli");
+    }
+
+    #[test]
+    fn arbitrary_token_is_echoed_instead_of_unknown() {
+        let h = headers_with(&[("authorization", "Bearer my-script")]);
+        assert_eq!(detect_client(&h, "/v1/chat/completions"), "my-script");
+
+        // 光一个前缀不算名字，整串回显。
+        let h = headers_with(&[("authorization", "Bearer apilot-")]);
+        assert_eq!(detect_client(&h, "/v1/chat/completions"), "apilot-");
+    }
+
+    #[test]
+    fn long_token_is_truncated_on_a_char_boundary() {
+        // 头值只能是可见 ASCII，多字节字符的截断直接测截断函数。
+        let label = truncate_label(&"客".repeat(40));
+        assert_eq!(label.chars().count(), MAX_TOKEN_LABEL_CHARS + 1);
+        assert!(label.ends_with('…'));
+
+        let h = headers_with(&[("authorization", &format!("Bearer {}", "a".repeat(100)))]);
+        assert_eq!(detect_client(&h, "/v1/chat/completions"), format!("{}…", "a".repeat(32)));
+    }
+
+    #[test]
+    fn legacy_placeholder_and_real_keys_fall_through_to_ua() {
+        // 旧版接管写的统一占位：认不出是谁，走 UA。
+        let h = headers_with(&[
+            ("authorization", "Bearer apilot-local"),
+            ("user-agent", "codex_cli_rs/0.9"),
+        ]);
+        assert_eq!(detect_client(&h, "/v1/responses"), "codex");
+
+        // 真密钥绝不能被回显成客户端名 —— 它会落库、上界面。
+        let h = headers_with(&[("x-api-key", "sk-ant-api03-secret")]);
+        assert_eq!(detect_client(&h, "/v1/messages"), "claude-code");
+        let h = headers_with(&[("x-goog-api-key", "AIzaSySecret")]);
         assert_eq!(detect_client(&h, "/v1/chat/completions"), "unknown");
     }
 
