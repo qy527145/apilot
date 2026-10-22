@@ -108,14 +108,20 @@ impl ClientId {
         }
     }
 
-    /// 读配置里当前写着的本地令牌。
+    /// 配置里的令牌是不是旧版接管留下的形状，需要在网关启动时换掉（见 [`repoint_taken_over`]）。
     ///
-    /// 只用于认出旧版接管留下的 [`floor::LOCAL_PLACEHOLDER_KEY`]（见 [`repoint_taken_over`]）。
-    pub fn current_token(&self) -> Option<String> {
+    /// - 三个客户端：统一占位 [`floor::LOCAL_PLACEHOLDER_KEY`] —— 网关凭它认不出是谁
+    /// - Claude Code 另有一种：令牌写在 `env.ANTHROPIC_AUTH_TOKEN` 而不是 `apiKeyHelper`。
+    ///   只认 `apilot-` 开头的（那是我们写的）；用户自己填的真令牌不当成过期
+    pub fn has_legacy_token(&self) -> bool {
         match self {
-            Self::ClaudeCode => read_claude_env("ANTHROPIC_AUTH_TOKEN"),
-            Self::Codex => read_codex_provider_str("experimental_bearer_token"),
-            Self::GeminiCli => read_gemini_env("GEMINI_API_KEY"),
+            Self::ClaudeCode => read_claude_env("ANTHROPIC_AUTH_TOKEN")
+                .is_some_and(|t| t.starts_with(floor::CLIENT_TOKEN_PREFIX)),
+            Self::Codex => read_codex_provider_str("experimental_bearer_token").as_deref()
+                == Some(floor::LOCAL_PLACEHOLDER_KEY),
+            Self::GeminiCli => {
+                read_gemini_env("GEMINI_API_KEY").as_deref() == Some(floor::LOCAL_PLACEHOLDER_KEY)
+            }
         }
     }
 
@@ -244,13 +250,12 @@ pub fn repoint_taken_over(
         // 然后被 `plan_apply` 顺手抹掉 —— 一次启动就悄悄回退掉用户的手改，
         // 比不改还糟。地址一样就什么都不做。
         //
-        // 唯一的例外是旧版接管留下的 `apilot-local`：所有客户端同一个值，网关凭它
-        // 认不出是谁，顺带换成按客户端区分的令牌。只认这一个值 —— 用户自己改成的
-        // 别的令牌是有意为之（网关会原样回显它），不能当成"过期"覆盖掉。
+        // 唯一的例外是旧版接管留下的令牌（判据见 `has_legacy_token`）：顺带换成现在的
+        // 写法。只认我们写过的那几种形状 —— 用户自己改成的别的令牌是有意为之
+        // （网关会原样回显它），不能当成"过期"覆盖掉。
         let address_ok =
             id.current_base_url().as_deref() == Some(id.stored_base_url(base_url).as_str());
-        let legacy_token = id.current_token().as_deref() == Some(floor::LOCAL_PLACEHOLDER_KEY);
-        if address_ok && !legacy_token {
+        if address_ok && !id.has_legacy_token() {
             continue;
         }
 
@@ -362,8 +367,17 @@ fn plan_claude(base_url: &str) -> AppResult<Vec<FilePatch>> {
     // 文件不存在时从空对象开始 —— 这是"新建"而非"解析失败"，可以安全创建。
     let original = patch::read_optional(&path)?.unwrap_or_else(|| b"{}".to_vec());
 
-    let content = patch::patch_json(
-        &original,
+    Ok(vec![FilePatch {
+        path,
+        content: Some(claude_settings(&original, base_url)?),
+    }])
+}
+
+/// [`plan_claude`] 的纯内核：原文件字节 → 改写后的字节。拆出来是为了测试能给
+/// 固定输入，而不是读本机的 `~/.claude/settings.json`。
+fn claude_settings(original: &[u8], base_url: &str) -> AppResult<Vec<u8>> {
+    patch::patch_json(
+        original,
         &[
             // 先清掉会让客户端绕过网关的键，再写入我们的值。
             JsonOp::Remove {
@@ -379,22 +393,30 @@ fn plan_claude(base_url: &str) -> AppResult<Vec<FilePatch>> {
             JsonOp::Remove {
                 path: vec!["apiKey".into()],
             },
+            // 令牌改由 `apiKeyHelper` 给，这个键必须清掉：Claude Code 的鉴权优先级里
+            // 它排在 apiKeyHelper **前面**，留着的话 helper 根本不会被调用。
+            JsonOp::Remove {
+                path: vec!["env".into(), "ANTHROPIC_AUTH_TOKEN".into()],
+            },
             JsonOp::Set {
                 path: vec!["env".into(), "ANTHROPIC_BASE_URL".into()],
                 value: json!(base_url),
             },
             // 本地令牌：真实上游密钥在渠道里配；按客户端区分是为了让网关认出是谁。
+            // 走 apiKeyHelper 而不是 `ANTHROPIC_AUTH_TOKEN`：后者是「Authorization 头的
+            // 自定义值」，语义上是给 OAuth 式网关用的；helper 的输出才是 Claude Code 当作
+            // API Key 的那份（同时发 `x-api-key` 与 `Authorization: Bearer`，网关两处都认）。
+            // `echo` 在 sh 与 cmd 下都可用，令牌只含 `[a-z-]`，不需要引号。
             JsonOp::Set {
-                path: vec!["env".into(), "ANTHROPIC_AUTH_TOKEN".into()],
-                value: json!(floor::client_token(ClientId::ClaudeCode.as_str())),
+                path: vec!["apiKeyHelper".into()],
+                value: json!(claude_key_helper()),
             },
         ],
-    )?;
+    )
+}
 
-    Ok(vec![FilePatch {
-        path,
-        content: Some(content),
-    }])
+fn claude_key_helper() -> String {
+    format!("echo {}", floor::client_token(ClientId::ClaudeCode.as_str()))
 }
 
 fn read_claude_base_url() -> Option<String> {
@@ -630,7 +652,31 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(v["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
-        assert_eq!(v["env"]["ANTHROPIC_AUTH_TOKEN"], "apilot-claude-code");
+        assert_eq!(v["apiKeyHelper"], "echo apilot-claude-code");
+    }
+
+    #[test]
+    fn claude_plan_drops_auth_token_so_the_key_helper_takes_effect() {
+        // 上一版接管写的是 env 里的 ANTHROPIC_AUTH_TOKEN。它在 Claude Code 的鉴权
+        // 优先级里压过 apiKeyHelper，不清掉的话新写的 helper 形同虚设。
+        let original = br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"apilot-claude-code","KEEP":"y"}}"#;
+        let v: serde_json::Value =
+            serde_json::from_slice(&claude_settings(original, "http://x").unwrap()).unwrap();
+        assert!(v["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+        assert_eq!(v["env"]["KEEP"], "y");
+        assert_eq!(v["apiKeyHelper"], "echo apilot-claude-code");
+    }
+
+    #[test]
+    fn claude_key_helper_output_is_the_client_token() {
+        // helper 是一条 shell 命令，网关收到的是它的输出 —— 那必须正好是令牌本身。
+        let helper = claude_key_helper();
+        let token = helper.strip_prefix("echo ").unwrap();
+        assert_eq!(token, floor::client_token("claude-code"));
+        assert!(
+            token.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+            "令牌里出现 shell 特殊字符就得加引号，而 sh 与 cmd 的引号规则不一样"
+        );
     }
 
     #[test]

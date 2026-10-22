@@ -145,7 +145,8 @@ fn token_label(headers: &HeaderMap) -> Option<String> {
 }
 
 /// 客户端可能把令牌放在的几个头。Anthropic SDK 的 api key 模式发 `x-api-key`，
-/// 走 `ANTHROPIC_AUTH_TOKEN` / OpenAI 系发 `Authorization: Bearer`，Gemini 发 `x-goog-api-key`。
+/// Claude Code 的 `apiKeyHelper` 两个头都发，OpenAI 系发 `Authorization: Bearer`，
+/// Gemini 发 `x-goog-api-key`。
 fn inbound_token(headers: &HeaderMap) -> Option<&str> {
     let bearer = headers
         .get(http::header::AUTHORIZATION)
