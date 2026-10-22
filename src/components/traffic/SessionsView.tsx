@@ -59,8 +59,11 @@ interface Props {
   live: LiveRequest[];
   /** 打开正在进行的流式请求的实时视图。 */
   onOpenLive: (requestId: string) => void;
-  /** 打开某一条请求的详情（复用监控页的详情弹窗）。 */
-  onOpenRequest: (requestId: string) => void;
+  /**
+   * 打开某一条请求的详情（复用监控页的详情弹窗）。`order` 是时间线此刻在屏幕上的
+   * 顺序（只含已落库的），详情弹窗按它翻上一条 / 下一条。
+   */
+  onOpenRequest: (requestId: string, order: string[]) => void;
   /** 切回请求列表，只看这个对话。 */
   onFilterRequests: (sessionId: string) => void;
 }
@@ -344,7 +347,7 @@ function Timeline({
   sessionId: string;
   live: LiveRequest[];
   onOpenLive: (id: string) => void;
-  onOpenRequest: (id: string) => void;
+  onOpenRequest: (id: string, order: string[]) => void;
   onFilterRequests: (sessionId: string) => void;
 }) {
   const [thread, setThread] = useState<string | "all">("all");
@@ -402,6 +405,8 @@ function Timeline({
   // 只反转**展示**用的这一份：上面 `prevModelOf` 的"上一条"必须按时间正序算，
   // 「压缩横幅」也要跟在自己那条请求身上，倒着渲染不该改变它们的含义。
   const shown = newestFirst ? [...rows].reverse() : rows;
+  // 进行中的那几条走实时视图，不进详情弹窗的翻页序列。
+  const entryOrder = shown.flatMap((row) => (row.kind === "entry" ? [row.e.request_id] : []));
 
   return (
     <Card className="py-0">
@@ -490,7 +495,7 @@ function Timeline({
                 prevModel={prevModelOf.get(row.e.request_id) ?? null}
                 label={row.e.thread_key ? labels.get(row.e.thread_key) ?? "" : "计数"}
                 kind={row.e.thread_key ? kindOf.get(row.e.thread_key) ?? null : null}
-                onClick={() => onOpenRequest(row.e.request_id)}
+                onClick={() => onOpenRequest(row.e.request_id, entryOrder)}
               />
             ),
           )}

@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, GitCompareArrows, Loader2, Trash2 } from "lucide-react";
+import {
+  ArrowRight,
+  ChevronLeft,
+  ChevronRight,
+  GitCompareArrows,
+  Loader2,
+  Trash2,
+} from "lucide-react";
 
 import { CopyButton } from "@/components/common/CopyButton";
 import { JsonViewer, tryParseJson } from "@/components/common/JsonViewer";
@@ -51,6 +58,13 @@ interface Props {
    * 二次确认不该散落在每个入口里。
    */
   onDelete?: (requestId: string) => void;
+  /**
+   * 打开它的那份列表的顺序（请求表或对话时间线，按屏幕上的上下顺序）。
+   * 给了就显示「上一条 / 下一条」—— 逐条翻报文是排查时最常见的动作，
+   * 每次关掉弹窗再点下一行太绕。
+   */
+  order?: string[];
+  onNavigate?: (requestId: string) => void;
 }
 
 /** 三种查看方式。表达的是"我在核对报文"还是"我在看语义"，与具体是哪一段无关。 */
@@ -128,7 +142,13 @@ function formattedOf(d: RequestDetail, side: "client" | "upstream"): string | nu
 }
 
 
-export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props) {
+export function RequestDetailDialog({
+  requestId,
+  onOpenChange,
+  onDelete,
+  order,
+  onNavigate,
+}: Props) {
   const [view, setView] = useState<ViewMode>("visual");
   const [tab, setTab] = useState<DetailTab>("request");
   const [replayOpen, setReplayOpen] = useState(false);
@@ -157,6 +177,12 @@ export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props
     setReplayOpen(false);
   }, [requestId]);
 
+  // 当前这条不在列表里（被筛掉、被删了、或列表刷新后滚出了已加载的那页）时
+  // 不给翻页：没有"位置"可言，硬翻会跳到一个莫名其妙的地方。
+  const index = requestId && order ? order.indexOf(requestId) : -1;
+  const prevId = index > 0 ? order![index - 1] : null;
+  const nextId = index >= 0 && index < order!.length - 1 ? order![index + 1] : null;
+
   // 时间轴只知道"第几个事件什么时候到"，不知道它发了什么。正文得从同一份捕获里的
   // 原始 SSE 帧按序号取回来 —— 两者是同一次遍历里写下的，序号天然对齐。
   const events = useMemo(
@@ -184,17 +210,47 @@ export function RequestDetailDialog({ requestId, onOpenChange, onDelete }: Props
                   {requestId}
                 </DialogDescription>
               </div>
-              {data ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setReplayOpen(true)}
-                  title="把这条请求重发到另一个渠道 / 模型"
-                >
-                  <GitCompareArrows className="size-4" />
-                  回放对比
-                </Button>
-              ) : null}
+              <div className="flex shrink-0 items-center gap-2">
+                {/* 加载中也给翻页：上游慢的那条可能要读好几秒，不该把人困在这里。 */}
+                {onNavigate && index >= 0 && (
+                  <div className="flex items-center gap-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!prevId}
+                      onClick={() => prevId && onNavigate(prevId)}
+                      title="列表里的上一条"
+                    >
+                      <ChevronLeft className="size-4" />
+                      上一条
+                    </Button>
+                    <span className="text-muted-foreground px-1 text-xs tabular-nums">
+                      {index + 1} / {order!.length}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!nextId}
+                      onClick={() => nextId && onNavigate(nextId)}
+                      title="列表里的下一条"
+                    >
+                      下一条
+                      <ChevronRight className="size-4" />
+                    </Button>
+                  </div>
+                )}
+                {data ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setReplayOpen(true)}
+                    title="把这条请求重发到另一个渠道 / 模型"
+                  >
+                    <GitCompareArrows className="size-4" />
+                    回放对比
+                  </Button>
+                ) : null}
+              </div>
             </div>
           </DialogHeader>
 

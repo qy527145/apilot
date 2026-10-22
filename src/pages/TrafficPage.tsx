@@ -139,6 +139,11 @@ const hostOf = (url: string) => url.replace(/^https?:\/\//, "");
 export default function TrafficPage() {
   const qc = useQueryClient();
   const [selected, setSelected] = useState<string | null>(null);
+  /**
+   * 从对话时间线打开详情时，那条时间线的顺序。为空表示从请求表打开 —— 那时直接用
+   * 表格当前的行序，跟着实时刷新走。
+   */
+  const [sessionOrder, setSessionOrder] = useState<string[] | null>(null);
   const [liveStream, setLiveStream] = useState<string | null>(null);
   const [live, setLive] = useState(true);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -706,7 +711,10 @@ export default function TrafficPage() {
             /** 和请求列表同一份"进行中"底账（连筛选条件也一致），对话视图里也看得到。 */
             live={inflightList}
             onOpenLive={setLiveStream}
-            onOpenRequest={setSelected}
+            onOpenRequest={(id, order) => {
+              setSessionOrder(order);
+              setSelected(id);
+            }}
             onFilterRequests={(sid) => {
               setSessionId(sid);
               setView("requests");
@@ -828,7 +836,10 @@ export default function TrafficPage() {
                         <TableRow
                           key={r.request_id}
                           className="cursor-pointer"
-                          onClick={() => setSelected(r.request_id)}
+                          onClick={() => {
+                            setSessionOrder(null);
+                            setSelected(r.request_id);
+                          }}
                         >
                           <TableCell className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
                             {formatTime(r.ts)}
@@ -961,6 +972,8 @@ export default function TrafficPage() {
         requestId={selected}
         onOpenChange={(o) => !o && setSelected(null)}
         onDelete={setConfirmDelete}
+        order={sessionOrder ?? items.map((r) => r.request_id)}
+        onNavigate={setSelected}
       />
 
       <LiveStreamDialog
