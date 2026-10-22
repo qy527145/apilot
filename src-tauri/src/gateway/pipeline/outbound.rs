@@ -377,6 +377,7 @@ pub(super) async fn try_outbound(
         ));
 
         let body = translate_stream_with_rewrite(
+            started,
             upstream_stream,
             decoder,
             encoder,

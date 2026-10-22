@@ -40,7 +40,7 @@ const MAX_TIMINGS: usize = 2000;
 /// 那个原始帧 blob 比可以忽略。
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct StreamTimings {
-    /// 每个事件相对流开始的毫秒数，按发生顺序。
+    /// 每个事件相对**请求到达网关**的毫秒数，按发生顺序（与 TTFB 同一个起点）。
     pub at_ms: Vec<i64>,
     /// 去重后的事件名。
     pub names: Vec<String>,
@@ -281,7 +281,10 @@ impl ContentAccumulator {
 /// 流的超时配置。
 #[derive(Debug, Clone, Copy)]
 pub struct StreamTimeouts {
-    /// 首字节超时：建立连接后多久没收到第一个字节就判失败。
+    /// 首字节超时：拿到响应头后多久没收到第一个字节就判失败。
+    ///
+    /// 计时从拿到响应头算（`tokio::time::timeout` 每轮重新起表），与 TTFB 的起点
+    /// （请求到达）不同 —— 等响应头那段归 HTTP 客户端的超时管。
     pub first_byte: Duration,
     /// 空闲超时：两个 chunk 之间的最大间隔。
     pub idle: Duration,
@@ -450,7 +453,7 @@ where
     F: FnOnce(StreamOutcome) + Send + 'static,
 {
     translate_stream_with_rewrite(
-        upstream, decoder, encoder, timeouts, observer, None, on_finish,
+        Instant::now(), upstream, decoder, encoder, timeouts, observer, None, on_finish,
     )
 }
 
@@ -458,7 +461,14 @@ where
 ///
 /// `delta_rewrite` 为 `Some` 时调用方必须传 `encoder`（改写后的增量要重新编码，
 /// 不能走直通）；否则钩子会被忽略，按普通流式处理。
+///
+/// `started` 是**请求到达网关**的时刻，TTFB 与时间轴都从它算起。不能在这里
+/// 取 `Instant::now()`：走到这一步时上游的响应头已经回来了，而不少上游（含
+/// Anthropic 官方）要等首个 token 生成出来才发响应头 —— 从这里起算，用户真正
+/// 干等的那几秒到几分钟全落在计时之外，TTFT 只剩个位数毫秒。
+#[allow(clippy::too_many_arguments)]
 pub fn translate_stream_with_rewrite<F>(
+    started: Instant,
     upstream: BoxStream<'static, reqwest::Result<Bytes>>,
     decoder: Box<dyn StreamDecoder>,
     encoder: Option<Box<dyn StreamEncoder>>,
@@ -479,7 +489,7 @@ where
     // 就断开）。放到生成器里面的话，那种情况下状态根本没建起来，既不会记账、
     // 也不会把「进行中」摘掉 —— 前端从此挂着一个永远不消失的幽灵。
     let mut tail = StreamTail {
-        start: Instant::now(),
+        start: started,
         outcome: StreamOutcome::default(),
         acc: ContentAccumulator::new(),
         decoder,
@@ -1020,6 +1030,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let body = translate_stream_with_rewrite(
+            Instant::now(),
             upstream(chunks),
             Box::new(AnthropicStreamDecoder::new()),
             Some(Box::new(AnthropicStreamEncoder::new())),
@@ -1548,6 +1559,41 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("call_1"), "工具调用必须能重放: {text}");
         assert!(text.contains("tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn ttfb_counts_from_request_arrival_not_from_response_headers() {
+        // 回归：计时曾在拿到上游响应头之后才开始，而 Anthropic 等上游要等首个
+        // token 出来才回响应头 —— 用户干等几十秒，监控里的 TTFT 却只有几毫秒。
+        // 这里用「请求 300ms 前就到了」模拟那段等在响应头之前的时间。
+        let started = Instant::now() - Duration::from_millis(300);
+        let chunks = vec![
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_with_rewrite(
+            started,
+            upstream(chunks),
+            Box::new(AnthropicStreamDecoder::new()),
+            None,
+            StreamTimeouts::default(),
+            None,
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+        run(body).await;
+
+        let o = rx.await.unwrap();
+        let ttfb = o.ttfb.expect("收到了字节就该有 TTFB");
+        assert!(ttfb >= Duration::from_millis(300), "TTFB 必须包含响应头之前的等待: {ttfb:?}");
+        assert!(o.total.unwrap() >= ttfb);
+        assert!(
+            o.timings.at_ms.first().is_some_and(|&ms| ms >= 300),
+            "时间轴与 TTFB 同一个起点，否则首帧的等待在时间轴上也看不见"
+        );
     }
 
     #[tokio::test]
