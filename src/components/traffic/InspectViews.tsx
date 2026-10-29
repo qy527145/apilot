@@ -1,14 +1,17 @@
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import {
   ChevronDown,
   ChevronRight,
   Image as ImageIcon,
   Lock,
+  Search,
   Wrench,
+  X,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn, formatNumber } from "@/lib/utils";
 import type {
   ContentBlock,
@@ -70,6 +73,39 @@ function Section({
 }
 
 /**
+ * 把命中的片段标出来。
+ *
+ * 只做大小写不敏感的**原文切片**，不做正则 —— 用户搜的是字面量，把
+ * `*` / `(` 当元字符解释会让人搜不到本来明明存在的内容。
+ */
+function Highlight({ text, query }: { text: string; query?: string }) {
+  const q = (query ?? "").trim();
+  if (!q) return <>{text}</>;
+
+  const lower = text.toLowerCase();
+  const needle = q.toLowerCase();
+  const out: ReactNode[] = [];
+  let from = 0;
+  let at = lower.indexOf(needle);
+  let key = 0;
+  while (at !== -1) {
+    if (at > from) out.push(text.slice(from, at));
+    out.push(
+      <mark
+        key={key++}
+        className="rounded-sm bg-amber-200/70 text-inherit dark:bg-amber-500/30"
+      >
+        {text.slice(at, at + needle.length)}
+      </mark>,
+    );
+    from = at + needle.length;
+    at = lower.indexOf(needle, from);
+  }
+  if (from < text.length) out.push(text.slice(from));
+  return <>{out}</>;
+}
+
+/**
  * 长内容的截断展示。
  *
  * 一段系统提示词或一次工具输出动辄几千字，全铺开会把别的信息挤到屏幕外；
@@ -79,10 +115,13 @@ function LongText({
   text,
   limit = 800,
   className,
+  highlight,
 }: {
   text: string;
   limit?: number;
   className?: string;
+  /** 搜索词。命中的片段会被标出来。 */
+  highlight?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const tooLong = text.length > limit;
@@ -96,7 +135,10 @@ function LongText({
           className,
         )}
       >
-        {expanded || !tooLong ? text : `${text.slice(0, limit)}…`}
+        <Highlight
+          text={expanded || !tooLong ? text : `${text.slice(0, limit)}…`}
+          query={highlight}
+        />
       </pre>
       {tooLong && (
         <button
@@ -154,16 +196,26 @@ const ROLE_STYLE: Record<Role, string> = {
 // 内容块
 // ---------------------------------------------------------------------------
 
-function ToolCallCard({ name, input }: { name: string; input: unknown }) {
+function ToolCallCard({
+  name,
+  input,
+  highlight,
+}: {
+  name: string;
+  input: unknown;
+  highlight?: string;
+}) {
   return (
     <div className="bg-background rounded-md border p-2">
       <div className="mb-1 flex items-center gap-1.5">
         <Wrench className="size-3.5 shrink-0" />
-        <span className="font-mono text-xs font-medium">{name}</span>
+        <span className="font-mono text-xs font-medium">
+          <Highlight text={name} query={highlight} />
+        </span>
         <span className="text-muted-foreground text-[11px]">调用参数</span>
       </div>
       <pre className="bg-muted/30 max-h-60 overflow-auto rounded border p-2 font-mono text-[11px] whitespace-pre-wrap">
-        {JSON.stringify(input ?? {}, null, 2)}
+        <Highlight text={JSON.stringify(input ?? {}, null, 2)} query={highlight} />
       </pre>
     </div>
   );
@@ -199,14 +251,17 @@ function BlockRenderer({
   block,
   depth = 0,
   labels = true,
+  highlight,
 }: {
   block: ContentBlock;
   depth?: number;
   labels?: boolean;
+  /** 搜索词，命中处高亮。响应视图不传。 */
+  highlight?: string;
 }) {
   switch (block.type) {
     case "text":
-      return <LongText text={block.text} />;
+      return <LongText text={block.text} highlight={highlight} />;
 
     case "thinking":
       return (
@@ -217,7 +272,12 @@ function BlockRenderer({
               {block.signature ? "（带签名）" : ""}
             </div>
           )}
-          <LongText text={block.text} limit={400} className="italic" />
+          <LongText
+            text={block.text}
+            limit={400}
+            className="italic"
+            highlight={highlight}
+          />
         </div>
       );
 
@@ -230,7 +290,13 @@ function BlockRenderer({
       );
 
     case "tool_use":
-      return <ToolCallCard name={block.name} input={block.input} />;
+      return (
+        <ToolCallCard
+          name={block.name}
+          input={block.input}
+          highlight={highlight}
+        />
+      );
 
     case "tool_result":
       return (
@@ -254,7 +320,13 @@ function BlockRenderer({
           )}
           <div className={cn("space-y-2", depth > 0 && "pl-3")}>
             {block.content.map((b, i) => (
-              <BlockRenderer key={i} block={b} depth={depth + 1} labels={labels} />
+              <BlockRenderer
+                key={i}
+                block={b}
+                depth={depth + 1}
+                labels={labels}
+                highlight={highlight}
+              />
             ))}
           </div>
         </div>
@@ -277,7 +349,7 @@ function BlockRenderer({
             未识别的内容块（原样展示，不做语义化渲染）
           </div>
           <pre className="bg-muted/30 overflow-auto rounded border p-2 font-mono text-[11px]">
-            {JSON.stringify(block.raw, null, 2)}
+            <Highlight text={JSON.stringify(block.raw, null, 2)} query={highlight} />
           </pre>
         </div>
       );
@@ -297,11 +369,17 @@ function MessageCard({
   index,
   open,
   onToggle,
+  query,
+  hits,
 }: {
   msg: UnifiedMessage;
   index: number;
   open: boolean;
   onToggle: () => void;
+  /** 搜索词，命中处高亮。 */
+  query?: string;
+  /** 这条消息里的命中次数。为 0 时不显示徽章。 */
+  hits?: number;
 }) {
   // 一屏里塞十条带工具结果的工具消息会很难读，所以每条默认收起由调用方决定。
   const preview = previewOf(msg);
@@ -331,8 +409,15 @@ function MessageCard({
         </span>
         {!open && (
           <span className="text-muted-foreground min-w-0 flex-1 truncate font-mono text-[11px]">
-            {preview}
+            <Highlight text={preview} query={query} />
           </span>
+        )}
+        {/* 命中可能落在收起摘要看不到的地方（工具结果、未建模块），
+            给个次数，免得用户不知道为什么这条被留下了。 */}
+        {!!hits && hits > 0 && (
+          <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[10px]">
+            {hits} 处命中
+          </Badge>
         )}
       </button>
       {open && (
@@ -340,7 +425,9 @@ function MessageCard({
           {msg.content.length === 0 ? (
             <p className="text-muted-foreground text-xs">（空消息）</p>
           ) : (
-            msg.content.map((b, i) => <BlockRenderer key={i} block={b} />)
+            msg.content.map((b, i) => (
+              <BlockRenderer key={i} block={b} highlight={query} />
+            ))
           )}
         </div>
       )}
@@ -364,6 +451,111 @@ function previewOf(msg: UnifiedMessage): string {
   n("image", "图片");
   n("redacted_thinking", "加密思考");
   return counts.join("、") || "（空消息）";
+}
+
+/** 消息里出现过的块类型，`tool_result` 会递归进去 —— 搜索结果里的文本块
+ *  其实常常是工具输出，只看外层会把它们排除在"文本"筛选之外。 */
+function blockTypesOf(blocks: ContentBlock[]): Set<ContentBlock["type"]> {
+  const out = new Set<ContentBlock["type"]>();
+  const walk = (bs: ContentBlock[]) => {
+    for (const b of bs) {
+      out.add(b.type);
+      if (b.type === "tool_result") walk(b.content);
+    }
+  };
+  walk(blocks);
+  return out;
+}
+
+/**
+ * 搜索用的纯文本。
+ *
+ * 图片与加密思考的 base64 / 密文不参与：搜它没有意义，还会让"命中 N 处"
+ * 虚高。未建模的块摊成 JSON —— 用户想搜的是里面的字，不是它的结构。
+ */
+function searchTextOf(blocks: ContentBlock[]): string {
+  const parts: string[] = [];
+  const walk = (bs: ContentBlock[]) => {
+    for (const b of bs) {
+      switch (b.type) {
+        case "text":
+        case "thinking":
+          parts.push(b.text);
+          break;
+        case "tool_use":
+          parts.push(b.name, JSON.stringify(b.input ?? {}));
+          break;
+        case "tool_result":
+          walk(b.content);
+          break;
+        case "unmodeled":
+          parts.push(JSON.stringify(b.raw ?? null));
+          break;
+      }
+    }
+  };
+  walk(blocks);
+  return parts.join("\n");
+}
+
+/** 命中次数。用于给消息挂一个"N 处命中"，不关心重叠。 */
+function countHits(lowerHay: string, needle: string): number {
+  if (!needle) return 0;
+  let n = 0;
+  let at = lowerHay.indexOf(needle);
+  while (at !== -1) {
+    n += 1;
+    at = lowerHay.indexOf(needle, at + needle.length);
+  }
+  return n;
+}
+
+const ROLE_ORDER: Role[] = ["system", "user", "assistant", "tool"];
+
+const BLOCK_LABEL: Record<ContentBlock["type"], string> = {
+  text: "文本",
+  thinking: "思考",
+  tool_use: "工具调用",
+  tool_result: "工具结果",
+  image: "图片",
+  redacted_thinking: "加密思考",
+  unmodeled: "未识别",
+};
+
+const BLOCK_ORDER: ContentBlock["type"][] = [
+  "text",
+  "thinking",
+  "tool_use",
+  "tool_result",
+  "image",
+  "redacted_thinking",
+  "unmodeled",
+];
+
+/** 展开状态的默认值：条数少就全摊开，多了先收起 —— 一百多条消息全展开
+ *  既读不动也渲染不动，而「全部展开」随时可以点。 */
+const AUTO_EXPAND_LIMIT = 12;
+
+function FilterChip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant={active ? "secondary" : "outline"}
+      className="h-6 px-2 text-[11px]"
+      onClick={onClick}
+    >
+      {children}
+    </Button>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -402,13 +594,70 @@ function describeToolChoice(tc: ToolChoice | null | undefined): string | null {
 export function RequestView({ req }: { req: UnifiedRequest }) {
   // 全部展开/收起：展开状态提到父级，否则按钮没法一次影响所有消息。
   const [openMap, setOpenMap] = useState<Record<number, boolean>>({});
-  const isOpen = (i: number) => openMap[i] !== false;
+
+  // 对话的筛选条件。三个条件之间是「与」，同一组里多选是「或」。
+  const [query, setQuery] = useState("");
+  const [roleFilter, setRoleFilter] = useState<Role[]>([]);
+  const [typeFilter, setTypeFilter] = useState<ContentBlock["type"][]>([]);
 
   // 后端对空的集合用了 skip_serializing_if，空时字段会整个消失，所以都要兜底。
   const tools = req.tools ?? [];
   const stop = req.stop ?? [];
   const system = req.system ?? [];
   const messages = req.messages ?? [];
+
+  // 逐条预算：搜索文本与小写副本。这些内容动辄几 MB，不能在每次按键时
+  // 重新摊一遍 —— 输入框的每次 onChange 都会重渲染。
+  const rows = useMemo(
+    () =>
+      messages.map((m, index) => {
+        const text = searchTextOf(m.content);
+        return {
+          index,
+          msg: m,
+          types: blockTypesOf(m.content),
+          lower: text.toLowerCase(),
+        };
+      }),
+    [messages],
+  );
+
+  const needle = query.trim().toLowerCase();
+  const filtering =
+    needle !== "" || roleFilter.length > 0 || typeFilter.length > 0;
+
+  const visible = rows.filter(
+    (r) =>
+      (roleFilter.length === 0 || roleFilter.includes(r.msg.role)) &&
+      (typeFilter.length === 0 || typeFilter.some((t) => r.types.has(t))) &&
+      (needle === "" || r.lower.includes(needle)),
+  );
+
+  // 条数少就默认摊开，多了先收起 —— 见 AUTO_EXPAND_LIMIT 的说明。
+  const defaultOpen = visible.length <= AUTO_EXPAND_LIMIT;
+  const isOpen = (i: number) => openMap[i] ?? defaultOpen;
+
+  const toggle = <T,>(list: T[], v: T): T[] =>
+    list.includes(v) ? list.filter((x) => x !== v) : [...list, v];
+
+  const presentRoles = ROLE_ORDER.filter((r) =>
+    messages.some((m) => m.role === r),
+  );
+  const presentTypes = BLOCK_ORDER.filter((t) =>
+    rows.some((r) => r.types.has(t)),
+  );
+
+  const setAllVisible = (open: boolean) => {
+    const next = { ...openMap };
+    visible.forEach((r) => (next[r.index] = open));
+    setOpenMap(next);
+  };
+
+  const clearFilters = () => {
+    setQuery("");
+    setRoleFilter([]);
+    setTypeFilter([]);
+  };
 
   // `extra` 是后端 flatten 上来的未建模字段，要按已知键名排除掉。
   const extras = Object.entries(req).filter(([k]) => !SYSTEM_KEYS.has(k));
@@ -487,42 +736,120 @@ export function RequestView({ req }: { req: UnifiedRequest }) {
 
       <Section
         title="对话上下文"
-        count={`${messages.length} 条`}
+        count={
+          filtering
+            ? `${visible.length} / ${messages.length} 条`
+            : `${messages.length} 条`
+        }
         defaultOpen={messages.length > 0}
       >
         {messages.length > 0 && (
-          <div className="flex gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 px-2 text-[11px]"
-              onClick={() => {
-                const next: Record<number, boolean> = {};
-                messages.forEach((_, i) => (next[i] = false));
-                setOpenMap(next);
-              }}
-            >
-              全部收起
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 px-2 text-[11px]"
-              onClick={() => setOpenMap({})}
-            >
-              全部展开
-            </Button>
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative min-w-56 flex-1">
+                <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2" />
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="搜索内容（文本 / 思考 / 工具参数与结果）"
+                  className="h-7 pr-7 pl-7 text-xs"
+                />
+                {query && (
+                  <button
+                    type="button"
+                    aria-label="清除搜索"
+                    className="text-muted-foreground hover:text-foreground absolute top-1/2 right-1.5 -translate-y-1/2"
+                    onClick={() => setQuery("")}
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                )}
+              </div>
+              <span className="text-muted-foreground text-[11px]">
+                {filtering
+                  ? `显示 ${visible.length} / ${messages.length} 条`
+                  : `共 ${messages.length} 条`}
+              </span>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-muted-foreground w-7 text-[11px]">角色</span>
+              {presentRoles.map((r) => (
+                <FilterChip
+                  key={r}
+                  active={roleFilter.includes(r)}
+                  onClick={() => setRoleFilter((prev) => toggle(prev, r))}
+                >
+                  {ROLE_LABEL[r]}
+                </FilterChip>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-muted-foreground w-7 text-[11px]">类型</span>
+              {presentTypes.map((t) => (
+                <FilterChip
+                  key={t}
+                  active={typeFilter.includes(t)}
+                  onClick={() => setTypeFilter((prev) => toggle(prev, t))}
+                >
+                  {BLOCK_LABEL[t]}
+                </FilterChip>
+              ))}
+              {filtering && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-[11px]"
+                  onClick={clearFilters}
+                >
+                  清除筛选
+                </Button>
+              )}
+            </div>
+
+            <div className="flex gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-[11px]"
+                onClick={() => setAllVisible(false)}
+              >
+                全部收起
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-[11px]"
+                onClick={() => setAllVisible(true)}
+              >
+                全部展开
+              </Button>
+            </div>
           </div>
         )}
-        {messages.map((m, i) => (
-          <MessageCard
-            key={i}
-            msg={m}
-            index={i}
-            open={isOpen(i)}
-            onToggle={() => setOpenMap((s) => ({ ...s, [i]: !isOpen(i) }))}
-          />
-        ))}
+
+        {visible.length === 0 ? (
+          <p className="text-muted-foreground text-xs">
+            {messages.length === 0
+              ? "（没有消息）"
+              : "没有符合条件的消息。换个关键词，或点「清除筛选」。"}
+          </p>
+        ) : (
+          visible.map((r) => (
+            <MessageCard
+              key={r.index}
+              msg={r.msg}
+              index={r.index}
+              open={isOpen(r.index)}
+              onToggle={() =>
+                setOpenMap((s) => ({ ...s, [r.index]: !isOpen(r.index) }))
+              }
+              query={needle}
+              hits={needle ? countHits(r.lower, needle) : 0}
+            />
+          ))
+        )}
       </Section>
 
       {extras.length > 0 && (
