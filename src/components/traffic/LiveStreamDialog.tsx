@@ -22,7 +22,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PROTOCOL_LABEL, type Protocol } from "@/lib/api";
 import type { StreamFrame } from "@/lib/events";
-import { cn, formatTime } from "@/lib/utils";
+import { cn, formatMs, formatTime } from "@/lib/utils";
 
 /** 一条正在跑（或刚跑完）的流式请求在内存里的样子。 */
 export interface LiveRequest {
@@ -173,6 +173,24 @@ export function LiveStreamDialog({
 
   const frames = live?.frames ?? [];
   const blocks = useMemo(() => accumulate(frames), [frames]);
+
+  /**
+   * 首帧到达前的等待计时。
+   *
+   * 这段时间界面只有一个转圈，用户无从判断已经等了 3 秒还是 30 秒 ——
+   * 事后看明细里的 TTFT 只有几秒时，就会怀疑"是不是少算了一段"。
+   * 把等待时长显式写出来就能对上：起点与 TTFT 相同（请求到达网关），
+   * 首帧到达即停，两者应当一致。
+   */
+  const waiting = !!live && !live.done && frames.length === 0;
+  const [waitTick, setWaitTick] = useState(0);
+  useEffect(() => {
+    if (!waiting) return;
+    setWaitTick(Date.now());
+    const timer = window.setInterval(() => setWaitTick(Date.now()), 200);
+    return () => window.clearInterval(timer);
+  }, [waiting, live?.request_id]);
+  const waitedMs = live && waitTick > 0 ? Math.max(0, waitTick - live.ts) : 0;
 
   // 时间轴吃的是 (时间点, 名字) 两样，与明细那边从库里读出来的形态一致 ——
   // 同一个组件因此能给两种数据源画同一张图。
@@ -335,10 +353,22 @@ export function LiveStreamDialog({
               className="max-h-[52vh] min-h-32 overflow-y-auto pr-1"
             >
               {frames.length === 0 ? (
-                <p className="text-muted-foreground flex items-center justify-center gap-2 py-8 text-xs">
-                  <Loader2 className="size-3 animate-spin" />
-                  等待上游第一个事件…
-                </p>
+                <div className="flex flex-col items-center justify-center gap-2 py-8 text-xs">
+                  <p className="text-muted-foreground flex items-center gap-2">
+                    <Loader2 className="size-3 animate-spin" />
+                    等待上游第一个事件…
+                    {!live?.done && (
+                      <span className="tabular-nums">
+                        已等待 {formatMs(waitedMs)}
+                      </span>
+                    )}
+                  </p>
+                  {!live?.done && (
+                    <p className="text-muted-foreground/70 text-[11px]">
+                      首字从请求到达网关起算，结束后明细里的 TTFT 就是这段等待。
+                    </p>
+                  )}
+                </div>
               ) : (
                 <StreamTimeline
                   entries={entries}
