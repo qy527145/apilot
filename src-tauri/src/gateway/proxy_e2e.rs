@@ -287,7 +287,7 @@ async fn cross_protocol_stream_end_to_end() {
     assert_eq!(outcome.usage.input_tokens, 100, "input 应保持 fresh 口径");
     assert_eq!(outcome.usage.cache_read_tokens, 900);
     assert_eq!(outcome.usage.output_tokens, 7);
-    assert!(outcome.ttfb.is_some(), "必须记录 TTFB");
+    assert!(outcome.ttft.is_some(), "必须记录 TTFT");
     assert!(outcome.error.is_none(), "不应有错误: {:?}", outcome.error);
     assert!(!outcome.content.is_empty(), "应重建出内容块供缓存使用");
 }
@@ -310,7 +310,7 @@ async fn same_protocol_stream_passes_through_byte_for_byte() {
     assert_eq!(outcome.text, "你好，世界");
     assert_eq!(outcome.usage.input_tokens, 100);
     assert_eq!(outcome.usage.output_tokens, 7);
-    assert!(outcome.ttfb.is_some());
+    assert!(outcome.ttft.is_some());
 }
 
 #[tokio::test]

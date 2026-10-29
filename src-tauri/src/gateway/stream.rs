@@ -127,8 +127,15 @@ pub struct StreamOutcome {
     pub raw_client: Option<Vec<u8>>,
     /// 原始帧是否因为超过上限被截断。
     pub raw_truncated: bool,
-    /// 首字节耗时。
-    pub ttfb: Option<Duration>,
+    /// 首个可解析事件（带 `data:` 的 SSE 块）耗时，从请求到达网关算起。
+    ///
+    /// 不能量到"首个字节"：上游常在真正出内容前先发纯注释帧（`: ping`）保活，
+    /// 源码注释与心跳帧在客户端那边是被忽略的，拿它们当首字会让"干等几十秒"
+    /// 显示成"几毫秒"。
+    pub ttft: Option<Duration>,
+    /// 首个原始字节耗时。只用于把「首字节超时」切成「空闲超时」，
+    /// 不作为对外指标 —— 对外看的是 [`Self::ttft`]。
+    pub first_byte: Option<Duration>,
     pub total: Option<Duration>,
     /// 处理过的 SSE 事件数。
     pub events: u64,
@@ -509,7 +516,7 @@ where
 
         loop {
             // 首个字节用更短的超时，之后用空闲超时。
-            let timeout = if tail.outcome.ttfb.is_none() {
+            let timeout = if tail.outcome.first_byte.is_none() {
                 timeouts.first_byte
             } else {
                 timeouts.idle
@@ -517,7 +524,7 @@ where
 
             let chunk = match tokio::time::timeout(timeout, pinned.next()).await {
                 Err(_) => {
-                    tail.outcome.error = Some(if tail.outcome.ttfb.is_none() {
+                    tail.outcome.error = Some(if tail.outcome.first_byte.is_none() {
                         "等待上游首字节超时".to_string()
                     } else {
                         "上游流空闲超时".to_string()
@@ -532,8 +539,8 @@ where
                 Ok(Some(Ok(chunk))) => chunk,
             };
 
-            if tail.outcome.ttfb.is_none() {
-                tail.outcome.ttfb = Some(tail.start.elapsed());
+            if tail.outcome.first_byte.is_none() {
+                tail.outcome.first_byte = Some(tail.start.elapsed());
             }
 
             // 原始帧：上游侧无条件留一份。
@@ -549,6 +556,11 @@ where
 
             while let Some(block) = take_sse_block(&mut buf) {
                 let Some(ev) = parse_event(&block) else { continue };
+                // 注释帧、`retry:` 之类没有 `data:` 的块到不了这里 —— 它们不算
+                // 首字。见 `StreamOutcome::ttft` 的注释。
+                if tail.outcome.ttft.is_none() {
+                    tail.outcome.ttft = Some(tail.start.elapsed());
+                }
                 tail.outcome.events += 1;
 
                 let deltas = match tail.decoder.on_event(&ev) {
@@ -772,7 +784,9 @@ impl<F: FnOnce(StreamOutcome)> ReplayTail<F> {
         }
         self.finished = true;
         let elapsed = self.start.elapsed();
-        self.outcome.ttfb = Some(elapsed);
+        // 缓存重放时"首个事件"是瞬间合成的，与整体耗时同义。
+        self.outcome.ttft = Some(elapsed);
+        self.outcome.first_byte = Some(elapsed);
         self.outcome.total = Some(elapsed);
         if let Some(f) = self.on_finish.take() {
             f(std::mem::take(&mut self.outcome));
@@ -843,6 +857,19 @@ mod tests {
                 .into_iter()
                 .map(|c| Ok(Bytes::from_static(c.as_bytes()))),
         ))
+    }
+
+    /// 每帧之间隔一段时间的流，用来验证"等待落在计时里"。
+    fn upstream_with_delay(
+        chunks: Vec<&'static str>,
+        gap: Duration,
+    ) -> BoxStream<'static, reqwest::Result<Bytes>> {
+        Box::pin(async_stream::stream! {
+            for c in chunks {
+                tokio::time::sleep(gap).await;
+                yield Ok(Bytes::from_static(c.as_bytes()));
+            }
+        })
     }
 
     /// 发完这几帧就再也不产出的流。配合极短的 `idle` 超时，它就是"上游断了"。
@@ -1088,7 +1115,7 @@ mod tests {
 
         let outcome = rx.await.unwrap();
         assert_eq!(outcome.text, "hi");
-        assert!(outcome.ttfb.is_some());
+        assert!(outcome.ttft.is_some());
         assert!(outcome.events >= 2);
     }
 
@@ -1562,7 +1589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ttfb_counts_from_request_arrival_not_from_response_headers() {
+    async fn ttft_counts_from_request_arrival_not_from_response_headers() {
         // 回归：计时曾在拿到上游响应头之后才开始，而 Anthropic 等上游要等首个
         // token 出来才回响应头 —— 用户干等几十秒，监控里的 TTFT 却只有几毫秒。
         // 这里用「请求 300ms 前就到了」模拟那段等在响应头之前的时间。
@@ -1587,12 +1614,53 @@ mod tests {
         run(body).await;
 
         let o = rx.await.unwrap();
-        let ttfb = o.ttfb.expect("收到了字节就该有 TTFB");
-        assert!(ttfb >= Duration::from_millis(300), "TTFB 必须包含响应头之前的等待: {ttfb:?}");
-        assert!(o.total.unwrap() >= ttfb);
+        let ttft = o.ttft.expect("收到了事件就该有 TTFT");
+        assert!(ttft >= Duration::from_millis(300), "TTFT 必须包含响应头之前的等待: {ttft:?}");
+        assert!(o.total.unwrap() >= ttft);
         assert!(
             o.timings.at_ms.first().is_some_and(|&ms| ms >= 300),
-            "时间轴与 TTFB 同一个起点，否则首帧的等待在时间轴上也看不见"
+            "时间轴与 TTFT 同一个起点，否则首帧的等待在时间轴上也看不见"
+        );
+    }
+
+    /// 上游先发纯注释帧保活、很久之后才吐第一个真事件。
+    ///
+    /// 回归：TTFT 曾量到「首个字节」，于是一串 `: ping` 就能让"干等 30 秒"
+    /// 显示成"3 毫秒" —— 与用户在实时视图里看到的等待完全对不上。
+    /// 注释帧在 SSE 里是给客户端忽略的，不是用户能看见的任何东西。
+    #[tokio::test]
+    async fn ttft_anchors_on_the_first_parseable_event_not_on_keepalive_bytes() {
+        let started = Instant::now();
+        let chunks = vec![
+            ": keepalive\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n",
+        ];
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_with_rewrite(
+            started,
+            upstream_with_delay(chunks, Duration::from_millis(150)),
+            Box::new(AnthropicStreamDecoder::new()),
+            None,
+            StreamTimeouts::default(),
+            None,
+            None,
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+        run(body).await;
+
+        let o = rx.await.unwrap();
+        let first_byte = o.first_byte.expect("注释帧也是字节");
+        let ttft = o.ttft.expect("真事件到达后就有 TTFT");
+        assert!(
+            first_byte < Duration::from_millis(200),
+            "首字节是那条注释帧: {first_byte:?}"
+        );
+        assert!(
+            ttft >= first_byte + Duration::from_millis(100),
+            "TTFT 必须跳过注释帧，量到第一个可解析事件: first_byte={first_byte:?} ttft={ttft:?}"
         );
     }
 
@@ -1611,7 +1679,8 @@ mod tests {
         let bytes = run(body).await;
         assert!(bytes.is_empty());
         let o = rx.await.unwrap();
-        assert!(o.ttfb.is_none(), "没有任何字节就没有 TTFB");
+        assert!(o.ttft.is_none(), "没有任何事件就没有 TTFT");
+        assert!(o.first_byte.is_none(), "没有任何字节就没有首字节时刻");
     }
 
     #[tokio::test]

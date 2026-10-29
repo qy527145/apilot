@@ -275,7 +275,7 @@ pub struct BillingBucket {
     /// 三个平均值背后的样本条数（流式、非缓存命中、量得出解码窗口的请求）。
     /// 为 0 说明这一桶里没有可比的生成过程（全是非流式或缓存命中）。
     pub sample_requests: i64,
-    /// 平均首字节耗时（毫秒）。样本为空时为 `None`。
+    /// 平均 TTFT（首个可解析事件耗时，毫秒）。样本为空时为 `None`。
     pub avg_ttft_ms: Option<f64>,
     /// 平均 token 间隔（毫秒）。同上。
     pub avg_itl_ms: Option<f64>,

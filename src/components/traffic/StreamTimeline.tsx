@@ -46,7 +46,7 @@ export function parseTimings(
 /**
  * 每个事件**自己**花了多久 = 与上一个事件的时间差。
  *
- * 注意第一个事件那一项是从流开始算起的等待 —— 也就是首字节耗时。它和后面那些
+ * 注意第一个事件那一项是从流开始算起的等待 —— 也就是首个事件耗时（TTFT）。它和后面那些
  * "两个事件之间的间隔"不是一回事，但对"我到底在等谁"是同一个问题，所以一并画出来。
  */
 function withGaps(entries: TimingEntry[]): Array<TimingEntry & { gap: number }> {

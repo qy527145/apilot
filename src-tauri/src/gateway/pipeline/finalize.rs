@@ -81,7 +81,9 @@ pub(super) fn finalize_stream(
     } = ctx;
 
     let latency = started.elapsed().as_millis() as i64;
-    let ttfb = outcome.ttfb.map(|d| d.as_millis() as i64);
+    // 落库列名沿用了 `ttfb_ms`，但这里的口径是**首个可解析事件**，见
+    // `StreamOutcome::ttft`。改列名要过迁移，收益不抵成本。
+    let ttfb = outcome.ttft.map(|d| d.as_millis() as i64);
     // 499 = nginx 的「客户端关闭请求」。客户端收完内容就断、或者中途按 Esc，
     // 上游都没错；记成 502 会让人以为是上游抽风。见 `Recorder::Drop` 同样的取舍。
     let status_code = if outcome.aborted {

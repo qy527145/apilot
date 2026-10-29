@@ -1113,9 +1113,10 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
 /// 不会给出两个数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeedSample {
-    /// 首字节耗时（毫秒）。
+    /// 首个可解析事件耗时（毫秒），即 TTFT。落库列名沿用 `ttfb_ms`，
+    /// 口径见 `StreamOutcome::ttft`。
     pub ttft_ms: i64,
-    /// 解码窗口（毫秒）= 总耗时 - 首字节，恒为正。
+    /// 解码窗口（毫秒）= 总耗时 - 首个事件，恒为正。
     pub decode_ms: i64,
     /// 这段窗口里吐出的 token 数。
     pub output_tokens: u64,
