@@ -189,6 +189,13 @@ pub struct RequestStarted {
     /// 对话视图的每条线下面要显示"正在进行"的那一条，没有它就不知道往哪儿挂。
     #[serde(default)]
     pub thread_key: Option<String>,
+    /// 这一条是「中断并重试」重放出来的哪一条请求。
+    ///
+    /// 重试走的是完整的第二次请求，所以 `request_id` 会换一个 —— 前端正盯着
+    /// 旧的那条弹窗，没有这个字段就只能看到它"结束了"，然后在列表里自己找
+    /// 新出来的那条。有了它，弹窗可以跟过去。
+    #[serde(default)]
+    pub retry_of: Option<String>,
 }
 
 /// 请求结束。与 `apilot://request` 分开：那个走的 `EventBus::request`
@@ -408,6 +415,7 @@ mod tests {
             is_stream: true,
             session_id: None,
             thread_key: None,
+            retry_of: None,
         }
     }
 

@@ -10,9 +10,12 @@ use axum::body::Bytes;
 use axum::response::{IntoResponse, Response};
 use http::HeaderMap;
 
-use crate::gateway::stream::{translate_stream_with_rewrite, StreamDeltaRewrite, StreamTimeouts};
+use crate::gateway::stream::{
+    translate_stream_with_rewrite, StreamDeltaRewrite, StreamRestart, StreamTimeouts,
+};
 use crate::protocol::dto::{Protocol, ReasoningConfig, UnifiedDelta, UnifiedRequest};
 use crate::shell::AppShell;
+use crate::traffic::control::{RequestControl, RequestSignal};
 use crate::upstream::outbound::{Outbound, UpstreamBody, UpstreamError};
 
 use super::body_patch::{count_tool_uses, patch_model_field, patch_outbound_body,
@@ -21,6 +24,24 @@ use super::buffered::finish_buffered;
 use super::finalize::{finalize_stream, StreamContext};
 use super::recorder::Recorder;
 use super::reply::{build_response, headers_to_json, record_client_response};
+use super::{handle_with, RetryHint};
+
+/// 单次出站的结果。
+///
+/// 比 `Result<Response, UpstreamError>` 多出来的一支是给界面上那个「中断 /
+/// 中断并重试」按钮的：那**不是**错误，而是一次有意为之的放弃 —— 调用方据此
+/// 换渠道或整条重来，而不是把它记成上游抽风。
+pub(super) enum OutboundOutcome {
+    Failed(UpstreamError),
+    /// 用户按了按钮，`RequestSignal` 说按的是哪一个。
+    Interrupted(RequestSignal),
+}
+
+impl From<UpstreamError> for OutboundOutcome {
+    fn from(e: UpstreamError) -> Self {
+        Self::Failed(e)
+    }
+}
 
 /// 发一次原样转发，返回**未经改写的**上游响应。
 ///
@@ -105,9 +126,13 @@ pub(super) async fn try_outbound(
     started: Instant,
     // 请求改写脚本确实改动了 IR。为真时即使同协议也必须重编码。
     force_encode: bool,
-) -> Result<Response, UpstreamError> {
+    // 界面上的「中断 / 中断并重试」从这个句柄进来。
+    control: &Arc<RequestControl>,
+) -> Result<Response, OutboundOutcome> {
     // 渠道声明支持入站协议就直接说那种协议（直通），不支持才回落到首选协议做转换。
     let wire = outbound.wire_for(protocol_in);
+    // 「试过哪些渠道」交给控制句柄攒着：重试时要把它们排到最后。
+    control.note_provider(outbound.tag());
     recorder.record.protocol_out = wire.as_str().to_string();
     recorder.record.provider_tag = Some(outbound.tag().to_string());
     recorder.record.provider_id = Some(outbound.provider().id);
@@ -138,7 +163,7 @@ pub(super) async fn try_outbound(
         match codec.encode_request(&to_send) {
             Ok(b) => Bytes::from(b),
             Err(e) => {
-                return Err(UpstreamError::Build(format!("请求编码为 {wire} 失败: {e}")))
+                return Err(UpstreamError::Build(format!("请求编码为 {wire} 失败: {e}")).into())
             }
         }
     } else {
@@ -189,7 +214,26 @@ pub(super) async fn try_outbound(
         c.upstream.body = Some(prepared.body.to_vec());
     }
 
-    let resp = outbound.dial(prepared).await?;
+    // **只有这一段可以被界面打断**。上游一开始回字节（`dial` 返回）之后，
+    // 「重试」就换成流里面的那一套（那边才能把新请求接到同一条下游流上），
+    // 「中断」也由流的转发循环负责收尾 —— 在这里凭空丢掉一个已经拿到响应头的
+    // 请求，只会在日志里留下一条"成功"、客户端却什么都收不到。
+    //
+    // 放在 `dial` 这一处而不是包住整个 `try_outbound`：后面那半段里
+    // `finish_buffered` 已经会把 `Recorder` 结账、把「进行中」摘掉，那时再
+    // 撤销就成了幽灵——账记了、响应却被丢进垃圾桶。
+    let resp = tokio::select! {
+        biased;
+        // 用户点了按钮就优先于"恰好同一刻拿到了响应头"：他要的是换条路，
+        // 这条路上的运气如何已经不重要了。
+        _ = control.wait() => {
+            // 取走信号。不取的话，换到下一个候选的第一轮 `select!` 会立刻
+            // 又命中同一次点击，一路把候选表刷穿。
+            let signal = control.take().unwrap_or(RequestSignal::Cancel);
+            return Err(OutboundOutcome::Interrupted(signal));
+        }
+        r = outbound.dial(prepared) => r?,
+    };
     let status = resp.status;
 
     // 上游返回的原始状态码单独记：网关可能把它包装成别的码再返回给客户端，
@@ -219,7 +263,8 @@ pub(super) async fn try_outbound(
         return Err(UpstreamError::Status {
             status: status.as_u16(),
             body: msg,
-        });
+        }
+        .into());
     }
 
     // ---- 2xx 却不是 API 的回复 ----
@@ -254,10 +299,7 @@ pub(super) async fn try_outbound(
                 c.upstream.response_body = Some(b.to_vec());
             }
         }
-        return Err(UpstreamError::Status {
-            status: 502,
-            body: why,
-        });
+        return Err(UpstreamError::Status { status: 502, body: why }.into());
     }
 
     // ---- 流式 ----
@@ -301,13 +343,52 @@ pub(super) async fn try_outbound(
                     shell, protocol_in, wire, &b, resp.headers, recorder, status, needs_conversion,
                     cacheable, cache_key, started, &mapped_model,
                 )
-                .await;
+                .await
+                .map_err(Into::into);
             }
         };
 
         let timeouts = StreamTimeouts {
             first_byte: std::time::Duration::from_millis(settings.first_byte_timeout_ms),
             idle: std::time::Duration::from_millis(settings.idle_timeout_ms),
+        };
+
+        // ---- 流里面的「中断并重试」 ----
+        //
+        // 响应头已经发给客户端了，所以不能靠"再回一个 Response"来重试：只能把
+        // 新一次请求的字节接到**同一条下游流**上。前提是这条流还没往下游送过
+        // 任何东西 —— 那条判据在 `stream.rs` 里，这里只负责把"怎么再跑一遍"交给它。
+        let restart = StreamRestart {
+            control: control.clone(),
+            make: Box::new({
+                let shell = shell.clone();
+                let path = recorder.record.path.clone();
+                let headers = headers.clone();
+                let body = raw_body.clone();
+                let retry_of = recorder.record.request_id.clone();
+                let control = control.clone();
+                move || {
+                    Box::pin(async move {
+                        let hint = RetryHint {
+                            skip_provider_tags: control.attempted(),
+                            retry_of: Some(retry_of),
+                        };
+                        let resp = handle_with(shell, protocol_in, path, headers, body, hint).await;
+                        // 只接 2xx 的 SSE。重试自己就失败时（路由拒绝、渠道全挂）
+                        // `handle` 回的是 JSON —— 灌进一条已经在送 SSE 的响应里，
+                        // 客户端解析器看到的只是垃圾。宁可让这条流就此结束。
+                        let is_sse = resp
+                            .headers()
+                            .get(http::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v.contains("text/event-stream"));
+                        if !resp.status().is_success() || !is_sse {
+                            return None;
+                        }
+                        Some(resp.into_body())
+                    })
+                }
+            }),
         };
 
         let mut response_headers = resp.headers.clone();
@@ -384,6 +465,7 @@ pub(super) async fn try_outbound(
             timeouts,
             Some(observer),
             delta_rewrite,
+            Some(restart),
             move |outcome| finalize_stream(ctx, outcome),
         );
 
@@ -403,7 +485,7 @@ pub(super) async fn try_outbound(
                 match chunk {
                     Ok(b) => acc.extend_from_slice(&b),
                     Err(e) => {
-                        return Err(UpstreamError::Io(format!("读取上游响应失败: {e}")))
+                        return Err(UpstreamError::Io(format!("读取上游响应失败: {e}")).into())
                     }
                 }
             }
@@ -426,4 +508,5 @@ pub(super) async fn try_outbound(
         &mapped_model,
     )
     .await
+    .map_err(Into::into)
 }

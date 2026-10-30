@@ -157,6 +157,28 @@ pub async fn get_inflight_requests(
     Ok(shell.inflight.snapshot())
 }
 
+/// 中断一条进行中的请求；`retry` 为真时顺带让它重跑一遍。
+///
+/// 返回 `false` 表示这条请求已经不在「进行中」里了（刚跑完，或者界面上的那条
+/// 早就结束了）—— 界面据此说明"没赶上"，而不是假装点了有用。
+///
+/// 重试**不是**在同一条请求里换个渠道继续：网关会把它当成一次全新的请求
+/// （新 `request_id`、新日志行），旧的那条记 499「已手动中断并重试」。
+/// 客户端的连接始终不动 —— 除了卡住的那段等待，它看不出中间换过一次。
+#[tauri::command]
+pub async fn interrupt_inflight_request(
+    shell: State<'_, Arc<AppShell>>,
+    request_id: String,
+    retry: bool,
+) -> AppResult<bool> {
+    let signal = if retry {
+        crate::traffic::control::RequestSignal::Retry
+    } else {
+        crate::traffic::control::RequestSignal::Cancel
+    };
+    Ok(shell.inflight.request_signal(&request_id, signal))
+}
+
 /// 清空请求日志与捕获原文。
 ///
 /// 只动这两张表：`usage_hourly` 与内存里的累计计数器是计费口径的历史账目，

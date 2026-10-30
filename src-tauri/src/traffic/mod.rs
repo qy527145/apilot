@@ -3,6 +3,7 @@
 //! 这里的数字是**进程内实时值**（当前并发、累计请求数），与数据库里的历史
 //! 统计互补：DB 回答"过去一小时花了多少"，这里回答"现在正在跑什么"。
 
+pub mod control;
 pub mod events;
 pub mod log_filter;
 pub mod session;
@@ -34,6 +35,13 @@ pub struct InflightEntry {
     /// 留着的不全（顶到帧上限，或者被下面的环形缓冲挤掉了最老的）。
     /// 半路进页的人据此知道"上面还有内容"，而不是把这几百帧当成整条流。
     pub truncated: bool,
+    /// 手动中断 / 中断并重试的入口。
+    ///
+    /// 挂在这条底账上而不是另建一张表：它必须与请求**同生共死**。见
+    /// [`control`] 模块顶部那段。不参与序列化 —— 它是进程内的一个句柄，
+    /// 前端拿不到也不该拿到。
+    #[serde(skip)]
+    pub control: Option<Arc<control::RequestControl>>,
 }
 
 /// 每条请求在底账里最多留多少帧。
@@ -63,13 +71,49 @@ impl InflightStore {
             .lock()
             .insert(
                 r.request_id.clone(),
-                InflightEntry { started: r, frames: Vec::new(), truncated: false },
+                InflightEntry {
+                    started: r,
+                    frames: Vec::new(),
+                    truncated: false,
+                    control: None,
+                },
             );
     }
 
     /// 请求结束时移除。连带把攒着的帧一起丢掉 —— 收尾之后完整报文在数据库里。
     pub fn remove(&self, request_id: &str) {
         self.entries.lock().remove(request_id);
+    }
+
+    /// 给这条请求挂上控制句柄。
+    ///
+    /// 与 `insert` 分开：`insert` 发生在请求真正开始出站的那一刻，而控制句柄
+    /// 在更早的候选循环里就要用上。挂在这条底账上，`remove` 一执行它就跟着
+    /// 一起消失，不需要任何一处再记得单独清理。
+    pub fn attach_control(&self, request_id: &str, control: Arc<control::RequestControl>) {
+        if let Some(entry) = self.entries.lock().get_mut(request_id) {
+            entry.control = Some(control);
+        }
+    }
+
+    /// 给一条进行中的请求下发中断 / 重试信号。
+    ///
+    /// 返回 `false` 表示这条请求已经不在了（刚跑完，或者用户点的其实是更早的
+    /// 一条）—— 调用方据此告诉界面"没赶上"，而不是假装成功。
+    pub fn request_signal(&self, request_id: &str, signal: control::RequestSignal) -> bool {
+        let handle = {
+            // 只在锁内取 Arc，`request` 在锁外调：Hold 锁去 notify 虽然不阻塞，
+            // 但让"取句柄"与"发信号"的边界清楚一点，读代码时不必怀疑会不会串。
+            let map = self.entries.lock();
+            map.get(request_id).and_then(|e| e.control.clone())
+        };
+        match handle {
+            Some(c) => {
+                c.request(signal);
+                true
+            }
+            None => false,
+        }
     }
 
     /// 这条请求刚推出去了一批帧，底账里也留一份。
@@ -273,6 +317,7 @@ mod tests {
             is_stream: true,
             session_id: Some("s".into()),
             thread_key: Some("main".into()),
+            retry_of: None,
         }
     }
 

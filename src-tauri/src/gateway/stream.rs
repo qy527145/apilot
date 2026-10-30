@@ -7,12 +7,16 @@
 //! 这样既避免了"解码再编码"可能引入的偏差，又保留了完整的监控能力。
 //! 只有跨协议时才真正重编码。
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt};
 use serde::Serialize;
+
+use crate::traffic::control::{RequestControl, RequestSignal};
 
 use crate::protocol::codec::{StreamDecoder, StreamEncoder};
 use crate::protocol::dto::{FinishReason, UnifiedDelta, UnifiedResponse, UnifiedUsage};
@@ -349,6 +353,19 @@ pub struct StreamDeltaRewrite {
     pub apply: Box<dyn FnMut(&UnifiedDelta) -> Option<Vec<UnifiedDelta>> + Send + 'static>,
 }
 
+/// 「中断并重试」在流中途用的那一半。
+///
+/// 响应头早就发给客户端了，没法再回一个 `Response` —— 只能把**新一次请求**的
+/// 字节接到同一条下游流上。`make` 由 `pipeline` 提供（它才知道怎么把整条请求
+/// 重跑一遍），这里只负责判断"现在能不能接"以及旧那条怎么收尾。
+///
+/// `make` 返回 `None` 表示重试本身也没成功：此时这条下游流就此结束，客户端看到
+/// 的是"流没起来"，会自己重试 —— 总好过把一段 JSON 错误灌进 SSE 里。
+pub struct StreamRestart {
+    pub control: Arc<RequestControl>,
+    pub make: Box<dyn FnOnce() -> BoxFuture<'static, Option<Body>> + Send>,
+}
+
 /// 对一批增量逐条跑改写钩子。钩子返回空数组时该条被丢弃。
 fn apply_delta_rewrite(
     deltas: Vec<UnifiedDelta>,
@@ -460,7 +477,7 @@ where
     F: FnOnce(StreamOutcome) + Send + 'static,
 {
     translate_stream_with_rewrite(
-        Instant::now(), upstream, decoder, encoder, timeouts, observer, None, on_finish,
+        Instant::now(), upstream, decoder, encoder, timeouts, observer, None, None, on_finish,
     )
 }
 
@@ -482,6 +499,7 @@ pub fn translate_stream_with_rewrite<F>(
     timeouts: StreamTimeouts,
     observer: Option<Box<dyn StreamObserver>>,
     delta_rewrite: Option<StreamDeltaRewrite>,
+    restart: Option<StreamRestart>,
     on_finish: F,
 ) -> Body
 where
@@ -491,6 +509,7 @@ where
     // 没有编码器就无法把改写后的增量发出去。宁可按普通流式走，也不要把请求弄坏。
     let mut delta_rewrite = delta_rewrite.filter(|_| !passthrough);
     let mut encoder = encoder;
+    let mut restart = restart;
 
     // **在生成器外构造**：Body 可能一次都没被 poll 就被丢掉（客户端收到响应头
     // 就断开）。放到生成器里面的话，那种情况下状态根本没建起来，既不会记账、
@@ -514,6 +533,12 @@ where
         let mut rem: Vec<u8> = Vec::new();
         let mut pinned = upstream;
 
+        // 用户按了按钮时从这里出去。`None` = 循环是正常/异常结束的。
+        let mut interrupted: Option<RequestSignal> = None;
+        // 已经往下游送过语义没有。`message_start` 也算 —— 重来一遍会在客户端
+        // 那边出现第二条 `message_start`，那是它接不住的。
+        let mut saw_delta = false;
+
         loop {
             // 首个字节用更短的超时，之后用空闲超时。
             let timeout = if tail.outcome.first_byte.is_none() {
@@ -522,7 +547,25 @@ where
                 timeouts.idle
             };
 
-            let chunk = match tokio::time::timeout(timeout, pinned.next()).await {
+            let wait = tokio::time::timeout(timeout, pinned.next());
+            // 先把控制句柄单独拎出来：`StreamRestart` 里那个 `FnOnce` 只能保证
+            // `Send`、不保证 `Sync`，而 `&StreamRestart` 一旦跨过下面这个 await，
+            // 整个生成器就不再是 `Send` 了，`Body::from_stream` 直接拒收。
+            let ctl = restart.as_ref().map(|r| r.control.clone());
+            let chunk = match match ctl {
+                // 有控制句柄才多等一个信号。没有的话保持原来的单路等待，
+                // 别为一个用不上的分支多一次 poll。
+                Some(ctl) => tokio::select! {
+                    biased;
+                    _ = ctl.wait() => {
+                        // 信号必须取走：留着的话下一轮立刻又命中同一次点击。
+                        interrupted = Some(ctl.take().unwrap_or(RequestSignal::Cancel));
+                        break;
+                    }
+                    r = wait => r,
+                },
+                None => wait.await,
+            } {
                 Err(_) => {
                     tail.outcome.error = Some(if tail.outcome.first_byte.is_none() {
                         "等待上游首字节超时".to_string()
@@ -594,6 +637,10 @@ where
                 // 逐增量改写放在观察者 / 累加器 / 编码器**之前**：三者必须看到
                 // 同一份增量，否则实时视图、捕获内容与客户端收到的会互相矛盾。
                 let deltas = apply_delta_rewrite(deltas, &mut delta_rewrite);
+                // 只要解出过一条增量，下游就已经拿到了有语义的东西。
+                if !deltas.is_empty() {
+                    saw_delta = true;
+                }
 
                 if let Some(o) = tail.observer.as_mut() {
                     o.on_event(&block, &deltas);
@@ -627,6 +674,67 @@ where
                     }
                 }
             }
+        }
+
+        // ---- 用户按了「中断」/「中断并重试」 ----
+        if let Some(signal) = interrupted {
+            // 能不能把新一次请求接到这条流上？前提是下游还没拿到任何有语义的
+            // 东西，**而且**已经发出去的字节正好停在 SSE 块的边界上。
+            //
+            // 后半句不能省：直通模式是"先把原始字节转给客户端、再回头解析"，
+            // 一块被 TCP 拆成两半的 `message_start` 完全可能已经发出去了 ——
+            // 此时再接一条新流，客户端的解析器会把"半截旧帧 + 新流的开头"
+            // 拼成一条垃圾事件。`buf` / `rem` 正好就是那两个"半截"。
+            let can_restart = matches!(signal, RequestSignal::Retry)
+                && !saw_delta
+                && buf.is_empty()
+                && rem.is_empty()
+                && restart.is_some();
+
+            tail.outcome.error = Some(if can_restart {
+                "已手动中断并重试".to_string()
+            } else {
+                "已手动中断".to_string()
+            });
+
+            // 不重试时补一帧 `error`：客户端才知道这条响应是**被结束**的，
+            // 而不是上游吐到一半断了。直通那条路不能补（客户端收到的本来就是
+            // 上游原始字节，硬塞一帧别的协议的错误反而可能把它弄坏）——
+            // 与下面 `broken` 那一段是同一个取舍。
+            if !can_restart && !tail.passthrough {
+                if let Some(enc) = encoder.as_mut() {
+                    let events = enc.on_delta(&UnifiedDelta::Error {
+                        code: "api_error".into(),
+                        message: "已手动中断：这条响应被用户在监控页结束".into(),
+                    });
+                    for out in events {
+                        let bytes = encode_event(&out);
+                        tail.raw_client.push(&bytes);
+                        yield Ok::<Bytes, std::io::Error>(bytes);
+                    }
+                }
+            }
+
+            // 用户按的按钮既不是上游抽风也不是客户端断连：按 499 记，原因写成人话。
+            // `finalize(true)` 之后 `Drop` 不会再收一次尾（`finished` 已置位）。
+            tail.finalize(true);
+
+            if can_restart {
+                if let Some(r) = restart.take() {
+                    if let Some(body) = (r.make)().await {
+                        let mut data = body.into_data_stream();
+                        while let Some(chunk) = data.next().await {
+                            match chunk {
+                                Ok(b) => yield Ok::<Bytes, std::io::Error>(b),
+                                // 新流自己坏了就到此为止：旧那条已经结完账，
+                                // 这条下游流也没有第二套账可记。
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+            }
+            return;
         }
 
         // 上游这一段已经走完：内容与用量都齐了。标记放在这里（而不是收尾之后），
@@ -1064,6 +1172,7 @@ mod tests {
             StreamTimeouts::default(),
             None,
             Some(rewrite),
+            None,
             move |o| {
                 let _ = tx.send(o);
             },
@@ -1607,6 +1716,7 @@ mod tests {
             StreamTimeouts::default(),
             None,
             None,
+            None,
             move |o| {
                 let _ = tx.send(o);
             },
@@ -1643,6 +1753,7 @@ mod tests {
             Box::new(AnthropicStreamDecoder::new()),
             None,
             StreamTimeouts::default(),
+            None,
             None,
             None,
             move |o| {
@@ -2047,5 +2158,164 @@ mod tests {
                 "时间轴的名字与前端的 kind 标签对不上：{d:?}"
             );
         }
+    }
+    /// 「中断并重试」：下游还没拿到任何有语义的东西时，把新一次请求的字节
+    /// 接到**同一条**下游流上。
+    ///
+    /// 上游"只发心跳然后干等"正是用户在实时视图里干看 250 秒的那种形状。
+    #[tokio::test]
+    async fn a_retry_before_any_delta_resumes_on_the_new_stream() {
+        let control = Arc::new(RequestControl::new());
+        {
+            let control = control.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                control.request(RequestSignal::Retry);
+            });
+        }
+
+        let made = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_with_rewrite(
+            Instant::now(),
+            hanging_upstream(vec![": keepalive\n\n"]),
+            Box::new(AnthropicStreamDecoder::new()),
+            None,
+            StreamTimeouts {
+                first_byte: Duration::from_millis(500),
+                idle: Duration::from_millis(500),
+            },
+            None,
+            None,
+            Some(StreamRestart {
+                control: control.clone(),
+                make: Box::new({
+                    let made = made.clone();
+                    move || {
+                        Box::pin(async move {
+                            made.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Some(Body::from(
+                                "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"新的内容\"}}\n\n",
+                            ))
+                        })
+                    }
+                }),
+            }),
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+
+        let out = String::from_utf8_lossy(&run(body).await).to_string();
+        assert!(made.load(std::sync::atomic::Ordering::SeqCst), "重试没有被执行");
+        assert!(out.contains("keepalive"), "已经发出去的心跳不能被吞掉: {out}");
+        assert!(out.contains("新的内容"), "新一次请求的内容必须接到同一条流上: {out}");
+
+        let o = rx.await.unwrap();
+        assert!(o.aborted, "人为中止不是上游失败");
+        assert_eq!(o.error.as_deref(), Some("已手动中断并重试"));
+        // 旧那条的账要干净：一个事件都没有。
+        assert_eq!(o.events, 0);
+    }
+
+    /// 只按「中断」：非直通那条路要补一帧 `error` 再收尾 —— 客户端得知道这是
+    /// 被结束的，而不是上游吐到一半断了。
+    #[tokio::test]
+    async fn a_plain_cancel_ends_with_an_error_frame_and_no_terminal_frame() {
+        let control = Arc::new(RequestControl::new());
+        {
+            let control = control.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                control.request(RequestSignal::Cancel);
+            });
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_with_rewrite(
+            Instant::now(),
+            hanging_upstream(vec![
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n",
+            ]),
+            Box::new(AnthropicStreamDecoder::new()),
+            Some(Box::new(AnthropicStreamEncoder::new())),
+            StreamTimeouts {
+                first_byte: Duration::from_millis(500),
+                idle: Duration::from_millis(500),
+            },
+            None,
+            None,
+            Some(StreamRestart {
+                control: control.clone(),
+                // 中断不该重试，这个闭包一次都不该被调用。
+                make: Box::new(|| Box::pin(async { None })),
+            }),
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+
+        let out = String::from_utf8_lossy(&run(body).await).to_string();
+        assert!(out.contains("event: error"), "客户端要收到明确的错误帧: {out}");
+        assert!(out.contains("已手动中断"), "错误帧里要说清是被手动结束的: {out}");
+        assert!(!out.contains("message_stop"), "error 之后不能再补终止帧: {out}");
+
+        let o = rx.await.unwrap();
+        assert!(o.aborted);
+        assert_eq!(o.error.as_deref(), Some("已手动中断"));
+    }
+
+    /// 已经往下游送过语义之后就不能再"重试"了 —— 再来一遍会在客户端那边
+    /// 出现第二条 `message_start`。这时按「中断」处理：直接结束这条流。
+    #[tokio::test]
+    async fn a_retry_after_content_started_ends_the_stream_instead() {
+        let control = Arc::new(RequestControl::new());
+        {
+            let control = control.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                control.request(RequestSignal::Retry);
+            });
+        }
+
+        let made = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = translate_stream_with_rewrite(
+            Instant::now(),
+            hanging_upstream(vec![
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\"}}\n\n",
+            ]),
+            Box::new(AnthropicStreamDecoder::new()),
+            None,
+            StreamTimeouts {
+                first_byte: Duration::from_millis(500),
+                idle: Duration::from_millis(500),
+            },
+            None,
+            None,
+            Some(StreamRestart {
+                control: control.clone(),
+                make: Box::new({
+                    let made = made.clone();
+                    move || {
+                        Box::pin(async move {
+                            made.store(true, std::sync::atomic::Ordering::SeqCst);
+                            None
+                        })
+                    }
+                }),
+            }),
+            move |o| {
+                let _ = tx.send(o);
+            },
+        );
+
+        let out = String::from_utf8_lossy(&run(body).await).to_string();
+        assert!(!made.load(std::sync::atomic::Ordering::SeqCst), "出过内容就不能再重试");
+        assert!(out.contains("message_start"), "已经发出去的内容不能少: {out}");
+
+        let o = rx.await.unwrap();
+        assert!(o.aborted);
+        assert_eq!(o.error.as_deref(), Some("已手动中断"));
     }
 }

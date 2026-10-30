@@ -798,6 +798,8 @@ export interface InflightRequest {
   frames: StreamFrame[];
   /** 补回来的这批不全（流的帧上限到了，或底账只留了最新的那些）。 */
   truncated?: boolean;
+  /** 这一条是「中断并重试」重放出来的哪一条。 */
+  retry_of?: string | null;
 }
 
 export interface Page<T> {
@@ -1743,6 +1745,16 @@ export const api = {
     call<RequestDetail>("get_request_detail", { requestId }),
   /** 查询当前正在进行的请求。进监控页时调用一次，补齐用户进页前已开始的请求。 */
   getInflightRequests: () => call<InflightRequest[]>("get_inflight_requests"),
+  /**
+   * 中断一条进行中的请求，`retry` 为真时顺带让它重跑一遍。
+   *
+   * 重试是**另起一条请求**（新 request_id、新日志行），旧的那条记 499
+   * 「已手动中断并重试」。客户端的连接不动 —— 它只是多等了一会儿。
+   *
+   * 返回 `false` 表示这条已经不在「进行中」里了（刚跑完），界面应当如实说明。
+   */
+  interruptInflightRequest: (requestId: string, retry: boolean) =>
+    call<boolean>("interrupt_inflight_request", { requestId, retry }),
   /** 清空请求明细与原文捕获。计费聚合不受影响。 */
   clearLogs: () => call<ClearResult>("clear_logs"),
   /** 删除单条请求明细及其原文捕获。计费聚合不受影响。 */

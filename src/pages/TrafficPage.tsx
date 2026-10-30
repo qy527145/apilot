@@ -312,6 +312,12 @@ export default function TrafficPage() {
   }, []);
 
   useApilotEvent("apilot://request-start", (p) => {
+    // 「中断并重试」会起一条**全新的请求**（新 request_id），旧的那条随即以
+    // 499 收尾。不跟过去的话，用户点完看到的是旧弹窗上写着"已结束"，还得
+    // 自己去列表里找新出来的那条 —— 那看起来就像"点了没反应"。
+    if (p.retry_of) {
+      setLiveStream((cur) => (cur === p.retry_of ? p.request_id : cur));
+    }
     setInflight((prev) => {
       const next = new Map(prev);
       pruneDone(next, Date.now());

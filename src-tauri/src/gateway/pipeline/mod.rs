@@ -213,6 +213,24 @@ pub(crate) async fn policy_model(
     model_policy::effective_model(policy, &ctx, &ShellModelEnv { has_channels })
 }
 
+/// 一次「中断并重试」留给下一轮的话。
+///
+/// 重试是**整条请求重来一遍**，不是在同一次请求里换个渠道继续 —— 后者要求把
+/// `Recorder` 的记账状态、`StreamContext`、编码器统统复用，而流式那条路上
+/// `Recorder` 早就交棒出去了。整条重来也顺带把「旧的一次」如实记成 499，
+/// 账单与监控里看得见它确实卡过一次。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RetryHint {
+    /// 这条链路上已经试过的渠道 tag。候选顺序会把它们排到最后：重试的全部
+    /// 意义就是「别再走这几条」。
+    ///
+    /// 是**累积的一串**而不是"上一次那个"：只记上一个的话，两条渠道会来回
+    /// 弹 —— A 卡住 → 跳过 A 走 B → B 卡住 → 跳过 B 走 A，第一轮卡过的又回来了。
+    pub(crate) skip_provider_tags: Vec<String>,
+    /// 上一轮的 `request_id`。前端正盯着那条弹窗，靠它把视图跟过来。
+    pub(crate) retry_of: Option<String>,
+}
+
 /// 处理一次网关请求。
 pub async fn handle(
     shell: Arc<AppShell>,
@@ -221,6 +239,60 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    handle_with(shell, protocol, path, headers, body, RetryHint::default()).await
+}
+
+/// 同上，外加「上一轮是怎么被中断的」。
+///
+/// 循环而不是递归：每次重试都是一次完整的 `handle_once`（新 `request_id`、
+/// 新日志、新「进行中」条目），但栈不该跟着涨 —— 用户连点十次不该多十层。
+/// 返回的是**装箱**的 future，不是 `async fn`。
+///
+/// 这一层必须把类型擦掉：流中途的重试会在 `try_outbound` 里再调一次本函数，
+/// 不装箱的话 Rust 推断 `Send` 时会绕回自己（`handle_with` → `try_outbound`
+/// → 装箱的 future → `handle_with`），这个环解不开，整个生成器就不再是 `Send`，
+/// `Body::from_stream` 直接拒收。
+pub(crate) fn handle_with(
+    shell: Arc<AppShell>,
+    protocol: Protocol,
+    path: String,
+    headers: HeaderMap,
+    body: Bytes,
+    mut hint: RetryHint,
+) -> futures::future::BoxFuture<'static, Response> {
+    Box::pin(async move {
+        loop {
+            match handle_once(
+                shell.clone(),
+                protocol,
+                path.clone(),
+                headers.clone(),
+                body.clone(),
+                hint,
+            )
+            .await
+            {
+                Ok(resp) => return resp,
+                // 只有用户又点了一次「中断并重试」才会走到这里。旧的那一轮已经
+                // 按 499 收过尾了，这一轮是全新的一条请求。
+                Err(next) => hint = next,
+            }
+        }
+    })
+}
+
+/// 一次完整的请求尝试。
+///
+/// 返回 `Err(hint)` 表示「这一轮被用户中止了，按 hint 再来一轮」—— 只有
+/// 候选渠道全试过之后才可能发生（点一次按钮只是换下一个候选）。
+pub(crate) async fn handle_once(
+    shell: Arc<AppShell>,
+    protocol: Protocol,
+    path: String,
+    headers: HeaderMap,
+    body: Bytes,
+    hint: RetryHint,
+) -> Result<Response, RetryHint> {
     let started = Instant::now();
     let _active = shell.traffic.begin_request();
 
@@ -276,7 +348,7 @@ pub async fn handle(
             // 否则这条日志的「模型」是空的，按模型筛也筛不到它。
             recorder.record.model = peek_model(&body);
             recorder.record.request_model = recorder.record.model.clone();
-            return fail_response(&mut recorder, protocol, 400, "请求解析失败", &e.to_string());
+            return Ok(fail_response(&mut recorder, protocol, 400, "请求解析失败", &e.to_string()));
         }
     };
 
@@ -321,7 +393,7 @@ pub async fn handle(
     let selector_tag = match outcome {
         RouteOutcome::Reject { reason, .. } => {
             shell.traffic.record_failure();
-            return fail_response(&mut recorder, protocol, 403, "请求被路由规则拒绝", &reason);
+            return Ok(fail_response(&mut recorder, protocol, 403, "请求被路由规则拒绝", &reason));
         }
         RouteOutcome::Final { selector, .. } => selector,
     };
@@ -394,7 +466,7 @@ pub async fn handle(
         None => {
             shell.traffic.record_failure();
             let msg = format!("selector「{selector_tag}」没有可用的渠道，请先在「路由」页配置");
-            return fail_response(&mut recorder, protocol, 503, "没有可用渠道", &msg);
+            return Ok(fail_response(&mut recorder, protocol, 503, "没有可用渠道", &msg));
         }
     };
 
@@ -406,7 +478,7 @@ pub async fn handle(
     if let Some(key) = &key {
         match shell.cache.get(&shell.db, key).await {
             Ok(Some(entry)) => {
-                return serve_from_cache(
+                return Ok(serve_from_cache(
                     shell,
                     protocol,
                     &req,
@@ -414,7 +486,7 @@ pub async fn handle(
                     recorder,
                     started,
                 )
-                .await;
+                .await);
             }
             Ok(None) => {}
             Err(e) => tracing::warn!("读缓存失败: {e}"),
@@ -422,7 +494,10 @@ pub async fn handle(
     }
 
     // ---- 5. 出站 ----
-    let candidates = build_candidates(&shell, &primary, &upstream_model, protocol).await;
+    let mut candidates = build_candidates(&shell, &primary, &upstream_model, protocol).await;
+    attempted_last(&mut candidates, |c| {
+        hint.skip_provider_tags.iter().any(|s| s == c.tag())
+    });
 
     // 监控页的「进行中」列表靠这一条进入。放在这里而不是请求最开始：
     // 此刻才既有生效模型、又有选定的渠道，而用户在意的正是"这一条在跑哪条路"。
@@ -446,9 +521,14 @@ pub async fn handle(
         is_stream: req.stream,
         session_id: recorder.record.session_id.clone(),
         thread_key: recorder.record.thread_key.clone(),
+        retry_of: hint.retry_of.clone(),
     };
     // 先写进行中快照，再广播事件：顺序保证前端任何时刻查询都不会漏掉刚进来的请求。
     shell.inflight.insert(started_payload.clone());
+    // 控制句柄挂在底账上，随 `remove` 一起消失。挂的时机只能是这里 ——
+    // 更早的话底账里还没有这一条，命令层也就查不到它。
+    let control = Arc::new(crate::traffic::control::RequestControl::new());
+    shell.inflight.attach_control(&started_payload.request_id, control.clone());
     shell.events.request_started(&started_payload);
 
     let mut last_error: Option<UpstreamError> = None;
@@ -473,11 +553,53 @@ pub async fn handle(
             // 到不了上游。代价是放弃直通（未建模字段会丢），这是脚本功能的
             // 明确取舍 —— 只在用户真的配了脚本且确实改动了请求时发生。
             rewritten_by_script,
+            &control,
         )
         .await
         {
-            Ok(resp) => return resp,
-            Err(e) => {
+            Ok(resp) => return Ok(resp),
+            // 用户点了按钮。**只有还在等响应头的那一段能被这样打断** ——
+            // 见 `try_outbound` 里那个 `select!`：一旦上游开始回字节，
+            // 打断就换成流里面的那一套（那边才能把新请求接到同一条下游流上）。
+            Err(outbound::OutboundOutcome::Interrupted(signal)) => {
+                match signal {
+                    // 只中断：这次请求就到此为止，回一个 499 让客户端知道是人为停的。
+                    crate::traffic::control::RequestSignal::Cancel => {
+                        shell.traffic.record_failure();
+                        return Ok(fail_response(
+                            &mut recorder,
+                            protocol,
+                            499,
+                            "请求已被手动中断",
+                            "用户在监控页手动中断了这条请求",
+                        ));
+                    }
+                    // 重试：还有候选就先换一条，别整条重来 —— 保住这次的记账与
+                    // 那个「进行中」条目，界面看起来才像"换了个渠道继续"。
+                    crate::traffic::control::RequestSignal::Retry if !is_last => {
+                        tracing::warn!(provider = outbound.tag(), "用户手动中断，换下一个渠道");
+                        continue;
+                    }
+                    crate::traffic::control::RequestSignal::Retry => {
+                        // 候选都试过了，整条请求重来。先把这一条按 499 记清，
+                        // 再把"试过哪些渠道"交给下一轮排序。
+                        let skip = control.attempted();
+                        tracing::warn!(
+                            skipped = ?skip,
+                            "用户手动中断并重试，整条请求重来"
+                        );
+                        // 不调 `record_failure`：这一条马上会被重试出来的新请求接上，
+                        // 记一笔失败只会让"失败率"看着比实际差。
+                        let retry_of = recorder.record.request_id.clone();
+                        recorder.fail(499, "已手动中断并重试");
+                        return Err(RetryHint {
+                            skip_provider_tags: skip,
+                            retry_of: Some(retry_of),
+                        });
+                    }
+                }
+            }
+            Err(outbound::OutboundOutcome::Failed(e)) => {
                 let retryable = e.is_retryable();
                 tracing::warn!(
                     provider = outbound.tag(),
@@ -509,7 +631,7 @@ pub async fn handle(
             let message = crate::gateway::errors::overflow_message(body);
             // 状态码仍按上游的原值透传（400 就回 400）：客户端对"超长"的判断
             // 是看报文，而用户与监控需要看到上游真正给的是哪个码。
-            return fail_response(&mut recorder, protocol, *status, "上下文超长", &message);
+            return Ok(fail_response(&mut recorder, protocol, *status, "上下文超长", &message));
         }
     }
 
@@ -518,7 +640,7 @@ pub async fn handle(
         .map(|e| e.to_string())
         .unwrap_or_else(|| "没有可用的上游渠道".to_string());
     let status = client_status_for(last_error.as_ref());
-    fail_response(&mut recorder, protocol, status, "上游请求失败", &err)
+    Ok(fail_response(&mut recorder, protocol, status, "上游请求失败", &err))
 }
 /// 请求体没读完整（客户端中途断开）时的收口。
 ///
@@ -739,6 +861,20 @@ pub async fn handle_raw(
     recorder.record.latency_ms = started.elapsed().as_millis() as i64;
     fail_raw_response(&mut recorder, 502, "上游请求失败", &err)
 }
+/// 把"已经试过"的候选挪到最后，其余保持原有顺序。
+///
+/// 重试的全部意义就是「别再走卡住的那条」。用**稳定**排序：模型策略与 selector
+/// 排出来的优先级在"没试过"的那几条里必须原样保留，否则一次重试就把用户配的
+/// 渠道偏好整个打乱了。
+///
+/// 全都试过时顺序不变 —— 无路可换，按原优先级再来一遍总比什么都不做强。
+fn attempted_last<T>(items: &mut [T], is_attempted: impl Fn(&T) -> bool) {
+    if !items.iter().any(&is_attempted) {
+        return;
+    }
+    items.sort_by_key(|c| is_attempted(c));
+}
+
 /// 从 body 里只取 `model` 一个字段。
 ///
 /// 非对话请求不解成 IR —— 那正是要避免的事。取不出来就返回空串，让路由按
@@ -860,6 +996,31 @@ mod tests {
     fn empty_client_header_falls_through() {
         let h = headers_with(&[("x-apilot-client", "")]);
         assert_eq!(detect_client(&h, "/v1/messages"), "claude-code");
+    }
+
+    #[test]
+    fn retrying_demotes_the_attempted_channel_and_keeps_the_rest_in_order() {
+        // 卡住的是 a：重试应当先走 b —— 打回 a 等于什么都没做。
+        let mut c = vec!["a", "b", "c"];
+        attempted_last(&mut c, |t| *t == "a");
+        assert_eq!(c, vec!["b", "c", "a"]);
+
+        // 两条都试过、还是不行：剩下那条原样排在最前，顺序不乱。
+        let mut c = vec!["a", "b", "c"];
+        attempted_last(&mut c, |t| *t == "a" || *t == "b");
+        assert_eq!(c, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn an_untouched_candidate_list_is_left_alone() {
+        let mut c = vec!["a", "b"];
+        attempted_last(&mut c, |_| false);
+        assert_eq!(c, vec!["a", "b"]);
+
+        // 全都试过（比如只有一条渠道）：顺序不变，原样再试一次。
+        let mut c = vec!["a", "b"];
+        attempted_last(&mut c, |_| true);
+        assert_eq!(c, vec!["a", "b"]);
     }
 
     #[test]

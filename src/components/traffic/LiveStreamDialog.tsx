@@ -6,7 +6,15 @@ import {
   useState,
   type UIEvent,
 } from "react";
-import { ArrowDownToLine, Loader2, Radio, SkipForward } from "lucide-react";
+import {
+  ArrowDownToLine,
+  Loader2,
+  Radio,
+  RotateCw,
+  SkipForward,
+  Square,
+} from "lucide-react";
+import { toast } from "sonner";
 
 import { CopyButton } from "@/components/common/CopyButton";
 import { StreamTimeline } from "@/components/traffic/StreamTimeline";
@@ -20,7 +28,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { PROTOCOL_LABEL, type Protocol } from "@/lib/api";
+import { api, PROTOCOL_LABEL, type Protocol } from "@/lib/api";
 import type { StreamFrame } from "@/lib/events";
 import { cn, formatMs, formatTime } from "@/lib/utils";
 
@@ -175,6 +183,41 @@ export function LiveStreamDialog({
   const blocks = useMemo(() => accumulate(frames), [frames]);
 
   /**
+   * 下游是否已经拿到了有语义的东西（`message_start` 或内容增量）。
+   *
+   * 这是「能不能重试」的判据，与后端的 `saw_delta` 是同一条：重来一遍会在
+   * 客户端那边出现第二条 `message_start`。拿 "帧数" 当判据不行 —— 上游的
+   * `event: ping` 也带 `data:`，会算成一帧却解不出任何增量，于是一条**只发
+   * 心跳**的卡死流恰好会被误判成"已经在出内容"，按钮反而不给。
+   */
+  const semanticStarted = useMemo(
+    () => frames.some((f) => f.deltas.length > 0),
+    [frames],
+  );
+
+  // 点下去到界面上看清结果之间隔着一个来回，没有它按钮会看起来"点了没反应"。
+  const [pending, setPending] = useState<"retry" | "cancel" | null>(null);
+  useEffect(() => {
+    setPending(null);
+  }, [live?.request_id, live?.done]);
+
+  const interrupt = async (retry: boolean) => {
+    if (!live) return;
+    setPending(retry ? "retry" : "cancel");
+    try {
+      const reached = await api.interruptInflightRequest(live.request_id, retry);
+      if (!reached) {
+        // 点的时候它其实已经跑完了 —— 如实说，别让按钮看起来像生效了。
+        toast.error("这条请求已经结束了");
+        setPending(null);
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+      setPending(null);
+    }
+  };
+
+  /**
    * 首帧到达前的等待计时。
    *
    * 这段时间界面只有一个转圈，用户无从判断已经等了 3 秒还是 30 秒 ——
@@ -281,6 +324,35 @@ export function LiveStreamDialog({
             )}
             {live && !live.done && <Badge variant="success">进行中</Badge>}
             {live?.truncated && <Badge variant="secondary">已截断</Badge>}
+            {live && !live.done && (
+              <Button
+                size="sm"
+                variant={semanticStarted ? "outline" : "default"}
+                className="ml-auto h-6 px-2 text-[11px]"
+                disabled={pending !== null}
+                title={
+                  semanticStarted
+                    ? "结束这条响应。内容已经发出去，重试会让客户端收到第二条 message_start"
+                    : "放弃这次上游请求，换一条渠道重新来过；客户端那边感觉只是慢了一点"
+                }
+                onClick={() => interrupt(!semanticStarted)}
+              >
+                {pending !== null ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : semanticStarted ? (
+                  <Square className="size-3" />
+                ) : (
+                  <RotateCw className="size-3" />
+                )}
+                {pending === "retry"
+                  ? "正在重试…"
+                  : pending === "cancel"
+                    ? "正在中断…"
+                    : semanticStarted
+                      ? "中断"
+                      : "中断并重试"}
+              </Button>
+            )}
             {live?.done && nextRequestId && onGoToNext && (
               <Button
                 size="sm"
@@ -367,6 +439,23 @@ export function LiveStreamDialog({
                     <p className="text-muted-foreground/70 text-[11px]">
                       首字从请求到达网关起算，结束后明细里的 TTFT 就是这段等待。
                     </p>
+                  )}
+                  {/* 用户盯着的就是这一块，按钮也放在这儿 —— 只在标题栏里，
+                      等得不耐烦的人还得先把视线挪上去。 */}
+                  {live && !live.done && !semanticStarted && (
+                    <Button
+                      size="sm"
+                      className="mt-1 h-7"
+                      disabled={pending !== null}
+                      onClick={() => interrupt(true)}
+                    >
+                      {pending === "retry" ? (
+                        <Loader2 className="size-3 animate-spin" />
+                      ) : (
+                        <RotateCw className="size-3" />
+                      )}
+                      {pending === "retry" ? "正在重试…" : "中断并重试"}
+                    </Button>
                   )}
                 </div>
               ) : (

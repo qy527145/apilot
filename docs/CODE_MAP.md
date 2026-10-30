@@ -529,6 +529,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 |---|---|
 | `mod.rs` | `TrafficStats`（并发守护 `ActiveRequest`、累计计数、TTFB 环形窗口）、`TrafficEvent` |
 | `events.rs` | `EventBus`（按类型推送 + 节流）、`Throttle`、`event_names` |
+| `control.rs` | **进行中的请求怎么被人工打断**：`RequestControl`（`AtomicU8` 信号 + `Notify`，外加「这条请求试过哪些渠道」）。挂在 `InflightStore` 的底账条目上，与请求同生共死；命令层 `commands/logs.rs::interrupt_inflight_request`。中断与重试是两件事：见 `gateway/pipeline/outbound.rs::try_outbound`（等响应头那一段）与 `gateway/stream.rs::StreamRestart`（已经开始出字节之后） |
 | `stream_events.rs` | **流式实时事件**：`StreamBatcher`（攒批 + 封顶 + 单帧截断，纯逻辑）、`StreamEmitter`（观察者实现，`Drop` 兜底断连）、`StreamDelta`（推流用的增量形态） |
 | `session.rs` | **请求归属到对话**：会话 ID 取客户端给的（Claude Code `x-claude-code-session-id` / Codex `session-id`，body 里各有兜底），**不按对话历史推断** —— 压缩会把历史整个改写，ID 不变。线 = system 提示稳定部分的指纹（**不含工具集合**：主线中途会多出工具）；`count_tokens` 等非对话请求归会话、不归线。`classify_threads`（带工具且请求最多的是主线）、`is_compaction`（同一条线消息数骤降） |
 | `log_filter.rs` | **监控页「自定义表达式」筛选的求值器**：QuickJS 里跑用户表达式，逐行判断要不要显示。线程本地引擎。**报文按需取用**：元数据里只放哨兵，表达式真读到才回调 Rust 解析；于是要走两趟 —— `probe`（只带元数据的探测趟，报出哪些行需要报文）与 `filter`（带真报文的终趟）。单行 1s / 整批 2s / 报文 64MB 预算，撞上批预算标 `truncated` 而不是报错。求值放在**后端**是因为日志分页、报文在 `captures` 另一张表 —— 前端只看得见当前页。内置对象与字段见 `expr_meta` |
