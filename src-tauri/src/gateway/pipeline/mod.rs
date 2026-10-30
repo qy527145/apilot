@@ -827,6 +827,7 @@ pub async fn handle_raw(
             &client_path,
             &meta.model,
             &mut recorder,
+            std::time::Duration::from_millis(shell.settings().request_timeout_ms.max(1_000)),
         )
         .await
         {

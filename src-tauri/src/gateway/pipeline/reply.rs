@@ -249,6 +249,7 @@ mod tests {
         // 连不上 / 超时 / 组建失败：上游什么都没说，502 才是实话。
         for e in [
             UpstreamError::Timeout,
+            UpstreamError::Deadline("等待上游响应头超时（120 秒）".into()),
             UpstreamError::Connect("refused".into()),
             UpstreamError::Build("bad".into()),
             UpstreamError::Io("broken".into()),

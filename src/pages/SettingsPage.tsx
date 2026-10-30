@@ -181,8 +181,24 @@ export default function SettingsPage() {
             <CardHeader>
               <CardTitle className="text-sm">超时（毫秒）</CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <CardContent className="space-y-4">
+              {/* 四个值按请求的生命周期排：发出去 → 响应头 → 第一个字节 → 之后每一段。
+                  分开列是因为中转站排队时卡在**第一步**，而那一格以前根本不存在。 */}
+              <p className="text-muted-foreground text-xs">
+                按请求的生命周期排：发出 → 响应头 → 第一个字节 → 之后每段之间。
+                「响应头超时」是上游收下请求却迟迟不给回应时的兜底，超时会换下一个候选渠道。
+              </p>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>响应头超时</Label>
+                  <Input
+                    type="number"
+                    value={form.headers_timeout_ms}
+                    onChange={(e) =>
+                      set("headers_timeout_ms", num(e.target.value))
+                    }
+                  />
+                </div>
                 <div className="space-y-2">
                   <Label>首字节超时</Label>
                   <Input

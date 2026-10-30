@@ -470,11 +470,21 @@ pub struct AppSettings {
     #[serde(default = "default_true_setting")]
     pub allow_browser_origins: bool,
 
-    /// 上游首字节超时：连接建立后多久没收到第一个字节就判失败。
+    /// 上游首字节超时：**拿到响应头之后**，多久没收到第一个字节就判失败。
     pub first_byte_timeout_ms: u64,
     /// 流式空闲超时：两个 chunk 之间允许的最大间隔。
     pub idle_timeout_ms: u64,
-    /// 非流式请求整体超时。
+    /// **等响应头**超时：请求发出去之后，多久还没拿到响应头就判失败。
+    ///
+    /// 必须单独有一项。上面那两个都从"拿到响应头"才起表，而中转站排队时
+    /// 恰恰是连响应头都不给 —— 那段时间只剩渠道自己的 `timeout_ms` 兜底，
+    /// 而它按分钟配、常常是几十分钟。表现就是实时视图里一个转圈转到天荒地老。
+    ///
+    /// 超时按 `UpstreamError::Timeout` 处理（可重试），因此会**自动换下一个候选
+    /// 渠道**；没有别的候选时把 502 回给客户端，由它自己重试 —— 比干等十分钟
+    /// 强得多。
+    pub headers_timeout_ms: u64,
+    /// 非流式请求整体超时：从发出到读完正文。
     pub request_timeout_ms: u64,
 
     /// 是否捕获并保留请求/响应原文。
@@ -718,6 +728,7 @@ impl Default for AppSettings {
 
             first_byte_timeout_ms: 60_000,
             idle_timeout_ms: 300_000,
+            headers_timeout_ms: 120_000,
             request_timeout_ms: 600_000,
 
             capture_enabled: true,
@@ -838,6 +849,7 @@ impl AppSettings {
         };
         self.first_byte_timeout_ms = self.first_byte_timeout_ms.clamp(1_000, 600_000);
         self.idle_timeout_ms = self.idle_timeout_ms.clamp(1_000, 3_600_000);
+        self.headers_timeout_ms = self.headers_timeout_ms.clamp(1_000, 600_000);
         self.request_timeout_ms = self.request_timeout_ms.clamp(1_000, 3_600_000);
         self.cache_max_entries = self.cache_max_entries.clamp(1, 100_000);
         self.capture_max_entries = self.capture_max_entries.clamp(1, 100_000);

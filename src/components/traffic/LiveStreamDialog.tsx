@@ -440,6 +440,14 @@ export function LiveStreamDialog({
                       首字从请求到达网关起算，结束后明细里的 TTFT 就是这段等待。
                     </p>
                   )}
+                  {/* 等过一阵子才说这句话：刚开就弹一段解释，正常 2~3 秒的
+                      请求会先闪一下这段字，反而像出了问题。 */}
+                  {waitedMs > 15_000 && (
+                    <p className="text-muted-foreground/80 max-w-md text-center text-[11px]">
+                      上游迟迟没有回应。多数情况是上游在排队 —— 中转站被打满时连响应头
+                      都要等几十秒，再等下去往往也不会更快。
+                    </p>
+                  )}
                   {/* 用户盯着的就是这一块，按钮也放在这儿 —— 只在标题栏里，
                       等得不耐烦的人还得先把视线挪上去。 */}
                   {live && !live.done && !semanticStarted && (

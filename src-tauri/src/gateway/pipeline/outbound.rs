@@ -43,6 +43,26 @@ impl From<UpstreamError> for OutboundOutcome {
     }
 }
 
+/// 给一次出站套上时限，超时归成 [`UpstreamError::Deadline`]（**可重试**，
+/// 于是候选循环会自动换下一条渠道）。
+///
+/// 为什么需要它：`dial` 只在 HTTP 客户端自己的 `timeout` 到点时才返回，
+/// 而那个值来自渠道的 `timeout_ms`（现场配的是 100 分钟）。中转站排队时
+/// 连响应头都不给，用户就看到实时视图里一个转圈转到天荒地老。
+async fn with_deadline<T>(
+    limit: std::time::Duration,
+    describe: &str,
+    fut: impl std::future::Future<Output = Result<T, UpstreamError>>,
+) -> Result<T, UpstreamError> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            let secs = limit.as_secs();
+            Err(UpstreamError::Deadline(format!("{describe}超时（{secs} 秒）")))
+        }
+    }
+}
+
 /// 发一次原样转发，返回**未经改写的**上游响应。
 ///
 /// 与 [`try_outbound`] 的区别全在"不做"上：不解码、不重编码、不按流处理、
@@ -56,6 +76,8 @@ pub(super) async fn forward_raw(
     client_path: &str,
     upstream_model: &str,
     recorder: &mut Recorder,
+    // 这类请求不分流式/非流式，一律按"非流式整体超时"管。
+    timeout: std::time::Duration,
 ) -> Result<Response, UpstreamError> {
     let wire = outbound.wire_for(Protocol::AnthropicMessages);
     recorder.record.protocol_out = wire.as_str().to_string();
@@ -83,7 +105,7 @@ pub(super) async fn forward_raw(
         c.upstream.body = Some(prepared.body.to_vec());
     }
 
-    let resp = outbound.dial(prepared).await?;
+    let resp = with_deadline(timeout, "非对话请求", outbound.dial(prepared)).await?;
 
     recorder.record.upstream_status = Some(resp.status.as_u16() as i32);
     if let Some(c) = recorder.capture.as_mut() {
@@ -222,6 +244,22 @@ pub(super) async fn try_outbound(
     // 放在 `dial` 这一处而不是包住整个 `try_outbound`：后面那半段里
     // `finish_buffered` 已经会把 `Recorder` 结账、把「进行中」摘掉，那时再
     // 撤销就成了幽灵——账记了、响应却被丢进垃圾桶。
+    // 等多久算"上游没反应"。
+    //
+    // 流式用 `headers_timeout_ms`：`dial` 在流式下拿到响应头就返回，量到的正是
+    // 上游排队那一段。非流式用 `request_timeout_ms`：那条路上 `dial` 会把正文
+    // 一起读完，这个值就是它的整体超时。两者的默认值相差五倍，正因为它们
+    // 计的不是同一件事。
+    let (limit_ms, describe) = {
+        let s = shell.settings();
+        if req.stream {
+            (s.headers_timeout_ms, "等待上游响应头")
+        } else {
+            (s.request_timeout_ms, "非流式请求整体")
+        }
+    };
+    let limit = std::time::Duration::from_millis(limit_ms.max(1_000));
+
     let resp = tokio::select! {
         biased;
         // 用户点了按钮就优先于"恰好同一刻拿到了响应头"：他要的是换条路，
@@ -232,7 +270,7 @@ pub(super) async fn try_outbound(
             let signal = control.take().unwrap_or(RequestSignal::Cancel);
             return Err(OutboundOutcome::Interrupted(signal));
         }
-        r = outbound.dial(prepared) => r?,
+        r = with_deadline(limit, describe, outbound.dial(prepared)) => r?,
     };
     let status = resp.status;
 
@@ -509,4 +547,39 @@ pub(super) async fn try_outbound(
     )
     .await
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_hung_dial_becomes_a_retryable_deadline_error() {
+        // 上游收下了请求却连响应头都不给 —— 中转站排队时就是这个形状。
+        // 以前它只能等渠道自己的 `timeout_ms`（现场配的是 100 分钟）。
+        let hung = futures::future::pending::<Result<u8, UpstreamError>>();
+        let err = with_deadline(Duration::from_millis(20), "等待上游响应头", hung)
+            .await
+            .expect_err("挂住的那次必须被掐掉");
+        assert!(err.is_retryable(), "超时要能触发换渠道: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("等待上游响应头") && msg.contains("秒"), "原因要写人话: {msg}");
+    }
+
+    #[tokio::test]
+    async fn a_fast_dial_passes_through_untouched() {
+        let limit = Duration::from_secs(5);
+        assert_eq!(
+            with_deadline(limit, "x", async { Ok::<_, UpstreamError>(7) }).await.unwrap(),
+            7
+        );
+        // 上游自己报的错原样交给调用方判定，不能被时限吞掉换成 Timeout。
+        let err = with_deadline(limit, "x", async {
+            Err::<(), _>(UpstreamError::Status { status: 429, body: "slow down".into() })
+        })
+        .await
+        .expect_err("上游的错要透出去");
+        assert!(matches!(err, UpstreamError::Status { status: 429, .. }), "被改写了: {err}");
+    }
 }

@@ -335,8 +335,12 @@ export interface AppSettings {
    * 关掉后跨源网页请求会被网关挡回去：任意页面都能向本机发请求、花掉渠道额度。
    */
   allow_browser_origins: boolean;
+  /** 等响应头的时限：请求发出到上游回响应头。超时会换下一个候选渠道。 */
+  headers_timeout_ms: number;
+  /** 拿到响应头之后，多久没收到第一个字节判失败。 */
   first_byte_timeout_ms: number;
   idle_timeout_ms: number;
+  /** 非流式请求从发出到读完正文的整体超时。 */
   request_timeout_ms: number;
   capture_enabled: boolean;
   capture_max_entries: number;

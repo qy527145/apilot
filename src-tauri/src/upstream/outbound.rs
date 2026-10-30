@@ -24,6 +24,14 @@ pub enum UpstreamError {
     #[error("上游超时")]
     Timeout,
 
+    /// 等太久：带上人话的原因，让日志和客户端都能看出卡在哪一步。
+    ///
+    /// 与 [`Self::Timeout`] 分开是因为两者的成因完全不同 —— `Timeout` 来自
+    /// HTTP 客户端自己（连接/读取超时），这一条是我们主动掐的，说明的是
+    /// "上游在规定时间内连个响都没有"。
+    #[error("{0}")]
+    Deadline(String),
+
     #[error("上游返回 {status}: {body}")]
     Status { status: u16, body: String },
 
@@ -40,7 +48,7 @@ impl UpstreamError {
     /// 4xx（除 429）是请求本身的问题，换渠道也是同样结果，重试只会浪费时间和配额。
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Connect(_) | Self::Timeout | Self::Io(_) => true,
+            Self::Connect(_) | Self::Timeout | Self::Deadline(_) | Self::Io(_) => true,
             Self::Status { status, .. } => *status >= 500 || *status == 429,
             Self::Build(_) => false,
         }
