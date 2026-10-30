@@ -137,7 +137,10 @@ export function SessionsView({
   }
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[300px_1fr]">
+    // 第二列用 `minmax(0,1fr)` 而不是 `1fr`：grid 子项的默认最小宽度是
+    // `auto`（= 内容宽度），时间线里那几列不换行的数字会把整页撑宽。窄窗口下
+    // 页面横向溢出之后，左侧 padding 会被滚出视野（见 PageShell 的 onScroll）。
+    <div className="grid gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
       <Card className="py-0">
         <div className="border-b p-2">
           <div className="relative">
@@ -289,7 +292,7 @@ function LiveTimelineRow({
           : "非流式请求要跑完才落库，在那之前没有可看的报文"
       }
       className={cn(
-        "grid w-full grid-cols-[96px_64px_minmax(150px,1fr)_52px_auto] items-center gap-3 px-3 py-2 text-left text-xs",
+        "grid w-full min-w-[720px] grid-cols-[96px_64px_minmax(150px,1fr)_52px_auto] items-center gap-3 px-3 py-2 text-left text-xs",
         r.is_stream ? "hover:bg-emerald-500/5" : "cursor-default",
         dim && "text-muted-foreground",
       )}
@@ -409,8 +412,10 @@ function Timeline({
   const entryOrder = shown.flatMap((row) => (row.kind === "entry" ? [row.e.request_id] : []));
 
   return (
-    <Card className="py-0">
-      <CardContent className="space-y-3 p-3">
+    // `min-w-0`：作为外层 grid 的第二列，它必须能缩到比内容更窄，
+    // 否则那几列数字会把整页撑出横向溢出。
+    <Card className="min-w-0 py-0">
+      <CardContent className="min-w-0 space-y-3 p-3">
         <div className="flex min-w-0 items-baseline gap-2">
           {q.data.title && <h2 className="truncate text-sm font-medium">{q.data.title}</h2>}
           <span className="text-muted-foreground shrink-0 font-mono text-xs" title={sessionId}>
@@ -478,7 +483,9 @@ function Timeline({
           </div>
         </div>
 
-        <div className="divide-y rounded-md border">
+        {/* 行本身有最小宽度（五列数字都不换行）。窗口窄时让**这张卡片内部**
+            横向滚动，而不是把整个页面撑宽 —— 后者会把左侧 padding 滚没。 */}
+        <div className="divide-y overflow-x-auto rounded-md border">
           {shown.map((row) =>
             row.kind === "live" ? (
               <LiveTimelineRow
@@ -532,7 +539,7 @@ function TimelineRow({
         type="button"
         onClick={onClick}
         className={cn(
-          "hover:bg-accent/50 grid w-full grid-cols-[96px_64px_minmax(150px,1fr)_52px_auto] items-center gap-3 px-3 py-2 text-left text-xs",
+          "hover:bg-accent/50 grid w-full min-w-[720px] grid-cols-[96px_64px_minmax(150px,1fr)_52px_auto] items-center gap-3 px-3 py-2 text-left text-xs",
           kind !== "main" && "text-muted-foreground",
         )}
       >

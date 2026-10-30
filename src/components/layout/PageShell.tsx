@@ -31,7 +31,17 @@ export function PageShell({
           </div>
         )}
       </header>
-      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-6">
+      <div
+        className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-6"
+        onScroll={(e) => {
+          // `overflow-x-hidden` 只是不显示滚动条，容器**仍然可以被横向滚动**。
+          // 内容比容器宽时（表格里那些不换行的数字列），某个宽元素一旦被聚焦，
+          // 浏览器会把它滚进视野 —— 左侧那圈 24px 的 padding 就这么"消失"了，
+          // 而且没有滚动条能拖回来。这里把横向位置钉死在 0。
+          const el = e.currentTarget;
+          if (el.scrollLeft !== 0) el.scrollLeft = 0;
+        }}
+      >
         {children}
       </div>
     </div>
