@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDown,
   ChevronRight,
+  Copy,
   Loader2,
   Pencil,
   Plus,
@@ -61,6 +62,8 @@ export default function ProvidersPage() {
   const qc = useQueryClient();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Provider | null>(null);
+  /** 复制来源：非空时对话框走「新建」，但表单预填它的全部配置。 */
+  const [copyFrom, setCopyFrom] = useState<Provider | null>(null);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [probes, setProbes] = useState<Record<number, ProbeResult | "loading">>({});
 
@@ -128,11 +131,20 @@ export default function ProvidersPage() {
 
   const openCreate = () => {
     setEditing(null);
+    setCopyFrom(null);
     setDialogOpen(true);
   };
 
   const openEdit = (p: Provider) => {
     setEditing(p);
+    setCopyFrom(null);
+    setDialogOpen(true);
+  };
+
+  const openCopy = (p: Provider) => {
+    // 复制走的是「新建」而不是「编辑」：id 必须为空，否则会把原渠道覆盖掉。
+    setEditing(null);
+    setCopyFrom(p);
     setDialogOpen(true);
   };
 
@@ -289,6 +301,20 @@ export default function ProvidersPage() {
                                 <Button
                                   variant="ghost"
                                   size="icon"
+                                  onClick={() => openCopy(p)}
+                                >
+                                  <Copy className="size-4" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                复制为新渠道（密钥需重新填写）
+                              </TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
                                   onClick={() => openEdit(p)}
                                 >
                                   <Pencil className="size-4" />
@@ -338,6 +364,7 @@ export default function ProvidersPage() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         provider={editing}
+        copyFrom={copyFrom}
       />
     </PageShell>
   );

@@ -190,9 +190,21 @@ interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   provider?: Provider | null;
+  /**
+   * 复制来源。非空时按「新建」处理（id 为空），但表单预填它除名称与密钥外的全部配置。
+   *
+   * 密钥预填不了：后端不回显它，这里手里根本没有。名称加后缀是为了让用户不用
+   * 先删掉原名再敲 —— 而且名称会生成内部 tag，同名也没问题（后端自动加序号）。
+   */
+  copyFrom?: Provider | null;
 }
 
-export function ProviderDialog({ open, onOpenChange, provider }: Props) {
+export function ProviderDialog({
+  open,
+  onOpenChange,
+  provider,
+  copyFrom,
+}: Props) {
   const qc = useQueryClient();
   const [form, setForm] = useState<FormState>(EMPTY);
   const [error, setError] = useState<string | null>(null);
@@ -204,13 +216,23 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
 
   useEffect(() => {
     if (open) {
-      setForm(provider ? toForm(provider) : EMPTY);
+      if (provider) {
+        setForm(toForm(provider));
+      } else if (copyFrom) {
+        setForm({
+          ...toForm(copyFrom),
+          name: `${copyFrom.name} 副本`,
+          api_key: "",
+        });
+      } else {
+        setForm(EMPTY);
+      }
       setError(null);
       // 关了再打开时旧结论必须清掉：base_url / 密钥可能已经换了，
       // 留着上一轮的徽标会让人以为那就是当前这个地址的检测结果。
       setDetections(null);
     }
-  }, [open, provider]);
+  }, [open, provider, copyFrom]);
 
   /**
    * 新建渠道后顺手把上游的模型列表拉回来声明上。
@@ -423,9 +445,13 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{provider ? "编辑渠道" : "新建渠道"}</DialogTitle>
+          <DialogTitle>
+            {provider ? "编辑渠道" : copyFrom ? "复制渠道" : "新建渠道"}
+          </DialogTitle>
           <DialogDescription>
-            上游 LLM 服务地址与鉴权方式。新建时会自动获取该渠道支持的模型。
+            {copyFrom
+              ? "已带上原渠道除密钥外的全部配置，填一把新密钥再保存即可。"
+              : "上游 LLM 服务地址与鉴权方式。新建时会自动获取该渠道支持的模型。"}
           </DialogDescription>
         </DialogHeader>
 
@@ -666,6 +692,11 @@ export function ProviderDialog({ open, onOpenChange, provider }: Props) {
               placeholder={provider ? "留空表示不修改" : "sk-..."}
               autoComplete="off"
             />
+            {copyFrom && (
+              <p className="text-muted-foreground text-xs">
+                原渠道的密钥不会带过来（它本就不回显），这里必须重新填写。
+              </p>
+            )}
           </div>
 
           <div className="grid grid-cols-3 gap-4">
