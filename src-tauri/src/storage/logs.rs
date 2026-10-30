@@ -1176,7 +1176,8 @@ fn parse_json(s: Option<String>) -> serde_json::Value {
 
 /// 把捕获表裁剪到 `max_entries` 条，保留最新的。
 ///
-/// 捕获含完整请求/响应体，是数据库增长的主要来源，必须定期裁。
+/// 捕获含完整请求/响应体，是数据库增长的主要来源，必须定期裁。这条是按**条数**
+/// 兜底；按**时间**的那条见 [`prune_captures_before`]，两把锁各管一头。
 pub async fn prune_captures(pool: &SqlitePool, max_entries: i64) -> AppResult<u64> {
     if max_entries <= 0 {
         return Ok(0);
@@ -1191,6 +1192,21 @@ pub async fn prune_captures(pool: &SqlitePool, max_entries: i64) -> AppResult<u6
     .await?;
     // 捕获是数据库体积的大头，删掉的页要真正还给文件系统，否则文件只增不减。
     // `incremental_vacuum` 只搬尾部空页，代价与删掉的数据量成正比，不是全库重建。
+    if r.rows_affected() > 0 {
+        db::reclaim_space(pool).await;
+    }
+    Ok(r.rows_affected())
+}
+
+/// 删掉 `ts < before_ts` 的捕获（按时间保留）。
+///
+/// 与 [`prune_captures`] 分开而不是塞进同一个函数：条数那条每请求都要跑，
+/// 时间这条由后台任务定期跑，混在一起会让每个请求都多算一次时间边界。
+pub async fn prune_captures_before(pool: &SqlitePool, before_ts: i64) -> AppResult<u64> {
+    let r = sqlx::query("DELETE FROM captures WHERE ts < ?1")
+        .bind(before_ts)
+        .execute(pool)
+        .await?;
     if r.rows_affected() > 0 {
         db::reclaim_space(pool).await;
     }
@@ -1965,6 +1981,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(prune_captures(&p, 0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_captures_before_drops_only_old_rows() {
+        let p = pool().await;
+        for (id, ts) in [("old", 1_000), ("new", 5_000)] {
+            save_capture(
+                &p,
+                &CaptureRecord {
+                    request_id: id.into(),
+                    ts,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(prune_captures_before(&p, 3_000).await.unwrap(), 1);
+
+        let left: Vec<String> = sqlx::query_scalar("SELECT request_id FROM captures ORDER BY ts")
+            .fetch_all(&p)
+            .await
+            .unwrap();
+        assert_eq!(left, vec!["new"]);
     }
 
     #[tokio::test]

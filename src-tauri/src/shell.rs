@@ -22,12 +22,6 @@ use crate::upstream::client;
 use crate::upstream::ProviderRegistry;
 use crate::util::now_ms;
 
-/// 请求明细日志的保留天数。
-///
-/// 聚合表（`usage_hourly`）只存小时级汇总，几乎不增长，长期保留；
-/// 明细表则会随使用无限膨胀，超过这个期限就清掉。
-const LOG_RETENTION_DAYS: i64 = 30;
-
 pub struct AppShell {
     pub db: SqlitePool,
     pub app: AppHandle,
@@ -189,16 +183,36 @@ impl AppShell {
                 // 每 10 分钟清理一次超期日志。明细表会随使用无限增长，
                 // 一个活跃的 Agent 每天就能产生上万行。
                 if ticks % 600 == 0 {
-                    let cutoff = crate::util::now_ms() - LOG_RETENTION_DAYS * 24 * 3600 * 1000;
-                    match crate::storage::logs::prune_logs(&shell.db, cutoff).await {
-                        Ok(n) if n > 0 => tracing::info!(removed = n, "已清理超期请求日志"),
+                    match shell.prune_history().await {
+                        Ok((logs, captures)) if logs + captures > 0 => {
+                            tracing::info!(logs, captures, "已清理超期请求日志与捕获")
+                        }
                         Ok(_) => {}
-                        Err(e) => tracing::warn!("清理请求日志失败: {e}"),
+                        Err(e) => tracing::warn!("清理超期请求日志失败: {e}"),
                     }
                     let _ = shell.cache.persist_counters(&shell.db).await;
                 }
             }
         });
+    }
+
+    /// 按 `log_retention_days` 清掉超期的请求明细与捕获原文。
+    ///
+    /// 聚合表（`usage_hourly`）不动：它是小时级汇总、几乎不增长，而且是计费口径的
+    /// 历史账目 —— 改保留期是不想让明细堆着，不是想把账单抹掉。
+    ///
+    /// 捕获跟着明细一起清：明细没了，那份原文在界面上已经点不进去，
+    /// 留着只占体积。
+    pub async fn prune_history(&self) -> AppResult<(u64, u64)> {
+        let days = self.settings().log_retention_days as i64;
+        // 0 = 不按时间清理，此时只剩 `capture_max_entries` 那条条数兜底。
+        if days <= 0 {
+            return Ok((0, 0));
+        }
+        let cutoff = now_ms() - days * 24 * 3600 * 1000;
+        let logs = crate::storage::logs::prune_logs(&self.db, cutoff).await?;
+        let captures = crate::storage::logs::prune_captures_before(&self.db, cutoff).await?;
+        Ok((logs, captures))
     }
 
     /// 把数据库里的 selector 载入内存，并恢复各自的当前选择。

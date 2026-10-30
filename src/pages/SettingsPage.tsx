@@ -316,7 +316,7 @@ export default function SettingsPage() {
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-sm">请求捕获</CardTitle>
+              <CardTitle className="text-sm">请求捕获与历史保留</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="flex items-center justify-between rounded-md border px-3 py-2">
@@ -331,17 +331,32 @@ export default function SettingsPage() {
                   onCheckedChange={(v) => set("capture_enabled", v)}
                 />
               </div>
-              <div className="space-y-2 sm:max-w-xs">
-                <Label>捕获保留条数</Label>
-                <Input
-                  type="number"
-                  value={form.capture_max_entries}
-                  onChange={(e) => set("capture_max_entries", num(e.target.value))}
-                />
-                <p className="text-muted-foreground text-xs">
-                  流式与非流式请求都受这个上限约束。正文按 zstd 压缩落库，
-                  压缩与解压都不在请求转发的热路径上；监控页可随时清空历史。
-                </p>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>捕获保留条数</Label>
+                  <Input
+                    type="number"
+                    value={form.capture_max_entries}
+                    onChange={(e) => set("capture_max_entries", num(e.target.value))}
+                  />
+                  <p className="text-muted-foreground text-xs">
+                    流式与非流式请求都受这个上限约束。正文按 zstd 压缩落库，
+                    压缩与解压都不在请求转发的热路径上；监控页可随时清空历史。
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label>明细保留天数</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    value={form.log_retention_days}
+                    onChange={(e) => set("log_retention_days", num(e.target.value))}
+                  />
+                  <p className="text-muted-foreground text-xs">
+                    请求明细与捕获原文都按它清理，改完立即生效；填 0 表示不按时间清理。
+                    与条数上限同时生效，谁先到算谁 —— 想只留最近一天，填 1 即可。
+                  </p>
+                </div>
               </div>
             </CardContent>
           </Card>

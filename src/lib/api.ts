@@ -344,6 +344,8 @@ export interface AppSettings {
   request_timeout_ms: number;
   capture_enabled: boolean;
   capture_max_entries: number;
+  /** 请求明细与捕获原文的保留天数；0 = 不按时间清理。 */
+  log_retention_days: number;
   cache_enabled: boolean;
   cache_ttl_secs: number;
   cache_max_entries: number;

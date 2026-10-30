@@ -345,6 +345,12 @@ fn default_true_setting() -> bool {
     true
 }
 
+/// 明细保留天数缺省值。取 30 是为了让老存档的行为保持不变 ——
+/// 引入这一项之前，明细本来就是这个固定期限。
+fn default_log_retention_days() -> u32 {
+    30
+}
+
 /// 修剪空白；空白串等同于没配。
 ///
 /// 界面上「留空 = 跟随全局」「保持原样」都会存成空串，那种值必须在入口处清掉 ——
@@ -491,6 +497,15 @@ pub struct AppSettings {
     pub capture_enabled: bool,
     /// 捕获记录保留条数上限。
     pub capture_max_entries: u32,
+    /// 请求明细与捕获原文的保留天数。`0` = 不按时间清理。
+    ///
+    /// 与 [`Self::capture_max_entries`] 是**两把锁，谁先到算谁**：条数上限管住
+    /// 活跃用户的数据库体积，天数管住「很久没请求、但也不想一直留着」的历史。
+    /// 捕获跟着明细一起清 —— 明细都过期了，只剩一份从列表里点不进去的原文没有意义。
+    ///
+    /// 默认 30 天，与引入这一项之前的固定值一致；想只留一天就填 1。
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
 
     pub cache_enabled: bool,
     pub cache_ttl_secs: u64,
@@ -733,6 +748,7 @@ impl Default for AppSettings {
 
             capture_enabled: true,
             capture_max_entries: 500,
+            log_retention_days: default_log_retention_days(),
 
             cache_enabled: false, // 默认关：缓存会改变语义，需用户显式开启
             cache_ttl_secs: 3600,
@@ -853,6 +869,8 @@ impl AppSettings {
         self.request_timeout_ms = self.request_timeout_ms.clamp(1_000, 3_600_000);
         self.cache_max_entries = self.cache_max_entries.clamp(1, 100_000);
         self.capture_max_entries = self.capture_max_entries.clamp(1, 100_000);
+        // 0 是合法值（不按时间清理），所以下界是 0 而不是 1。
+        self.log_retention_days = self.log_retention_days.min(3_650);
         self.model_policy = self.model_policy.normalized();
         self.proxy = self.proxy.normalized();
         self
@@ -1566,6 +1584,31 @@ mod tests {
         assert!(s.request_script.is_empty());
         assert!(s.response_script.is_empty());
         assert!(s.response_delta_script.is_empty());
+    }
+
+    #[test]
+    fn an_old_settings_file_keeps_the_30_day_retention() {
+        // `log_retention_days` 是后加的字段。老存档缺键时必须拿回当年的固定期限
+        // （30 天），而不是被 u32 的零值变成「永不清理」—— 那会让数据库重新无限长。
+        let old = r#"{"listen_port": 9999}"#;
+        let s: AppSettings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.log_retention_days, 30);
+
+        let one_day = AppSettings {
+            log_retention_days: 1,
+            ..Default::default()
+        };
+        assert_eq!(one_day.normalized().log_retention_days, 1);
+
+        let unlimited = AppSettings {
+            log_retention_days: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            unlimited.normalized().log_retention_days,
+            0,
+            "0 是合法的「不按时间清理」，不能被夹成 1"
+        );
     }
 
     #[test]

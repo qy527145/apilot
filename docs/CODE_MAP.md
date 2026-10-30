@@ -499,7 +499,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 | `providers.rs` | 渠道 CRUD、**`set_enabled`**（渠道页那枚启停开关：只改启用位，不走整份 `upsert`）、模型映射、**`candidate_channels`**（按每模型优先级排序，路由的候选来源）/ `candidates_for_model`（含停用渠道，模型页展示用）、**`set_model_candidates`**（跨渠道写，与 `set_models` 是同一张表的两个方向）、`has_declared_models`（接管前置条件） |
 | `routing.rs` | 路由规则 / selector / 兜底配置的读写；`ensure_default_selector` |
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
-| `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站 / **发给客户端的响应头**）；`query`（动态过滤：时间、客户端、模型、协议、状态、是否流式）、`get_detail`、`facets`（筛选下拉的候选值）、`clear_all`、`prune_captures` / `prune_logs`。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧。正文经 `pack.rs` 压缩，`payload_bytes` 记**解压后**大小（表达式筛选的读取预算按它算）；保留条数在**流式与非流式两条收尾**都执行 |
+| `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站 / **发给客户端的响应头**）；`query`（动态过滤：时间、客户端、模型、协议、状态、是否流式）、`get_detail`、`facets`（筛选下拉的候选值）、`clear_all`、`prune_captures`（条数）/ `prune_captures_before` + `prune_logs`（时间）。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧。正文经 `pack.rs` 压缩，`payload_bytes` 记**解压后**大小（表达式筛选的读取预算按它算）；保留条数在**流式与非流式两条收尾**都执行，保留天数由 `shell.rs::prune_history` 定期执行 |
 | `session_pins.rs` | 对话级模型固定的读写（`session_model_pins` 表）。判定在 `routing/session_pin.rs` |
 | `sessions.rs` | **按对话聚合**：`list`（会话列表，带标题，模型按首次出现保序）/ `timeline`（一个会话的全部请求 + 各条线 + 压缩点）/ `save_title`（写 `session_titles`，会话级一行；`TitleSource::Generated` 覆盖 `FirstLine`，同来源先到者说话）。标题的两个来源：客户端起标题任务的回复（`traffic/session.rs::parse_generated_title`）优先，取不到才用用户第一句话（`first_user_line`）。「主线 / 子代理 / 旁路」与「哪里压缩过」**查询时现算**，不落库 —— 要看整个会话才定得下来 |
 | `model_policies.rs` | 每模型的渠道选择策略读写。**没有行 = 交给 selector 与路由规则** |

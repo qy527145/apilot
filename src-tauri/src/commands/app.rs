@@ -62,6 +62,17 @@ pub async fn update_settings(
     // 换地址那条走下面的 rebind → `serve_on`，不归这里。
     reapply_after_policy_change(shell.inner(), &before, &next).await;
 
+    // 保留期改短了要立刻见效。后台清理 10 分钟才跑一次，用户改完马上看列表
+    // 发现旧数据还在，只会以为这个设置没生效。
+    if before.log_retention_days != next.log_retention_days {
+        let shell = shell.inner().clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = shell.prune_history().await {
+                tracing::warn!("按新保留期清理历史失败: {e}");
+            }
+        });
+    }
+
     // 监听地址变了要真的换过去 —— 以前只是存下来，网关照旧跑在老地址上，
     // 表现为"改了端口没反应"。
     //
