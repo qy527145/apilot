@@ -140,9 +140,14 @@ export function SessionsView({
     // 第二列用 `minmax(0,1fr)` 而不是 `1fr`：grid 子项的默认最小宽度是
     // `auto`（= 内容宽度），时间线里那几列不换行的数字会把整页撑宽。窄窗口下
     // 页面横向溢出之后，左侧 padding 会被滚出视野（见 PageShell 的 onScroll）。
-    <div className="grid gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
-      <Card className="py-0">
-        <div className="border-b p-2">
+    //
+    // 高度撑满 + 两栏各自滚动：左右两栏内容长短完全无关（左边的对话列表三项，
+    // 右边一条对话几百轮），交给页面一起滚就会出现「滚动左边，右边跟着跑」「想
+    // 看右边最新一轮，得先把左边滚到底」。窄屏（单列堆叠）不做这件事，那里只
+    // 有一栏，跟着页面滚才是对的。
+    <div className="grid gap-4 lg:min-h-0 lg:flex-1 lg:grid-cols-[300px_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]">
+      <Card className="py-0 lg:min-h-0 lg:overflow-hidden">
+        <div className="shrink-0 border-b p-2">
           <div className="relative">
             <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2" />
             <Input
@@ -153,7 +158,9 @@ export function SessionsView({
             />
           </div>
         </div>
-        <CardContent className="max-h-[calc(100vh-300px)] overflow-y-auto p-0">
+        {/* `overscroll-contain`：滚到头之后别把滚轮事件甩给外层页面 ——
+            两栏各自滚动时，那种「滚到底页面突然整体跳一下」最让人懵。 */}
+        <CardContent className="max-h-[calc(100vh-300px)] overflow-y-auto overscroll-contain p-0 lg:min-h-0 lg:max-h-none lg:flex-1">
           {visible.map((s) => (
             <SessionRow
               key={s.session_id}
@@ -414,15 +421,16 @@ function Timeline({
   return (
     // `min-w-0`：作为外层 grid 的第二列，它必须能缩到比内容更窄，
     // 否则那几列数字会把整页撑出横向溢出。
-    <Card className="min-w-0 py-0">
-      <CardContent className="min-w-0 space-y-3 p-3">
-        <div className="flex min-w-0 items-baseline gap-2">
+    // 纵向同理：`min-h-0` + 卡片内滚动，别让几百行把页面撑长。
+    <Card className="min-w-0 py-0 lg:min-h-0 lg:overflow-hidden">
+      <CardContent className="min-w-0 space-y-3 p-3 lg:flex lg:min-h-0 lg:flex-1 lg:flex-col">
+        <div className="flex min-w-0 shrink-0 items-baseline gap-2">
           {q.data.title && <h2 className="truncate text-sm font-medium">{q.data.title}</h2>}
           <span className="text-muted-foreground shrink-0 font-mono text-xs" title={sessionId}>
             #{shortSessionId(sessionId)}
           </span>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
           <Button
             size="sm"
             variant={thread === "all" ? "secondary" : "ghost"}
@@ -484,8 +492,10 @@ function Timeline({
         </div>
 
         {/* 行本身有最小宽度（五列数字都不换行）。窗口窄时让**这张卡片内部**
-            横向滚动，而不是把整个页面撑宽 —— 后者会把左侧 padding 滚没。 */}
-        <div className="divide-y overflow-x-auto rounded-md border">
+            横向滚动，而不是把整个页面撑宽 —— 后者会把左侧 padding 滚没。
+            纵向也一样：宽屏下时间线自己滚，几百轮的对话不会把整页拉到几万像素长，
+            左栏也不会跟着一起动。 */}
+        <div className="divide-y overflow-x-auto overscroll-contain rounded-md border lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
           {shown.map((row) =>
             row.kind === "live" ? (
               <LiveTimelineRow

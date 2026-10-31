@@ -540,8 +540,15 @@ export default function TrafficPage() {
         </div>
       }
     >
-      <div className="space-y-6">
-        <Card className="py-0">
+      {/* 对话视图撑满高度：左右两栏各自滚动，顶部的筛选条留在原处。
+          其它视图是普通长列表，跟着页面滚即可 —— 那条路也是「加载更多」的语义。 */}
+      <div
+        className={cn(
+          "flex flex-col gap-6",
+          view === "sessions" && "lg:h-full lg:min-h-0",
+        )}
+      >
+        <Card className="shrink-0 py-0">
           <CardContent className="space-y-3 p-3">
             {/* 高频筛选条件 */}
             <div className="flex flex-wrap items-center gap-3">
