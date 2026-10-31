@@ -184,10 +184,50 @@ export default function SettingsPage() {
             <CardContent className="space-y-4">
               {/* 四个值按请求的生命周期排：发出去 → 响应头 → 第一个字节 → 之后每一段。
                   分开列是因为中转站排队时卡在**第一步**，而那一格以前根本不存在。 */}
-              <p className="text-muted-foreground text-xs">
+              <p className="text-muted-foreground text-xs leading-relaxed">
                 按请求的生命周期排：发出 → 响应头 → 第一个字节 → 之后每段之间。
                 「响应头超时」是上游收下请求却迟迟不给回应时的兜底，超时会换下一个候选渠道。
               </p>
+              {/* 覆盖逻辑常被误解成"渠道和全局二选一"，实际是**两层同时生效、短的先到**。
+                  写成表格太占地方，逐项说明配一句总述足够。 */}
+              <div className="text-muted-foreground space-y-1 rounded-md border p-3 text-xs leading-relaxed">
+                <div>
+                  <span className="text-foreground font-medium">响应头超时</span>
+                  ：请求发出 → 收到响应头，只对<span className="text-foreground">流式</span>
+                  请求生效（非流式走下面的总超时）。到点按可重试失败处理，
+                  自动换下一个候选渠道；没有候选才回 502。
+                </div>
+                <div>
+                  <span className="text-foreground font-medium">首字节超时</span>
+                  ：收到响应头 → 流里第一个字节。只管流式，从拿到响应头才开始计时
+                  （等响应头那一段归上一项），免得把排队时间算两遍。
+                </div>
+                <div>
+                  <span className="text-foreground font-medium">空闲超时</span>
+                  ：流式里两个 chunk 之间允许的最大间隔。长回答正常输出时不会触发，
+                  只用来发现「上游还连着但已经不出字了」。
+                </div>
+                <div>
+                  <span className="text-foreground font-medium">请求总超时</span>
+                  ：非流式请求从发出到读完正文的整体时限；以及
+                  <code className="mx-1">/v1/messages/count_tokens</code>
+                  这类非对话接口的时限。流式回答不受它约束 —— 长回答靠上面两项守着。
+                </div>
+                <div className="pt-1">
+                  <span className="text-foreground font-medium">覆盖逻辑</span>
+                  ：渠道里另有一个「超时 (ms)」，它作用于该渠道
+                  <span className="text-foreground">所有</span>
+                  请求，且是客户端库的总时限（连响应体一起算，流式也不例外）。
+                  两层同时生效、<span className="text-foreground">谁先到算谁</span>
+                  ，也就是实际时限取两者中较小的那个：渠道超时不会盖掉这里，
+                  这里也不会放宽渠道那一层。所以看到「请求在整数秒被掐断」时，
+                  先看监控里的耗时，再对照这个渠道的超时。
+                </div>
+                <div className="pt-1">
+                  取值范围：响应头与首字节上限 10 分钟，空闲与总超时上限 60 分钟，
+                  低于 1 秒的按 1 秒存。
+                </div>
+              </div>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
                   <Label>响应头超时</Label>

@@ -91,7 +91,10 @@ const EMPTY: FormState = {
   paths: {},
   weight: "1",
   priority: "0",
-  timeout_ms: "60000",
+  // 600 秒与后端 `default_timeout()` 对齐。这里曾经是 60 秒，而 reqwest 的
+  // 请求超时是**总时限**（连响应体一起算），于是长回答一律在 60 秒被腰斩，
+  // 日志里还显示成「error decoding response body」，看起来像上游的锅。
+  timeout_ms: "600000",
   enabled: true,
   extra_headers: {},
   param_override: "",
@@ -430,7 +433,7 @@ export function ProviderDialog({
       weight: Number(form.weight) || 0,
       priority: Number(form.priority) || 0,
       enabled: form.enabled,
-      timeout_ms: Number(form.timeout_ms) || 60000,
+      timeout_ms: Number(form.timeout_ms) || 600000,
       proxy: {
         mode: form.proxy_mode,
         url: form.proxy_url.trim() ? form.proxy_url.trim() : null,
@@ -725,6 +728,17 @@ export function ProviderDialog({
               />
             </div>
           </div>
+          {/* 这一栏最容易被误解成"等连接的超时"。它是**总时限**：流式回答也算在里面，
+              配小了长回答会在整数秒被直接掐断（现象是监控里耗时清一色 60.0x 秒）。 */}
+          <p className="text-muted-foreground text-xs leading-relaxed">
+            本渠道一次请求的<span className="text-foreground font-medium">总时限</span>
+            ，从发出算到响应体读完 —— 流式回答的整个生成过程也算在内。
+            它不是「等连接」的超时：配成 60 秒，超过一分钟的回答就会被直接掐断。
+            与设置页那四个全局超时
+            <span className="text-foreground font-medium">同时生效、谁先到算谁</span>
+            ，所以别配得比「响应头超时 + 首字节超时 + 回答本身所需时间」还小。
+            默认 600 秒。
+          </p>
 
           <div className="space-y-2">
             <Label>额外请求头</Label>
