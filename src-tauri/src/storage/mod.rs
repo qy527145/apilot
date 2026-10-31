@@ -14,5 +14,6 @@ pub mod providers;
 pub mod routing;
 pub mod session_pins;
 pub mod sessions;
+pub mod tool_usage;
 
 pub use db::open;

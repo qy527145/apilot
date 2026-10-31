@@ -35,6 +35,19 @@
   --chart-3: oklch(0.398 0.07 227.392);
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
+  /*
+    工具调用分布页的分类色（按客户端上色）。
+
+    没有复用上面的 `--chart-*`：那五只在浅色下校验不过（亮度带、色盲可分度、
+    对比度都有失败项），而这一页要按客户端堆叠，颜色是唯一的第一识别通道。
+    这组按 OKLCH 的亮度带与最小色差重新挑过，`--tool-1` 蓝 / `--tool-2` 青绿 /
+    `--tool-3` 橙 / `--tool-4` 紫 / `--tool-5` 红，深浅两套各自独立校验。
+  */
+  --tool-1: #386be2;
+  --tool-2: #00896d;
+  --tool-3: #d06900;
+  --tool-4: #8845cb;
+  --tool-5: #d63150;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.205 0 0);
@@ -70,6 +83,12 @@
   --chart-3: oklch(0.769 0.188 70.08);
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
+  /* 工具分布的分类色 —— 深色是独立挑的一档，不是浅色那套的自动反转。 */
+  --tool-1: #4377f0;
+  --tool-2: #009a7b;
+  --tool-3: #d06900;
+  --tool-4: #9a58e0;
+  --tool-5: #e13c59;
   --sidebar: oklch(0.205 0 0);
   --sidebar-foreground: oklch(0.985 0 0);
   --sidebar-primary: oklch(0.488 0.243 264.376);
@@ -109,6 +128,11 @@
   --color-chart-3: var(--chart-3);
   --color-chart-4: var(--chart-4);
   --color-chart-5: var(--chart-5);
+  --color-tool-1: var(--tool-1);
+  --color-tool-2: var(--tool-2);
+  --color-tool-3: var(--tool-3);
+  --color-tool-4: var(--tool-4);
+  --color-tool-5: var(--tool-5);
   --color-sidebar: var(--sidebar);
   --color-sidebar-foreground: var(--sidebar-foreground);
   --color-sidebar-primary: var(--sidebar-primary);

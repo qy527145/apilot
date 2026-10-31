@@ -37,6 +37,17 @@ pub fn run() {
             let shell = tauri::async_runtime::block_on(AppShell::bootstrap(handle))?;
             app.manage(shell.clone());
 
+            // 工具统计上线之前就存在的捕获，一次性补进统计表（见函数注释）。
+            //
+            // 必须在网关启动**之前**跑完：那之后新请求会同时写捕获与内存缓冲，
+            // 回填再去看捕获就会把同一批调用计第二遍。函数自己带一次性标记，
+            // 后面的启动都是空转。
+            if let Err(e) = tauri::async_runtime::block_on(
+                crate::storage::tool_usage::backfill_from_captures(&shell.db),
+            ) {
+                tracing::warn!("工具统计回填失败: {e}");
+            }
+
             // 老库升级上来时价格表可能是空的；渠道默认 auto，这里在后台补一次。
             // 只在整个表为空时联网，成功之后不再触发（见函数注释）。
             let shell_for_prices = shell.clone();
@@ -138,6 +149,8 @@ pub fn run() {
             commands::billing::billing_summary,
             commands::billing::billing_totals,
             commands::billing::billing_timeseries,
+            // --- 工具调用统计 ---
+            commands::tools::tool_usage_report,
             // --- 缓存 ---
             commands::cache::cache_stats,
             commands::cache::clear_cache,

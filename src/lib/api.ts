@@ -593,6 +593,54 @@ export interface BillingSummary {
   p50_ttfb_ms?: number | null;
 }
 
+/* --------------------------- 工具调用统计 --------------------------- */
+
+/** 一行 (客户端, 工具) 的调用量。 */
+export interface ToolUsageCell {
+  client: string;
+  tool: string;
+  /** 调用次数：同一响应里调两次算两次。 */
+  calls: number;
+  /** 至少用过这个工具一次的响应条数，用来区分「高频」与「一次连发」。 */
+  requests: number;
+}
+
+/** 一个客户端的量，作为占比的分母。 */
+export interface ToolUsageClient {
+  client: string;
+  calls: number;
+  /** 区间内解出过内容的响应条数。 */
+  responses: number;
+  /** 其中带工具调用的条数。 */
+  tool_responses: number;
+}
+
+export interface ToolUsagePoint {
+  bucket_ts: number;
+  client: string;
+  calls: number;
+  responses: number;
+}
+
+/**
+ * 工具分布面板的全部数据。
+ *
+ * 一次取回而不是分几个命令：几块图看的是同一段时间，分开取会在刷新时短暂
+ * 对不上，用户会看到两块互相矛盾的数字。
+ */
+export interface ToolUsageReport {
+  total_calls: number;
+  /** 所有比例的分母：解出过内容的响应条数。 */
+  total_responses: number;
+  tool_responses: number;
+  tool_count: number;
+  clients: ToolUsageClient[];
+  /** 下拉候选值，**不受 `client` 筛选影响**。 */
+  available_clients: string[];
+  cells: ToolUsageCell[];
+  series: ToolUsagePoint[];
+}
+
 /* ------------------------------ 缓存 ------------------------------ */
 
 export interface CacheStats {
@@ -1696,6 +1744,19 @@ export const api = {
     call<BillingSummary>("billing_totals", { range }),
   billingTimeseries: (range: TimeRange) =>
     call<HourlyPoint[]>("billing_timeseries", { range }),
+
+  /* ---- tool usage ---- */
+  /**
+   * 工具调用分布。`client` 传空表示不限。
+   *
+   * 口径是**响应**里的工具调用，不是请求体里的历史 —— 详见后端
+   * `storage::tool_usage` 的模块注释。
+   */
+  toolUsageReport: (range: TimeRange, client?: string | null) =>
+    call<ToolUsageReport>("tool_usage_report", {
+      range,
+      client: client || null,
+    }),
 
   /* ---- cache ---- */
   cacheStats: () => call<CacheStats>("cache_stats"),

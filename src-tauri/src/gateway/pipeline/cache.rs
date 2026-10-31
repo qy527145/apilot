@@ -43,6 +43,15 @@ pub(super) async fn serve_from_cache(
 
     let usage = entry.usage.clone();
 
+    // 工具频率统计也要算上缓存命中。漏掉这一条，开了缓存之后面板上的数字会
+    // 成片掉下去（命中的请求照样把工具调用交给了客户端），而那看起来像功能坏了。
+    shell.tool_usage.record(
+        crate::util::now_ms(),
+        &recorder.record.client,
+        &recorder.record.model,
+        &crate::protocol::shared::tools::tool_call_names(&response.content),
+    );
+
     if req.stream {
         let encoder = shell.codecs.codec(protocol).new_stream_encoder();
         let shell_cb = shell.clone();

@@ -41,6 +41,28 @@ pub fn flatten_tool_result_text(content: &[ContentBlock]) -> String {
     out
 }
 
+/// 取出响应里模型发起的全部工具调用名（按出现顺序，可重复）。
+///
+/// 只给**工具频率统计**用，数的是响应、不是请求：Agent 每轮都会把全部历史
+/// 重发一遍，从请求里数会把同一个调用重复计 N 次。空名字要跳过 —— 流被中断时
+/// 累加器会留下一个还没拿到 `name` 的半截 `ToolUse`。
+///
+/// 名字原样返回，**不做跨客户端归一化**：`Bash` 与 `exec_command` 语义相近但
+/// 不等价，硬映射成一个名字只会让统计表变成一张谁都要重新解释的表。
+///
+/// 与 `gateway::pipeline::body_patch::count_tool_uses` 不是一回事：那个数的是
+/// **请求历史**里的调用，用于计费（一条请求里带了多少次工具调用）。两者口径
+/// 不同，别合并。
+pub fn tool_call_names(content: &[ContentBlock]) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { name, .. } if !name.is_empty() => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +97,54 @@ mod tests {
             data: "x".into(),
         }];
         assert_eq!(flatten_tool_result_text(&blocks), "[image]");
+    }
+
+    #[test]
+    fn tool_call_names_keeps_order_and_repeats() {
+        let content = vec![
+            ContentBlock::text("让我看看"),
+            ContentBlock::ToolUse {
+                id: "1".into(),
+                name: "Read".into(),
+                input: serde_json::json!({}),
+            },
+            ContentBlock::ToolUse {
+                id: "2".into(),
+                name: "Read".into(),
+                input: serde_json::json!({}),
+            },
+            ContentBlock::ToolUse {
+                id: "3".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
+            },
+        ];
+        // 并行读文件是常态：同名工具要出现两次，不能去重成调用次数。
+        assert_eq!(tool_call_names(&content), vec!["Read", "Read", "Bash"]);
+    }
+
+    #[test]
+    fn tool_call_names_skips_empty_names_and_other_blocks() {
+        let content = vec![
+            ContentBlock::ToolUse {
+                id: "1".into(),
+                name: String::new(),
+                input: serde_json::json!({}),
+            },
+            ContentBlock::Thinking {
+                text: "想了想".into(),
+                signature: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "1".into(),
+                content: vec![ContentBlock::text("ok")],
+                is_error: false,
+            },
+        ];
+        assert!(
+            tool_call_names(&content).is_empty(),
+            "流被中断时留下的空名调用不该计成一个工具"
+        );
     }
 
 }

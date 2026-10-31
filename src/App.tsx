@@ -27,6 +27,7 @@ import ModelsPage from "@/pages/ModelsPage";
 import SamplesPage from "@/pages/SamplesPage";
 import RoutingPage from "@/pages/RoutingPage";
 import TrafficPage from "@/pages/TrafficPage";
+import ToolsPage from "@/pages/ToolsPage";
 import BillingPage from "@/pages/BillingPage";
 import CachePage from "@/pages/CachePage";
 import SettingsPage from "@/pages/SettingsPage";
@@ -109,6 +110,7 @@ function Shell() {
         {view === "samples" && <SamplesPage />}
         {view === "routing" && <RoutingPage />}
         {view === "traffic" && <TrafficPage />}
+        {view === "tools" && <ToolsPage />}
         {view === "billing" && <BillingPage />}
         {view === "cache" && <CachePage />}
         {view === "settings" && <SettingsPage />}

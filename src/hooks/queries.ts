@@ -29,6 +29,8 @@ export const qk = {
   billingTotals: (key: string) => ["billing_totals", key] as const,
   billingSummary: (key: string) => ["billing_summary", key] as const,
   billingSeries: (key: string) => ["billing_series", key] as const,
+  /** 工具调用分布。键里带客户端筛选，切换筛选就是另一个查询。 */
+  toolUsage: (key: string) => ["tool_usage", key] as const,
   fingerprintLibrary: ["fingerprint_library"] as const,
   fingerprintChallenges: ["fingerprint_challenges"] as const,
   fingerprintDetections: ["fingerprint_detections"] as const,

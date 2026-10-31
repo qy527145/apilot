@@ -151,6 +151,16 @@ pub(super) async fn finish_buffered(
         .count() as u32;
     let breakdown = BillingEngine::settle(&usage, &price, tool_calls);
 
+    // 工具频率统计：与非流式同一口径 —— 数**响应**里的调用，不数请求历史。
+    // 放在改写脚本之前：脚本改的是「给客户端看什么」，不是"模型做了什么"，
+    // 而这次响应确实调过这些工具是客观事实。
+    shell.tool_usage.record(
+        crate::util::now_ms(),
+        &recorder.record.client,
+        &recorder.record.model,
+        &crate::protocol::shared::tools::tool_call_names(&decoded.content),
+    );
+
     recorder.record.quota = breakdown.total_quota;
     recorder.record.saved_quota = breakdown.cache_saved_quota;
 

@@ -10,6 +10,7 @@ import {
   MonitorSmartphone,
   Server,
   Settings,
+  Wrench,
 } from "lucide-react";
 
 export type ViewKey =
@@ -20,6 +21,7 @@ export type ViewKey =
   | "samples"
   | "routing"
   | "traffic"
+  | "tools"
   | "billing"
   | "cache"
   | "settings";
@@ -73,6 +75,12 @@ export const NAV_ITEMS: NavItem[] = [
     label: "监控",
     icon: Activity,
     description: "实时请求流与明细",
+  },
+  {
+    key: "tools",
+    label: "工具分布",
+    icon: Wrench,
+    description: "各 harness 调用了哪些工具",
   },
   {
     key: "billing",

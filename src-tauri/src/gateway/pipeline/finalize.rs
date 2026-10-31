@@ -107,6 +107,21 @@ pub(super) fn finalize_stream(
 
     let breakdown = BillingEngine::settle(&outcome.usage, &price, tool_calls);
 
+    // 工具频率统计：数**响应**里模型发起的调用。
+    // `outcome.content` 由 `ContentAccumulator` 从增量重建，同协议直通时也照样跑，
+    // 所以这条路上不用额外解码。
+    //
+    // 只记跑完的流：中断或上游断流时，工具调用可能只收到了半截（名字有了、
+    // 入参还没拼完），把它计进频率会把「用户按了 Esc」表现成「模型很爱调这个工具」。
+    if outcome.error.is_none() {
+        shell.tool_usage.record(
+            crate::util::now_ms(),
+            &client,
+            &model,
+            &crate::protocol::shared::tools::tool_call_names(&outcome.content),
+        );
+    }
+
     tauri::async_runtime::spawn(async move {
         // 流式结果只有拿到完整内容才值得缓存 —— 中断的流缓存下来会永远返回残缺答案。
         if cacheable && outcome.error.is_none() && !outcome.content.is_empty() {

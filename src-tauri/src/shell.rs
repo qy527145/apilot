@@ -36,6 +36,8 @@ pub struct AppShell {
     pub pricing: Arc<ArcSwap<crate::billing::PricingTable>>,
     pub cache: Arc<ResponseCache>,
     pub aggregates: Arc<AggregateBuffer>,
+    /// 工具调用频率统计的内存缓冲。与 `aggregates` 同一个 flush 节奏，见 `spawn_background_tasks`。
+    pub tool_usage: Arc<crate::storage::tool_usage::ToolUsageBuffer>,
     pub traffic: Arc<TrafficStats>,
     pub inflight: Arc<InflightStore>,
     pub events: Arc<EventBus>,
@@ -123,6 +125,7 @@ impl AppShell {
             pricing,
             cache,
             aggregates: Arc::new(AggregateBuffer::new()),
+            tool_usage: Arc::new(crate::storage::tool_usage::ToolUsageBuffer::new()),
             traffic: Arc::new(TrafficStats::new()),
             inflight: Arc::new(crate::traffic::InflightStore::new()),
             events: Arc::new(EventBus::new(app)),
@@ -171,6 +174,11 @@ impl AppShell {
                 if ticks % 10 == 0 {
                     if let Err(e) = shell.aggregates.flush(&shell.db).await {
                         tracing::warn!("聚合落库失败: {e}");
+                    }
+                    // 与用量聚合同频：两者都是旁路统计，分开落库只多一次唤醒。
+                    // 漏了它的话，工具面板每重启一次就丢掉最后 10 秒的数据。
+                    if let Err(e) = shell.tool_usage.flush(&shell.db).await {
+                        tracing::warn!("工具统计落库失败: {e}");
                     }
                     if let Err(e) = shell.cache.persist_counters(&shell.db).await {
                         tracing::warn!("缓存计数落库失败: {e}");
@@ -347,6 +355,9 @@ impl AppShell {
     pub async fn shutdown(&self) {
         if let Err(e) = self.aggregates.flush(&self.db).await {
             tracing::warn!("退出时刷新聚合失败: {e}");
+        }
+        if let Err(e) = self.tool_usage.flush(&self.db).await {
+            tracing::warn!("退出时刷新工具统计失败: {e}");
         }
         if let Err(e) = self.cache.persist_counters(&self.db).await {
             tracing::warn!("退出时刷新缓存计数失败: {e}");

@@ -548,6 +548,41 @@ CREATE INDEX IF NOT EXISTS idx_fingerprint_samples_label
 CREATE INDEX IF NOT EXISTS idx_fingerprint_samples_created
   ON fingerprint_samples(created_at);
 "#,
+    // --- v18: 工具调用频率统计 ---
+    //
+    // 与 `usage_hourly` 并列而不是加列：一张表按 (小时, 客户端, 模型, 工具名)
+    // 聚合，维度完全不同，塞进同一张表会让「按模型汇总」变成对一张宽表的扫描。
+    //
+    // 数的是**响应里模型发起的调用**，不是请求体里的历史。Agent 每一轮都会把
+    // 全部历史重发一遍，按请求数会把第 1 轮的调用重复计 N 次，频率曲线于是变成
+    // 越聊越高的假象。
+    r#"
+CREATE TABLE IF NOT EXISTS tool_usage_hourly (
+  bucket_ts INTEGER NOT NULL,
+  client    TEXT NOT NULL,
+  model     TEXT NOT NULL,
+  tool      TEXT NOT NULL,
+  calls     INTEGER NOT NULL DEFAULT 0,
+  requests  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket_ts, client, model, tool)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_bucket ON tool_usage_hourly(bucket_ts DESC);
+
+-- 分母：这段时间里有多少条响应、其中多少条带了工具。
+--
+-- 没有它就只能看到绝对次数，「每次响应平均调用几次」「多少比例的回答在动手」
+-- 都算不出来；而绝对次数会随流量漂移，跨客户端对比时尤其误导。
+CREATE TABLE IF NOT EXISTS tool_usage_totals (
+  bucket_ts      INTEGER NOT NULL,
+  client         TEXT NOT NULL,
+  model          TEXT NOT NULL,
+  responses      INTEGER NOT NULL DEFAULT 0,
+  tool_responses INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket_ts, client, model)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_totals_bucket
+  ON tool_usage_totals(bucket_ts DESC);
+"#,
 ];
 
 /// 当前 schema 版本 = 迁移条数。
@@ -559,7 +594,7 @@ mod tests {
 
     #[test]
     fn migrations_are_non_empty() {
-        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(SCHEMA_VERSION, 18);
         assert!(!MIGRATIONS[0].trim().is_empty());
     }
 
