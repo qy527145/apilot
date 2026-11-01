@@ -1111,7 +1111,7 @@ pub async fn get_detail(pool: &SqlitePool, request_id: &str) -> AppResult<Option
 /// 三个指标里的 TTFT 就是 `ttfb_ms`；ITL 与 TPS 由这里的两个量推出 —— 单条详情
 /// 用它算，聚合表也用它累加，**口径只此一处**：同一个模型在详情弹窗与统计页
 /// 不会给出两个数。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeedSample {
     /// 首个可解析事件耗时（毫秒），即 TTFT。落库列名沿用 `ttfb_ms`，
     /// 口径见 `StreamOutcome::ttft`。
@@ -1167,6 +1167,22 @@ pub fn speed_sample(
         decode_ms,
         output_tokens,
     })
+}
+
+/// [`speed_sample`] 的日志行版本。
+///
+/// 聚合缓冲与对话链路都要从一行 `RequestLogRecord` 里取样本，字段名念三遍
+/// 不如念一遍 —— 更要紧的是"哪些请求算样本"只有这一处判据，两个入口不会
+/// 各自写歪（非流式、缓存命中、失败这三种最容易被漏掉）。
+pub fn speed_sample_of(rec: &RequestLogRecord) -> Option<SpeedSample> {
+    speed_sample(
+        rec.is_stream,
+        rec.cache_hit,
+        rec.status_code,
+        rec.latency_ms,
+        rec.ttfb_ms,
+        rec.output_tokens,
+    )
 }
 
 fn parse_json(s: Option<String>) -> serde_json::Value {

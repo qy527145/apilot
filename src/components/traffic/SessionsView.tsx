@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FoldVertical, ListFilter, MessagesSquare, Pin, PinOff, Search, SortAsc, SortDesc } from "lucide-react";
 import { toast } from "sonner";
@@ -16,11 +16,21 @@ import {
   type PinScope,
   type SessionPin,
   type SessionSummary,
+  type SpeedSample,
   type ThreadKind,
   type ThreadSummary,
   type TimelineEntry,
 } from "@/lib/api";
-import { cn, formatMs, formatNumber, formatTime, quotaToUsd, shortSessionId } from "@/lib/utils";
+import {
+  cn,
+  formatMs,
+  formatNumber,
+  formatTime,
+  formatTps,
+  quotaToUsd,
+  shortSessionId,
+  speedAverages,
+} from "@/lib/utils";
 
 const KIND_LABEL: Record<ThreadKind, string> = {
   main: "主线",
@@ -35,6 +45,58 @@ const KIND_HINT: Record<ThreadKind, string> = {
   title: "客户端给对话起标题的请求。Apilot 对它强制关思考，并从回复里取标题",
   side: "不带工具的一次性任务：hook 求值、摘要",
 };
+
+/**
+ * 时间线的一级类目。
+ *
+ * 除了「哪条线」之外还有两类**不是线**的东西：`count` 是压根没有归属的请求
+ * （count_tokens 给出各种工具子集，不落在任何线上），`error` 横跨所有线。
+ * 把它们塞进某一类都不对 —— 用户找的是"这个对话里失败了哪些"，而不是
+ * "主线失没失败"。
+ */
+type Cat = "all" | ThreadKind | "count" | "error";
+
+const CAT_LABEL: Record<Cat, string> = {
+  all: "全部",
+  main: "主线",
+  agent: "子代理",
+  title: "标题",
+  side: "旁路",
+  count: "计数",
+  error: "错误",
+};
+
+const CAT_HINT: Record<Cat, string> = {
+  all: "这个对话里的全部请求",
+  count: "count_tokens 这类不是对话一轮的请求：在时间上属于这个对话，但不属于任何一条线",
+  error: "所有失败的请求（状态码 ≥ 400），横跨全部线 —— 排查时就该只看这些",
+  main: KIND_HINT.main,
+  agent: KIND_HINT.agent,
+  title: KIND_HINT.title,
+  side: KIND_HINT.side,
+};
+
+/** 一类目下要摆出来的一级芯片，顺序固定：先"全部"，再按线，最后计数与错误。 */
+const CAT_ORDER: Cat[] = ["all", "main", "agent", "title", "side", "count", "error"];
+
+/** 某一类线（主线 / 子代理 / 标题 / 旁路）里的全部线。 */
+function subThreadsOf(threads: ThreadSummary[], kind: ThreadKind): ThreadSummary[] {
+  return threads.filter((t) => t.kind === kind);
+}
+
+/** 一条请求属于哪个类目。`error` 优先于线：失败的请求落在哪个类目里都该被看见。 */
+function inCat(cat: Cat, threadKey: string | null | undefined, kind: ThreadKind | null, statusCode?: number): boolean {
+  switch (cat) {
+    case "all":
+      return true;
+    case "error":
+      return (statusCode ?? 0) >= 400;
+    case "count":
+      return !threadKey;
+    default:
+      return threadKey != null && kind === cat;
+  }
+}
 
 /** 一条线的名字：类别 + 同类里的序号（主线只有一条，不编号）。 */
 function threadLabels(threads: ThreadSummary[]): Map<string, string> {
@@ -362,7 +424,10 @@ function Timeline({
   onOpenRequest: (id: string, order: string[]) => void;
   onFilterRequests: (sessionId: string) => void;
 }) {
-  const [thread, setThread] = useState<string | "all">("all");
+  const [cat, setCat] = useState<Cat>("all");
+  // 类目之内再选一条具体的线（子代理常有好几条）。`null` = 这一类全都要。
+  // 换类目时必须清掉它：留着上个子代理的 key，新类目会一行都不剩。
+  const [thread, setThread] = useState<string | null>(null);
   // 默认最新在前：一条对话几百轮，想看的几乎总是"刚刚发生了什么"。
   const [newestFirst, setNewestFirst] = useState(true);
   const q = useQuery({
@@ -389,9 +454,37 @@ function Timeline({
   }
   if (q.isError || !q.data) return <ErrorState onRetry={() => q.refetch()} />;
 
-  const entries = q.data.entries.filter((e) =>
-    thread === "all" ? true : e.thread_key === thread,
-  );
+  // 每类各有多少条。计数与错误把**所有**请求都算一遍：错误的请求同时属于它
+  // 那条线，两类芯片里都该出现 —— 那正是为了"从线的视角"和"从失败的视角"
+  // 都能找到它。
+  const counts = useMemo(() => {
+    const c: Record<Cat, number> = { all: 0, main: 0, agent: 0, title: 0, side: 0, count: 0, error: 0 };
+    for (const e of q.data?.entries ?? []) {
+      const kind = e.thread_key ? kindOf.get(e.thread_key) ?? null : null;
+      c.all += 1;
+      if (!e.thread_key) c.count += 1;
+      if (e.status_code >= 400) c.error += 1;
+      if (kind) c[kind] += 1;
+    }
+    return c;
+  }, [q.data, kindOf]);
+
+  // 当前类目下、要摆在二级芯片里的线。主线和标题各只有一条，摆出来只是噪音；
+  // 子代理与旁路可能有好几条，那时才需要"是哪一条"。压缩次数挂在对应的线上。
+  const subThreads = useMemo(() => {
+    if (cat === "all" || cat === "count" || cat === "error") return [];
+    return (q.data?.threads ?? []).filter((t) => t.kind === cat);
+  }, [q.data, cat]);
+
+  // 选中的那条线被重新分类/消失了（3 秒一刷，可能随时变），回落到整个类目，
+  // 而不是给出一块空白。
+  const threadHere = subThreads.some((t) => t.thread_key === thread) ? thread : null;
+
+  const entries = q.data.entries.filter((e) => {
+    const kind = e.thread_key ? kindOf.get(e.thread_key) ?? null : null;
+    if (!inCat(cat, e.thread_key, kind, e.status_code)) return false;
+    return threadHere === null || e.thread_key === threadHere;
+  });
   // 「换了模型」只在同一条线里比：主线后面插一条起标题的旁路，模型不同是常态，
   // 拿相邻两行比会满屏都是假的「换模型」。不属于线的请求（count_tokens）不参与。
   const prevModelOf = new Map<string, string | null>();
@@ -403,11 +496,13 @@ function Timeline({
       if (e.model) last.set(e.thread_key, e.model);
     }
   }
-  const otherCount = q.data.entries.filter((e) => e.thread_key === null).length;
-  // 正在进行的请求按线的归属筛（和上面一样：不属于任何线的只在「全部」里出现）。
-  // 它们的起点天然晚于已落库的那些，所以并进来之后自己就排在最新那一头。
+  // 正在进行的请求跟着同一套筛选走。它们的起点天然晚于已落库的那些，所以并进来
+  // 之后自己就排在最新那一头。「错误」类目里看不到它们 —— 还没结束，没有状态码。
   const liveHere = live.filter(
-    (r) => r.session_id === sessionId && (thread === "all" || r.thread_key === thread),
+    (r) =>
+      r.session_id === sessionId &&
+      inCat(cat, r.thread_key, r.thread_key ? kindOf.get(r.thread_key) ?? null : null) &&
+      (threadHere === null || r.thread_key === threadHere),
   );
   const rows: Row[] = [
     ...entries.map((e) => ({ kind: "entry" as const, e })),
@@ -433,41 +528,30 @@ function Timeline({
           </span>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <Button
-            size="sm"
-            variant={thread === "all" ? "secondary" : "ghost"}
-            className="h-7"
-            onClick={() => setThread("all")}
-          >
-            全部
-            <span className="text-muted-foreground tabular-nums">· {q.data.entries.length}</span>
-          </Button>
-          {q.data.threads.map((t) => (
+          {CAT_ORDER.filter((c) => c === "all" || counts[c] > 0).map((c) => (
             <Button
-              key={t.thread_key}
+              key={c}
               size="sm"
-              variant={thread === t.thread_key ? "secondary" : "ghost"}
+              variant={cat === c ? "secondary" : "ghost"}
               className="h-7"
-              title={KIND_HINT[t.kind]}
-              onClick={() => setThread(t.thread_key)}
+              title={CAT_HINT[c]}
+              onClick={() => {
+                setCat(c);
+                setThread(null);
+              }}
             >
-              {labels.get(t.thread_key)}
-              <span className="text-muted-foreground tabular-nums">· {t.requests}</span>
-              {t.compactions > 0 && (
-                <span className="text-amber-500" title={`压缩过 ${t.compactions} 次`}>
-                  · 压缩 {t.compactions}
-                </span>
-              )}
+              {CAT_LABEL[c]}
+              <span className="text-muted-foreground tabular-nums">· {counts[c]}</span>
+              {/* 「压缩过几次」是主线上的一个事实，不是一个类目：挂着它，别另起一个
+                  「压缩」芯片 —— 压缩点本来就在时间线上有横幅。 */}
+              {c === "main" &&
+                (subThreadsOf(q.data.threads, "main")[0]?.compactions ?? 0) > 0 && (
+                  <span className="text-amber-500" title={`压缩过 ${subThreadsOf(q.data.threads, "main")[0].compactions} 次`}>
+                    · 压缩 {subThreadsOf(q.data.threads, "main")[0].compactions}
+                  </span>
+                )}
             </Button>
           ))}
-          {otherCount > 0 && (
-            <span
-              className="text-muted-foreground text-xs"
-              title="count_tokens 这类不是对话一轮的请求：在「全部」里按时间出现，但不属于任何一条线"
-            >
-              + {otherCount} 次计数等请求
-            </span>
-          )}
           <div className="ml-auto flex min-w-0 items-center gap-2">
           <Button
             size="sm"
@@ -492,6 +576,42 @@ function Timeline({
           </Button>
           </div>
         </div>
+
+        {/* 二级芯片：这个类目下不止一条线时才出现（子代理常有五六条）。
+            只摆一条线的类目（主线、标题）摆出来只是噪音。 */}
+        {subThreads.length > 1 && (
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant={threadHere === null ? "secondary" : "ghost"}
+              className="h-6 text-[11px]"
+              onClick={() => setThread(null)}
+            >
+              {CAT_LABEL[cat]}全部
+              <span className="text-muted-foreground tabular-nums">· {counts[cat]}</span>
+            </Button>
+            {subThreads.map((t) => (
+              <Button
+                key={t.thread_key}
+                size="sm"
+                variant={threadHere === t.thread_key ? "secondary" : "ghost"}
+                className="h-6 text-[11px]"
+                title={`${formatTime(t.first_ts)} → ${formatTime(t.last_ts)}`}
+                onClick={() => setThread(t.thread_key)}
+              >
+                {labels.get(t.thread_key)}
+                <span className="text-muted-foreground tabular-nums">· {t.requests}</span>
+                {t.compactions > 0 && (
+                  <span className="text-amber-500" title={`压缩过 ${t.compactions} 次`}>
+                    · 压缩 {t.compactions}
+                  </span>
+                )}
+              </Button>
+            ))}
+          </div>
+        )}
+
+        <SessionStats entries={entries} scope={threadHere ? labels.get(threadHere) ?? CAT_LABEL[cat] : CAT_LABEL[cat]} />
 
         {/* 行本身有最小宽度（五列数字都不换行）。窗口窄时让**这张卡片内部**
             横向滚动，而不是把整个页面撑宽 —— 后者会把左侧 padding 滚没。
@@ -521,6 +641,92 @@ function Timeline({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * 当前筛选下这一批请求的汇总。
+ *
+ * 只统计**已落库**的请求：进行中的那几条还没有 token 与耗时，混进来会把
+ * 平均值往零拉。它们本来就在时间线上单独标着「进行中」。
+ *
+ * 耗时中位数只在**成功**的请求里取：失败常常是上游几百毫秒就回个 4xx，
+ * 把它算进去会让"这个对话有多快"整体看起来很好。
+ */
+function SessionStats({ entries, scope }: { entries: TimelineEntry[]; scope: string }) {
+  const stats = useMemo(() => {
+    let input = 0;
+    let cacheRead = 0;
+    let output = 0;
+    let quota = 0;
+    let errors = 0;
+    const samples: SpeedSample[] = [];
+    const okLatency: number[] = [];
+    for (const e of entries) {
+      input += e.input_tokens;
+      cacheRead += e.cache_read_tokens;
+      output += e.output_tokens;
+      quota += e.quota;
+      if (e.status_code >= 400) errors += 1;
+      else okLatency.push(e.latency_ms);
+      if (e.sample) samples.push(e.sample);
+    }
+    okLatency.sort((a, b) => a - b);
+    const p50 = okLatency.length > 0 ? okLatency[Math.floor(okLatency.length / 2)] : null;
+    return {
+      input,
+      cacheRead,
+      output,
+      quota,
+      errors,
+      p50,
+      sampleCount: samples.length,
+      ...speedAverages(samples),
+    };
+  }, [entries]);
+
+  // 没有 TTFT / ITL 可算时三格都显示「—」。原因写进悬停：全是非流式、或是
+  // 缓存命中，用户看到三个横杠时最容易以为是坏了。
+  const speedHint =
+    stats.sampleCount > 0
+      ? `${stats.sampleCount} 条流式样本（流式、成功、未命中本地缓存）`
+      : "这个筛选下没有可比的流式样本：非流式、缓存命中与失败的请求算不出吐字速度";
+
+  return (
+    <div className="bg-muted/40 flex shrink-0 flex-wrap items-baseline gap-x-4 gap-y-1 rounded-md border px-3 py-1.5 text-xs">
+      <span className="text-muted-foreground">{scope}</span>
+      <Stat label="请求" value={formatNumber(entries.length)} hint={`共 ${formatNumber(entries.length)} 条`} />
+      {stats.errors > 0 && (
+        <Stat
+          label="失败"
+          value={<span className="text-destructive">{formatNumber(stats.errors)}</span>}
+          hint="状态码 ≥ 400 的请求"
+        />
+      )}
+      <Stat
+        label="输入 / 缓存读 / 输出"
+        value={`${formatNumber(stats.input)}${stats.cacheRead > 0 ? ` +${formatNumber(stats.cacheRead)}` : ""} / ${formatNumber(stats.output)}`}
+        hint="输入不含缓存；+ 后面是上游提示缓存的读取量"
+      />
+      <Stat label="花费" value={quotaToUsd(stats.quota)} hint="按各条请求的倍率结算后相加" />
+      <Stat
+        label="耗时中位数"
+        value={stats.p50 === null ? "—" : formatMs(stats.p50)}
+        hint="只取成功的请求：失败的请求常常几百毫秒就回 4xx，会把中位数拉低"
+      />
+      <Stat label="平均 TTFT" value={formatMs(stats.avgTtftMs)} hint={`首 token 耗时。${speedHint}`} />
+      <Stat label="平均 ITL" value={formatMs(stats.avgItlMs)} hint={`相邻 token 的平均间隔。${speedHint}`} />
+      <Stat label="平均 TPS" value={formatTps(stats.avgTps)} hint={`输出速度，按 token 数加权。${speedHint}`} />
+    </div>
+  );
+}
+
+function Stat({ label, value, hint }: { label: string; value: ReactNode; hint: string }) {
+  return (
+    <span className="flex items-baseline gap-1.5" title={hint}>
+      <span className="text-muted-foreground">{label}</span>
+      <span className="font-medium tabular-nums">{value}</span>
+    </span>
   );
 }
 

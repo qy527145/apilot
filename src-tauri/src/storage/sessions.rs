@@ -196,6 +196,12 @@ pub struct TimelineEntry {
     pub cache_read_tokens: i64,
     pub quota: i64,
     pub latency_ms: i64,
+    /// 这条请求提供的观感样本（流式 + 成功 + 非缓存命中）。取不出来是 `None`。
+    ///
+    /// 对话汇总的平均 TTFT / ITL / TPS 由前端把这些**分子分母**相加再一次相除，
+    /// 而不是后端先算逐条的平均再相加 —— 后者会让只吐 3 个 token 的请求和吐
+    /// 3000 个的等权。`None` 与 0 必须分开：0 会被读成"有数据且极快"。
+    pub sample: Option<crate::storage::logs::SpeedSample>,
     /// 这条请求相对同一条线的上一条，消息数骤降 —— 上下文在这之前被压缩过。
     pub compacted: bool,
     /// 压缩前那一条带了多少轮。只在 `compacted` 时有值。
@@ -233,7 +239,7 @@ pub async fn timeline(pool: &SqlitePool, session_id: &str) -> AppResult<SessionT
     let rows = sqlx::query(
         "SELECT request_id, ts, thread_key, model, request_model, path, \
                 status_code, error_message, message_count, has_tools, input_tokens, output_tokens, \
-                cache_read_tokens, quota, latency_ms, \
+                cache_read_tokens, quota, latency_ms, is_stream, cache_hit, ttfb_ms, \
                 CASE WHEN json_valid(other) THEN json_extract(other, '$.session_pin.from') END AS pinned_from, \
                 CASE WHEN json_valid(other) THEN json_extract(other, '$.title_request') END AS title_request \
          FROM request_logs WHERE session_id = ?1 ORDER BY ts ASC, request_id ASC",
@@ -297,6 +303,14 @@ pub async fn timeline(pool: &SqlitePool, session_id: &str) -> AppResult<SessionT
             cache_read_tokens: r.get("cache_read_tokens"),
             quota: r.get("quota"),
             latency_ms: r.get("latency_ms"),
+            sample: crate::storage::logs::speed_sample(
+                r.get::<i64, _>("is_stream") != 0,
+                r.get::<i64, _>("cache_hit") != 0,
+                status_code,
+                r.get("latency_ms"),
+                r.get("ttfb_ms"),
+                r.get::<i64, _>("output_tokens").max(0) as u64,
+            ),
             compacted,
             compacted_from,
             pinned_from: r.get("pinned_from"),
@@ -553,5 +567,45 @@ mod tests {
         let t = timeline(&pool, "S").await.unwrap();
         assert!(t.entries[1].compacted, "残缺请求自己相对上一条确实骤降，要标出来");
         assert!(!t.entries[2].compacted, "但它不能成为下一条的基线");
+    }
+
+    /// 灌一条能出观感样本的流式请求：总耗时 1000ms，首事件在 200ms，吐了 9 个 token。
+    fn streamed(id: &str, n: i64) -> RequestLogRecord {
+        RequestLogRecord {
+            is_stream: true,
+            latency_ms: 1000,
+            ttfb_ms: Some(200),
+            output_tokens: 9,
+            ..rec(id, n, "S", "main", n, true, "m")
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_requests_carry_a_speed_sample() {
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        seed(&pool, &[streamed("1", 1)]).await;
+
+        let s = timeline(&pool, "S").await.unwrap().entries[0].sample.expect("流式成功就该有样本");
+        assert_eq!(s.ttft_ms, 200);
+        assert_eq!(s.decode_ms, 800, "解码窗口是总耗时减首个事件");
+        assert_eq!(s.output_tokens, 9);
+    }
+
+    #[tokio::test]
+    async fn requests_without_a_comparable_generation_have_no_sample() {
+        // 三种请求都不该进平均值：非流式（没有可分窗口）、缓存命中（重放时间）、
+        // 失败（没吐完）。混进去会把汇总的 TTFT / ITL 拉偏，而界面上看不出来。
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        let non_stream = RequestLogRecord { latency_ms: 900, ttfb_ms: Some(900), ..rec("2", 2, "S", "main", 2, true, "m") };
+        let cached = RequestLogRecord { cache_hit: true, ..streamed("3", 3) };
+        let failed = RequestLogRecord { status_code: 500, ..streamed("4", 4) };
+        seed(&pool, &[streamed("1", 1), non_stream, cached, failed]).await;
+
+        let t = timeline(&pool, "S").await.unwrap();
+        let sample = |id: &str| t.entries.iter().find(|e| e.request_id == id).unwrap().sample;
+        assert!(sample("1").is_some());
+        assert_eq!(sample("2"), None, "非流式的首字节就是全文");
+        assert_eq!(sample("3"), None, "缓存命中与生成速度无关");
+        assert_eq!(sample("4"), None, "失败的请求没把 token 吐完");
     }
 }

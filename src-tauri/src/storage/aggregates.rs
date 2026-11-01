@@ -123,14 +123,7 @@ impl AggregateBuffer {
         // 观感指标只累加分子分母，不累加平均值。样本的判定与详情弹窗共用
         // `logs::speed_sample` —— 两处各写一遍的话，同一个模型在详情与统计页
         // 会给出两个数（非流式、缓存命中、失败的请求口径最容易被写歪）。
-        if let Some(s) = logs::speed_sample(
-            rec.is_stream,
-            rec.cache_hit,
-            rec.status_code,
-            rec.latency_ms,
-            rec.ttfb_ms,
-            rec.output_tokens,
-        ) {
+        if let Some(s) = logs::speed_sample_of(rec) {
             row.sample_requests += 1;
             row.ttfb_sum_ms += s.ttft_ms;
             row.decode_ms_sum += s.decode_ms;

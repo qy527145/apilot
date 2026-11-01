@@ -795,6 +795,22 @@ export interface ThreadSummary {
   compactions: number;
 }
 
+/**
+ * 一条请求提供的观感样本。口径见后端 `storage/logs.rs::speed_sample`。
+ *
+ * 只对**流式 + 成功 + 没命中本地缓存 + 量得出解码窗口**的请求有值 —— 其余请求
+ * 拿不出可比的生成过程（非流式的首字节就是全文，缓存命中的耗时是重放）。
+ * `null` 与 0 必须分开：0 会被读成「有数据且极快」。
+ */
+export interface SpeedSample {
+  /** 首个可解析事件耗时（毫秒），即 TTFT。 */
+  ttft_ms: number;
+  /** 解码窗口（毫秒）= 总耗时 - 首个事件，恒为正。 */
+  decode_ms: number;
+  /** 这段窗口里吐出的 token 数。 */
+  output_tokens: number;
+}
+
 export interface TimelineEntry {
   request_id: string;
   ts: number;
@@ -811,6 +827,8 @@ export interface TimelineEntry {
   cache_read_tokens: number;
   quota: number;
   latency_ms: number;
+  /** 这条请求能不能进汇总的平均 TTFT / ITL / TPS。取不出来是 `null`。见 [`SpeedSample`]。 */
+  sample?: SpeedSample | null;
   /** 相对同一条线的上一条，消息数骤降 —— 在这之前上下文被压缩过。 */
   compacted: boolean;
   compacted_from?: number | null;

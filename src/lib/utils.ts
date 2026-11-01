@@ -1,6 +1,8 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
+import type { SpeedSample } from "@/lib/api";
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
@@ -33,6 +35,39 @@ export function formatMs(n: number | null | undefined): string {
 export function formatTps(n: number | null | undefined): string {
   if (n === null || n === undefined || !Number.isFinite(n)) return "—";
   return `${n.toFixed(1)} tok/s`;
+}
+
+/**
+ * 由一批观感样本算三个平均值：`(平均 TTFT, 平均 ITL, 平均 TPS)`。
+ *
+ * 与后端 `storage/aggregates.rs::speed_averages` **同一个口径**，改一处就得改另一处：
+ *
+ * - 先相加再相除，不逐条求平均 —— 平均速度该按 token 数加权，否则一个只吐 3 个
+ *   token 的请求会跟一个吐 3000 个的等权，均值被前者拖垮。
+ * - ITL 的分母是 Σ(tokens − 1)：每个请求的第一个 token 不是"间隔"；样本里可能有
+ *   一个 token 都没吐的请求，这个差值会落到零或负数。
+ * - 没有样本时三项都是 null，界面显示「—」而不是 0。
+ */
+export function speedAverages(samples: SpeedSample[]): {
+  avgTtftMs: number | null;
+  avgItlMs: number | null;
+  avgTps: number | null;
+} {
+  if (samples.length === 0) return { avgTtftMs: null, avgItlMs: null, avgTps: null };
+  let ttft = 0;
+  let decodeMs = 0;
+  let tokens = 0;
+  for (const s of samples) {
+    ttft += s.ttft_ms;
+    decodeMs += s.decode_ms;
+    tokens += s.output_tokens;
+  }
+  const intervals = tokens - samples.length;
+  return {
+    avgTtftMs: ttft / samples.length,
+    avgItlMs: intervals > 0 ? decodeMs / intervals : null,
+    avgTps: tokens > 0 ? (tokens * 1000) / decodeMs : null,
+  };
 }
 
 export function formatTime(ts: number | null | undefined): string {
