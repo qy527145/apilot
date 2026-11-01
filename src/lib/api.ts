@@ -857,10 +857,10 @@ export interface InflightRequest {
 }
 
 /**
- * 一条进行中请求的入站报文。
+ * 一条请求的入站报文（实时视图的「请求」页签用）。
  *
- * 与 `RequestDetail` 分开：那条读数据库，而进行中的请求**还没落库**。这里取的是
- * 跟着请求一起存在内存里的那份，请求一结束就没了 —— 之后去明细里看落库的那份。
+ * 与 `RequestDetail` 分开：进行中的请求**还没落库**，那份从内存里取；结束之后
+ * 接着读数据库里落库的捕获。两处都没有才返回 `null`。
  */
 export interface InflightRequestDetail {
   request_id: string;
@@ -871,6 +871,8 @@ export interface InflightRequestDetail {
   body?: string | null;
   /** 用入站协议解出来的 IR。解不出来时 `value` 为空、`error` 写原因。 */
   view?: DecodedRequest | null;
+  /** `live` = 还在跑，内存里那份；`detail` = 已落库的捕获。 */
+  source: "live" | "detail";
 }
 
 export interface Page<T> {

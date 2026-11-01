@@ -157,11 +157,12 @@ pub async fn get_inflight_requests(
     Ok(shell.inflight.snapshot())
 }
 
-/// 一条进行中请求的入站报文，供实时视图的「请求」页签展示。
+/// 一条请求的入站报文，供实时视图的「请求」页签展示。
 ///
-/// 与 `get_request_detail` 分开：那条读数据库，而进行中的请求**还没有落库**，
-/// 查不到。这里取的是底账里跟着请求存的那份内存副本，请求一结束就没了 ——
-/// 之后要看就去明细里看落库的那份。
+/// 名字里还带 `inflight` 是因为入口在实时视图，但它**不只在「进行中」时才有**：
+/// 请求一结束，内存里那份随底账撤掉，这里接着读数据库里落库的那份。用户从实时
+/// 视图点进「请求」页签，看到的应当是"这次请求发了什么"，而不是"这条已经结束，
+/// 去明细分页里自己找" —— 何况流刚结束时那行日志可能还没写完。
 #[derive(Debug, Clone, Serialize)]
 pub struct InflightRequestDetail {
     pub request_id: String,
@@ -175,35 +176,61 @@ pub struct InflightRequestDetail {
     /// 用入站协议解出来的 IR。解不出来时 `value` 为空、`error` 写原因，
     /// 界面据此退回「原始」。整个为 null 表示根本没有报文。
     pub view: Option<crate::protocol::inspect::DecodedRequest>,
+    /// 这份报文从哪来：`live` = 还在跑，内存里的；`detail` = 已落库的捕获。
+    ///
+    /// 界面据此说明"这是落库那份"，也让"没抓到"与"请求还没写完"能分开讲。
+    pub source: String,
 }
 
-/// 取一条进行中请求的入站报文。不在「进行中」里（刚跑完或早就结束）返回 `None`。
+/// 取一条请求的入站报文。先在「进行中」底账里找，找不到就落到数据库的捕获。
+///
+/// 两处都没有（捕获被关掉 / 已被裁剪 / 这条压根不存在）才返回 `None`。
 #[tauri::command]
 pub async fn get_inflight_request(
     shell: State<'_, Arc<AppShell>>,
     request_id: String,
 ) -> AppResult<Option<InflightRequestDetail>> {
-    let Some(snap) = shell.inflight.request_snapshot(&request_id) else {
+    if let Some(snap) = shell.inflight.request_snapshot(&request_id) {
+        let body = snap
+            .body
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let view = crate::protocol::inspect::decode_request_text(
+            &shell.codecs,
+            &snap.protocol,
+            body.as_deref(),
+        );
+        return Ok(Some(InflightRequestDetail {
+            request_id,
+            method: snap.method,
+            path: snap.path,
+            protocol: snap.protocol,
+            headers: snap.headers,
+            body,
+            view,
+            source: "live".into(),
+        }));
+    }
+
+    // 已经结束：读落库那份。这里只取入站一侧，不必解上游 / 响应那几份报文 ——
+    // 实时视图的「响应」页签看的是流本身，历史报文属于明细弹窗。
+    let Some(detail) = crate::storage::logs::get_detail(&shell.db, &request_id).await? else {
         return Ok(None);
     };
-    let body = snap
-        .body
-        .as_deref()
-        .map(|b| String::from_utf8_lossy(b).into_owned());
     let view = crate::protocol::inspect::decode_request_text(
         &shell.codecs,
-        &snap.protocol,
-        body.as_deref(),
+        &detail.protocol_in,
+        detail.request_body.as_deref(),
     );
-
     Ok(Some(InflightRequestDetail {
         request_id,
-        method: snap.method,
-        path: snap.path,
-        protocol: snap.protocol,
-        headers: snap.headers,
-        body,
+        method: detail.method,
+        path: detail.path,
+        protocol: detail.protocol_in,
+        headers: detail.request_headers,
+        body: detail.request_body,
         view,
+        source: "detail".into(),
     }))
 }
 

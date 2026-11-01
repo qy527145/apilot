@@ -177,6 +177,14 @@ export function LiveStreamDialog({
   // 用 null 表示"跟随最新"，用序号表示"固定在某帧"。
   // 不用 frames[frames.length-1] 作默认值，避免每帧都触发 raw 面板重渲染。
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
+  /**
+   * 「响应」页签的两种看法：折叠后的内容块，还是某一帧的原始 SSE。
+   *
+   * 默认看内容块 —— 打开实时视图的人多半是想知道"它现在在说什么"。
+   * 但点时间轴上的某一帧是明确的"我要看这一帧"，那时必须切到原文，
+   * 否则点了没反应（内容页根本不随选中帧变化）。
+   */
+  const [responseMode, setResponseMode] = useState<"visual" | "raw">("visual");
   const [follow, setFollow] = useState(true);
   const timelineRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -259,6 +267,7 @@ export function LiveStreamDialog({
     if (live) {
       setSelectedSeq(null);
       setFollow(true);
+      setResponseMode("visual");
       // 新请求的两个面板可能带着上一条的滚动位置，方向判据得同步归零。
       lastTop.current = { timeline: 0, content: 0 };
     }
@@ -267,12 +276,15 @@ export function LiveStreamDialog({
   // 跟随末尾：两个滚动区都跟，只看一边的话另一边照样会停在半路。
   // 直接设 `scrollTop` 而不是 `scrollIntoView` —— 后者会连带滚动外层弹窗，
   // 而且滚动消息面板时可能把整页拽走。
+  //
+  // 依赖里带 `responseMode`：「原文」视图里没有滚动区，切回内容块时要补一次
+  // 跟滚，否则停在上次留下的位置、看起来像"新帧没进来"。
   useEffect(() => {
     if (!follow) return;
     for (const el of [timelineRef.current, contentRef.current]) {
       if (el) el.scrollTop = el.scrollHeight;
     }
-  }, [frames.length, follow, live?.request_id]);
+  }, [frames.length, follow, live?.request_id, responseMode]);
 
   /**
    * 用户自己往上滚了就停止跟随，别让下一批帧把他拽回底部；
@@ -309,6 +321,9 @@ export function LiveStreamDialog({
   const selectFrame = useCallback((seq: number) => {
     setSelectedSeq(seq);
     setFollow(false);
+    // 选中某一帧是有明确指向的动作，落到「响应 · 原文」上才看得到那一帧；
+    // 停在内容块视图里点了等于没点。
+    setResponseMode("raw");
   }, []);
 
   // 把「选中帧」的计算收进 memo：selectedSeq 为 null 时取最后一帧，
@@ -439,47 +454,72 @@ export function LiveStreamDialog({
             </div>
           </div>
 
-          {/* ---- 右：内容 / 原文 / 请求 ---- */}
+          {/* ---- 右：请求 / 响应 ---- */}
           {/*
+           * 一级只放方向（请求 / 响应），「可视化 / 原文」是响应的两种看法，降成
+           * 页签里的切换。三个平级的「内容 / 原文 / 请求」把两个方向混在了一起 ——
+           * 看响应的人得先排除掉请求那一页，而排查「发出去的到底是什么」时又得
+           * 跨到另一侧。
+           *
            * 换一条请求就整块重建：页签停在「请求」上看的是上一条的报文，
            * 新的一条进来时会先闪一下旧的、再换掉，像是"这条请求发了别人的参数"。
            */}
-          <Tabs key={live?.request_id} defaultValue="content" className="min-w-0">
+          <Tabs key={live?.request_id} defaultValue="response" className="min-w-0">
             <TabsList>
-              <TabsTrigger value="content">内容</TabsTrigger>
-              <TabsTrigger value="raw">原文</TabsTrigger>
-              {/* 请求参数与响应帧是两个方向，各占一个页签：混在一起时看响应的人
-                  得先滚过几百行系统提示词，而排查「发出去的到底是什么」恰恰要用
-                  另一侧的视角。 */}
+              <TabsTrigger value="response">响应</TabsTrigger>
               <TabsTrigger value="request">请求</TabsTrigger>
             </TabsList>
 
-            <TabsContent
-              ref={contentRef}
-              onScroll={handleScroll}
-              value="content"
-              className="max-h-[52vh] space-y-3 overflow-y-auto pt-3"
-            >
-              {blocks.length === 0 ? (
-                <p className="text-muted-foreground py-8 text-center text-xs">
-                  还没有可展示的内容增量。
-                </p>
-              ) : (
-                blocks.map((b) => <BlockView key={b.index} block={b} />)
-              )}
-            </TabsContent>
-
-            <TabsContent value="raw" className="space-y-2 pt-3">
-              {selected ? (
-                <>
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-muted-foreground text-[11px]">
-                      第 {selected.seq} 帧 · {frameName(selected)}
-                      {selected.raw_truncated && "（原文已截断）"}
-                    </span>
+            <TabsContent value="response" className="space-y-2 pt-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-1">
+                  {(
+                    [
+                      ["visual", "可视化"],
+                      ["raw", "原文"],
+                    ] as const
+                  ).map(([key, label]) => (
+                    <Button
+                      key={key}
+                      variant={responseMode === key ? "default" : "outline"}
+                      size="sm"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() => setResponseMode(key)}
+                    >
+                      {label}
+                    </Button>
+                  ))}
+                </div>
+                {responseMode === "raw" && selected && (
+                  <span className="text-muted-foreground text-[11px]">
+                    第 {selected.seq} 帧 · {frameName(selected)}
+                    {selected.raw_truncated && "（原文已截断）"}
+                  </span>
+                )}
+                {responseMode === "raw" && selected && (
+                  <span className="ml-auto">
                     <CopyButton text={selected.raw} />
-                  </div>
-                  <pre className="bg-muted/30 max-h-[46vh] overflow-auto rounded-md border p-2 font-mono text-xs whitespace-pre-wrap">
+                  </span>
+                )}
+              </div>
+
+              {responseMode === "visual" ? (
+                <div
+                  ref={contentRef}
+                  onScroll={handleScroll}
+                  className="max-h-[48vh] space-y-3 overflow-y-auto pr-1"
+                >
+                  {blocks.length === 0 ? (
+                    <p className="text-muted-foreground py-8 text-center text-xs">
+                      还没有可展示的内容增量。
+                    </p>
+                  ) : (
+                    blocks.map((b) => <BlockView key={b.index} block={b} />)
+                  )}
+                </div>
+              ) : selected ? (
+                <div className="space-y-2">
+                  <pre className="bg-muted/30 max-h-[40vh] overflow-auto rounded-md border p-2 font-mono text-xs whitespace-pre-wrap">
                     {selected.raw}
                   </pre>
                   {selected.deltas.length > 0 && (
@@ -492,7 +532,7 @@ export function LiveStreamDialog({
                       </pre>
                     </>
                   )}
-                </>
+                </div>
               ) : (
                 <p className="text-muted-foreground py-8 text-center text-xs">
                   还没有收到事件。
@@ -501,7 +541,17 @@ export function LiveStreamDialog({
             </TabsContent>
 
             <TabsContent value="request" className="max-h-[52vh] overflow-y-auto pt-3">
-              {live && <InflightRequestPane requestId={live.request_id} />}
+              {live && (
+                <InflightRequestPane
+                  requestId={live.request_id}
+                  done={live.done}
+                  onOpenDetail={
+                    onOpenDetail
+                      ? () => onOpenDetail(live.request_id)
+                      : undefined
+                  }
+                />
+              )}
             </TabsContent>
           </Tabs>
         </div>
@@ -577,24 +627,53 @@ export function LiveStreamDialog({
 /**
  * 实时视图里的「请求」页签。
  *
- * 数据不来自数据库 —— 进行中的请求**还没落库**，`get_request_detail` 查不到。
- * 后端在请求开始出站时把入站报文连同「进行中」条目一起存在内存里，这里按
- * request_id 取那一份；请求结束后它就没了，那时看明细即可。
+ * 报文来自两处，按顺序取：请求还在跑时是内存里的那份（进行中的请求**还没落库**，
+ * `get_request_detail` 查不到）；跑完之后后端接着读数据库里落库的捕获。用户在
+ * 实时视图里打开「请求」，无论这条流是否结束，都该看到"这次请求发了什么"。
+ *
+ * 两处都没有才说明确实没有：捕获被关掉了，或者那行已经被裁掉。
  *
  * 只在切到这个页签时才发起查询（Radix 的 TabsContent 未激活时卸载内容），
  * 请求体动辄上百 KB，没必要为了一个可能没人看的页签先拉一遍。
  */
-function InflightRequestPane({ requestId }: { requestId: string }) {
+function InflightRequestPane({
+  requestId,
+  done,
+  onOpenDetail,
+}: {
+  requestId: string;
+  /** 流已经结束：落库通常比「结束」事件晚几百毫秒，可能得再问一次。 */
+  done: boolean;
+  onOpenDetail?: () => void;
+}) {
   const [mode, setMode] = useState<"visual" | "formatted" | "raw">("visual");
   const [showHeaders, setShowHeaders] = useState(false);
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["inflight_request", requestId],
     queryFn: () => api.getInflightRequest(requestId),
     // 请求体在一条请求的生命周期内不会变；切走再切回来不该重拉。
     staleTime: Infinity,
     retry: 1,
   });
+
+  /**
+   * 落库比「流结束」事件晚一点，第一次问往往两处都没有。
+   *
+   * 与明细弹窗同一个补偿思路：短时间内问几次，拿不到再如实说没有。次数与间隔
+   * 一起压在三秒内 —— 再多就成了"点了没反应"，不如直接告诉用户没有。
+   */
+  const MAX_MISSES = 6;
+  const [misses, setMisses] = useState(0);
+  useEffect(() => setMisses(0), [requestId]);
+  useEffect(() => {
+    if (!done || isLoading || isError || data || misses >= MAX_MISSES) return;
+    const timer = window.setTimeout(() => {
+      setMisses((n) => n + 1);
+      void refetch();
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [done, isLoading, isError, data, misses, refetch]);
 
   if (isLoading) {
     return (
@@ -614,10 +693,13 @@ function InflightRequestPane({ requestId }: { requestId: string }) {
   }
 
   if (!data) {
-    // 请求已经结束：底账里那条连同报文一起撤掉了，数据库里那份才是完整的。
+    // 两处都没有：没开捕获，或者那行已经被裁掉了。这不是"去别处看"能解决的，
+    // 直接说清楚，免得用户以为是自己没找对地方。
     return (
       <p className="text-muted-foreground py-8 text-center text-xs">
-        这条请求已经结束，请求报文在明细里查看。
+        {done && misses < MAX_MISSES
+          ? "这条请求刚结束，正在读取落库的请求报文…"
+          : "没有这条请求的报文 —— 捕获可能被关掉了，或者这条记录已经被裁掉。"}
       </p>
     );
   }
@@ -633,6 +715,11 @@ function InflightRequestPane({ requestId }: { requestId: string }) {
         <Badge variant="outline" className="font-normal">
           {PROTOCOL_LABEL[data.protocol as Protocol] ?? data.protocol}
         </Badge>
+        {/* 说清这份报文是哪来的：还在跑时是内存副本，跑完之后是落库那份。
+            后者要提醒一句 —— 捕获关掉时落库的报文可能是空的。 */}
+        <span className="text-muted-foreground text-[11px]">
+          {data.source === "live" ? "进行中 · 内存副本" : "已落库"}
+        </span>
         <button
           type="button"
           className="text-muted-foreground hover:text-foreground text-[11px] underline"
@@ -640,6 +727,17 @@ function InflightRequestPane({ requestId }: { requestId: string }) {
         >
           Headers ({Object.keys(data.headers ?? {}).length})
         </button>
+        {/* 落库之后这里只给入站一份；上游收到的那份、以及按协议解出来的响应
+            都在明细里。给个直达，省得用户关掉弹窗再回列表里找。 */}
+        {data.source === "detail" && onOpenDetail && (
+          <button
+            type="button"
+            className="text-muted-foreground hover:text-foreground text-[11px] underline"
+            onClick={onOpenDetail}
+          >
+            在明细里看完整报文
+          </button>
+        )}
         <div className="ml-auto flex items-center gap-1">
           {(
             [
