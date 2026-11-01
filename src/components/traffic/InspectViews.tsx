@@ -18,6 +18,7 @@ import type {
   FinishReason,
   Role,
   ToolChoice,
+  ToolDef,
   UnifiedMessage,
   UnifiedRequest,
   UnifiedResponse,
@@ -591,6 +592,60 @@ function describeToolChoice(tc: ToolChoice | null | undefined): string | null {
   }
 }
 
+/**
+ * 一个工具定义，收成一行。
+ *
+ * 工具定义动辄带着几百行的 `input_schema`，Claude Code 一类客户端一次发十几个，
+ * 全铺开就把「对话上下文」整段挤到屏幕外。收起时只留名字与一行说明，点开才给
+ * 完整描述与 schema —— 想找某个工具靠扫名字，比在一堆 JSON 里翻快得多。
+ */
+function ToolRow({ tool }: { tool: ToolDef }) {
+  const [open, setOpen] = useState(false);
+  const schema = JSON.stringify(tool.input_schema ?? {}, null, 2);
+
+  return (
+    <div className="rounded-md border">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="hover:bg-muted/40 flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left"
+      >
+        {open ? (
+          <ChevronDown className="size-3.5 shrink-0" />
+        ) : (
+          <ChevronRight className="size-3.5 shrink-0" />
+        )}
+        <Wrench className="size-3.5 shrink-0" />
+        {/* Codex 的 namespace 工具（functions / clock / collaboration …）由后端展平成
+            一个个裸名工具，组名单独标出来，免得看着像一堆平级工具。 */}
+        {tool.namespace && (
+          <span className="bg-muted text-muted-foreground shrink-0 rounded px-1 py-0.5 font-mono text-[10px]">
+            {tool.namespace}
+          </span>
+        )}
+        <span className="shrink-0 font-mono text-xs font-medium">{tool.name}</span>
+        {tool.description && (
+          <span className="text-muted-foreground min-w-0 truncate text-[11px]">
+            {tool.description}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="space-y-1 px-2 pb-2">
+          {tool.description && (
+            <p className="text-muted-foreground text-[11px] whitespace-pre-wrap">
+              {tool.description}
+            </p>
+          )}
+          <pre className="bg-muted/30 max-h-60 overflow-auto rounded border p-2 font-mono text-[11px] whitespace-pre-wrap">
+            {schema}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function RequestView({ req }: { req: UnifiedRequest }) {
   // 全部展开/收起：展开状态提到父级，否则按钮没法一次影响所有消息。
   const [openMap, setOpenMap] = useState<Record<number, boolean>>({});
@@ -700,7 +755,9 @@ export function RequestView({ req }: { req: UnifiedRequest }) {
       <Section
         title="工具"
         count={tools.length ? `${tools.length} 个` : undefined}
-        defaultOpen={tools.length > 0 && tools.length <= 8}
+        // 每个工具收起后只有一行，摊开也不占地方，所以按「有没有工具」决定，
+        // 不再按个数阈值整个折叠 —— 那样会因为少看一眼就以为请求没带工具。
+        defaultOpen={tools.length > 0}
       >
         {tools.length === 0 ? (
           <p className="text-muted-foreground text-xs">
@@ -708,28 +765,7 @@ export function RequestView({ req }: { req: UnifiedRequest }) {
           </p>
         ) : (
           tools.map((t) => (
-            <div key={`${t.namespace ?? ""}\u0000${t.name}`} className="rounded-md border p-2">
-              <div className="mb-1 flex items-center gap-1.5">
-                <Wrench className="size-3.5 shrink-0" />
-                {/* Codex 的 namespace 工具（functions / clock / collaboration …）由后端展平成
-                    一个个裸名工具，组名单独标出来，免得看着像一堆平级工具。 */}
-                {t.namespace && (
-                  <span className="bg-muted text-muted-foreground rounded px-1 py-0.5 font-mono text-[10px]">
-                    {t.namespace}
-                  </span>
-                )}
-                <span className="font-mono text-xs font-medium">{t.name}</span>
-              </div>
-              {t.description && (
-                <p className="text-muted-foreground mb-1 text-[11px]">
-                  {t.description}
-                </p>
-              )}
-              <LongText
-                text={JSON.stringify(t.input_schema ?? {}, null, 2)}
-                limit={400}
-              />
-            </div>
+            <ToolRow key={`${t.namespace ?? ""}\u0000${t.name}`} tool={t} />
           ))
         )}
       </Section>
