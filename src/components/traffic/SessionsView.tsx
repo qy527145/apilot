@@ -443,16 +443,9 @@ function Timeline({
     [q.data],
   );
 
-  if (q.isLoading) {
-    return (
-      <Card className="py-0">
-        <CardContent className="p-4">
-          <TableSkeleton rows={8} cols={6} />
-        </CardContent>
-      </Card>
-    );
-  }
-  if (q.isError || !q.data) return <ErrorState onRetry={() => q.refetch()} />;
+  // 下面两个 memo 必须在加载 / 出错的早返回**之前**：hook 的个数每次渲染都得一样，
+  // 写在早返回后面时，加载中那一帧少调两个、数据到了又多调两个，React 直接抛错，
+  // 整个对话页黑屏。
 
   // 每类各有多少条。计数与错误把**所有**请求都算一遍：错误的请求同时属于它
   // 那条线，两类芯片里都该出现 —— 那正是为了"从线的视角"和"从失败的视角"
@@ -475,6 +468,17 @@ function Timeline({
     if (cat === "all" || cat === "count" || cat === "error") return [];
     return (q.data?.threads ?? []).filter((t) => t.kind === cat);
   }, [q.data, cat]);
+
+  if (q.isLoading) {
+    return (
+      <Card className="py-0">
+        <CardContent className="p-4">
+          <TableSkeleton rows={8} cols={6} />
+        </CardContent>
+      </Card>
+    );
+  }
+  if (q.isError || !q.data) return <ErrorState onRetry={() => q.refetch()} />;
 
   // 选中的那条线被重新分类/消失了（3 秒一刷，可能随时变），回落到整个类目，
   // 而不是给出一块空白。

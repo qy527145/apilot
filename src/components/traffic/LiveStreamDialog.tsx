@@ -341,8 +341,12 @@ export function LiveStreamDialog({
        * `DialogContent` 自带的是 `grid`，再叠一个 `flex` 不保险：两个类都设
        * `display`，谁赢取决于样式表的先后而不是 class 的顺序。布局就沿用它
        * 本身的 grid —— 头、正文、页脚各占一行。
+       *
+       * 高度写死而不是 `max-h`：请求与响应两个页签内容长短差得很远，随内容
+       * 伸缩时一切页签整个弹窗就跳一下，页脚按钮跟着挪出去老远。固定下来，
+       * 正文那一行吃掉剩余高度，长内容在各自的面板里滚。
        */}
-      <DialogContent className="max-h-[90vh] overflow-hidden sm:max-w-5xl">
+      <DialogContent className="h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden sm:max-w-5xl">
         <DialogHeader className="shrink-0">
           <DialogTitle className="flex flex-wrap items-center gap-2 pr-8">
             <Radio
@@ -371,18 +375,20 @@ export function LiveStreamDialog({
               </>
             )}
           </DialogDescription>
+          {/* 放在头里而不是单独一行：弹窗按「头 / 正文 / 页脚」三行排，多出一个
+              时有时无的子元素会把正文挤到页脚那一行去。 */}
+          {live?.error && (
+            <p className="text-destructive text-xs">流未正常结束：{live.error}</p>
+          )}
+          {live?.done && !live.error && (
+            <p className="text-muted-foreground text-xs">
+              流已结束。完整报文已落库，点右下角「查看完整明细」。
+            </p>
+          )}
         </DialogHeader>
 
-        {live?.error && (
-          <p className="text-destructive text-xs">流未正常结束：{live.error}</p>
-        )}
-        {live?.done && !live.error && (
-          <p className="text-muted-foreground text-xs">
-            流已结束。完整报文已落库，点右下角「查看完整明细」。
-          </p>
-        )}
-
-        <div className="grid min-h-0 grid-cols-1 gap-3 overflow-hidden md:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
+        {/* 窄屏是上下两块堆叠，没法各自撑满，整块一起滚；宽屏左右两栏各占满高、各自滚。 */}
+        <div className="grid min-h-0 grid-cols-1 gap-3 overflow-y-auto md:grid-cols-[minmax(0,20rem)_minmax(0,1fr)] md:grid-rows-[minmax(0,1fr)] md:overflow-hidden">
           {/* ---- 左：事件时间线 ---- */}
           <div className="flex min-h-0 flex-col gap-2">
             <div className="flex items-center justify-between">
@@ -413,7 +419,7 @@ export function LiveStreamDialog({
             <div
               ref={timelineRef}
               onScroll={handleScroll}
-              className="max-h-[52vh] min-h-32 overflow-y-auto pr-1"
+              className="max-h-[52vh] min-h-32 overflow-y-auto pr-1 md:max-h-none md:flex-1"
             >
               {frames.length === 0 ? (
                 <div className="flex flex-col items-center justify-center gap-2 py-8 text-xs">
@@ -461,17 +467,20 @@ export function LiveStreamDialog({
            * 看响应的人得先排除掉请求那一页，而排查「发出去的到底是什么」时又得
            * 跨到另一侧。
            *
+           * 页签顺序按时间先后：先有请求、后有响应。默认仍落在「响应」上 ——
+           * 打开实时视图多半是想看它现在在说什么。
+           *
            * 换一条请求就整块重建：页签停在「请求」上看的是上一条的报文，
            * 新的一条进来时会先闪一下旧的、再换掉，像是"这条请求发了别人的参数"。
            */}
-          <Tabs key={live?.request_id} defaultValue="response" className="min-w-0">
-            <TabsList>
-              <TabsTrigger value="response">响应</TabsTrigger>
+          <Tabs key={live?.request_id} defaultValue="response" className="min-h-0 min-w-0">
+            <TabsList className="shrink-0">
               <TabsTrigger value="request">请求</TabsTrigger>
+              <TabsTrigger value="response">响应</TabsTrigger>
             </TabsList>
 
-            <TabsContent value="response" className="space-y-2 pt-3">
-              <div className="flex flex-wrap items-center gap-2">
+            <TabsContent value="response" className="flex min-h-0 flex-col gap-2 pt-3">
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
                 <div className="flex items-center gap-1">
                   {(
                     [
@@ -507,7 +516,7 @@ export function LiveStreamDialog({
                 <div
                   ref={contentRef}
                   onScroll={handleScroll}
-                  className="max-h-[48vh] space-y-3 overflow-y-auto pr-1"
+                  className="max-h-[48vh] space-y-3 overflow-y-auto pr-1 md:max-h-none md:min-h-0 md:flex-1"
                 >
                   {blocks.length === 0 ? (
                     <p className="text-muted-foreground py-8 text-center text-xs">
@@ -518,8 +527,8 @@ export function LiveStreamDialog({
                   )}
                 </div>
               ) : selected ? (
-                <div className="space-y-2">
-                  <pre className="bg-muted/30 max-h-[40vh] overflow-auto rounded-md border p-2 font-mono text-xs whitespace-pre-wrap">
+                <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+                  <pre className="bg-muted/30 overflow-auto rounded-md border p-2 font-mono text-xs whitespace-pre-wrap">
                     {selected.raw}
                   </pre>
                   {selected.deltas.length > 0 && (
@@ -540,7 +549,7 @@ export function LiveStreamDialog({
               )}
             </TabsContent>
 
-            <TabsContent value="request" className="max-h-[52vh] overflow-y-auto pt-3">
+            <TabsContent value="request" className="max-h-[52vh] overflow-y-auto pt-3 md:max-h-none md:min-h-0">
               {live && (
                 <InflightRequestPane
                   requestId={live.request_id}
