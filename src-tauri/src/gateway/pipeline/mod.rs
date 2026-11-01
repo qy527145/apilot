@@ -380,7 +380,14 @@ pub(crate) async fn handle_once(
     //
     // 返回值要一路带到出站组装处：同协议直通那条路转发的是**原始字节**，IR 改了它
     // 不知道，得拿着同一份配置去改 raw body。那边绝不能自己从设置重算一遍。
-    let thinking = settings.apply_thinking(&mut req);
+    //
+    // 起标题请求无视全局档位、一律关思考：它只要吐一行 `{"title": …}`，思考既花钱
+    // 又拖慢首字，档位开得高时还会把 `max_tokens` 吃光（截断后标题就丢了）。
+    let thinking = if recorder.title_request {
+        Some(crate::config::settings::disable_thinking(&mut req))
+    } else {
+        settings.apply_thinking(&mut req)
+    };
 
     // ---- 2. 路由决策 ----
     let est_tokens = estimate_request_tokens(&req);

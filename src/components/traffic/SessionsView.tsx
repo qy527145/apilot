@@ -25,18 +25,20 @@ import { cn, formatMs, formatNumber, formatTime, quotaToUsd, shortSessionId } fr
 const KIND_LABEL: Record<ThreadKind, string> = {
   main: "主线",
   agent: "子代理",
+  title: "标题",
   side: "旁路",
 };
 
 const KIND_HINT: Record<ThreadKind, string> = {
   main: "你在对话的那条线：带工具、请求最多",
   agent: "带工具但不是主线：主线派出去干活的子代理",
-  side: "不带工具的一次性任务：起标题、hook 求值、摘要",
+  title: "客户端给对话起标题的请求。Apilot 对它强制关思考，并从回复里取标题",
+  side: "不带工具的一次性任务：hook 求值、摘要",
 };
 
 /** 一条线的名字：类别 + 同类里的序号（主线只有一条，不编号）。 */
 function threadLabels(threads: ThreadSummary[]): Map<string, string> {
-  const seen: Record<ThreadKind, number> = { main: 0, agent: 0, side: 0 };
+  const seen: Record<ThreadKind, number> = { main: 0, agent: 0, title: 0, side: 0 };
   const out = new Map<string, string>();
   for (const t of threads) {
     seen[t.kind] += 1;

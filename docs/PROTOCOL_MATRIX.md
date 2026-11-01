@@ -292,15 +292,22 @@ Responses 里 `{"type":"custom"}` 的工具（Codex 的 `apply_patch`、code mod
 
 | 档位 | Anthropic 线 | OpenAI Chat 线 | Responses 线 |
 |---|---|---|---|
-| 关闭 | 删掉 `thinking` | 删掉 `reasoning_effort` | 删掉 `reasoning.effort`（同级的 `summary` 留着） |
+| 关闭 | 删掉 `thinking` 与 `output_config.effort` | 删掉 `reasoning_effort` | 删掉 `reasoning.effort`（同级的 `summary` 留着） |
 | 低 / 中 / 高 / 极高 | `thinking:{type:"enabled",budget_tokens:N}` | `reasoning_effort` | `reasoning:{effort:...}` |
 
 `budget_tokens` 会被夹到 `< max_tokens`（Anthropic 的硬要求），夹不出合法值时本次不注入。
 
+**起标题请求无视档位、一律按「关闭」处理**（判据 `traffic/session.rs::is_title_request`：
+不带工具 + 首条用户消息是 `<session>…</session>`）。新版 Claude Code 的起标题请求不带
+`thinking`，思考深度只在 `output_config.effort`（实测 `"high"`）—— 所以「关闭」必须连它一起删，
+同级的 `format`（结构化输出）保留。
+
 **两个已知边界：**
 
 - **「关闭」只保证不发参数，不保证上游不思考。** IR 与三个 codec 都没有「关」这个概念，
-  去掉参数只是退回上游的默认档；推理模型照样推理。真正"关"的写法各家不同。
+  去掉参数只是退回上游的默认档；推理模型照样推理。真正"关"的写法各家不同。实测经中转站的
+  DeepSeek 系连显式的 `thinking:{type:"disabled"}` 都照样思考，而 Opus 5.5 / Sonnet 5.5
+  对它直接 400 —— 所以这里只删、不写。
 - **现代 Claude 模型拒收 `budget_tokens`。** 那边只认 `thinking:{type:"adaptive"}` +
   `output_config.effort`（`budget_tokens` 已被移除，发了就是 400），而本仓库的 anthropic
   codec 目前只实现了经典形状。所以这个档位对**第三方 Anthropic 兼容端点**

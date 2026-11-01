@@ -185,9 +185,14 @@ pub(super) fn finalize_stream(
             ttfb_ms: ttfb,
             cache_hit: false,
             saved_quota: breakdown.cache_saved_quota,
-            other: serde_json::json!({
-                "stream_events": outcome.events,
-            }),
+            other: {
+                let mut other = serde_json::json!({ "stream_events": outcome.events });
+                // 会话视图靠它把这条线认成「标题」而不是笼统的旁路（见 `classify_threads`）。
+                if session.title_request {
+                    other["title_request"] = serde_json::json!(true);
+                }
+                other
+            },
             session_id: session.session_id,
             thread_key: session.thread_key,
             message_count: session.message_count,

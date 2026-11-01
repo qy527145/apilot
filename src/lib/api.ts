@@ -783,8 +783,8 @@ export interface SessionSummary {
   pin?: SessionPin | null;
 }
 
-/** 主线 / 子代理 / 旁路（起标题、hook 求值）。判据见 `traffic/session.rs`。 */
-export type ThreadKind = "main" | "agent" | "side";
+/** 主线 / 子代理 / 标题（起标题请求）/ 旁路（hook 求值等）。判据见 `traffic/session.rs`。 */
+export type ThreadKind = "main" | "agent" | "title" | "side";
 
 export interface ThreadSummary {
   thread_key: string;

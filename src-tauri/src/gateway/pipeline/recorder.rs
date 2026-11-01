@@ -47,6 +47,11 @@ impl Recorder {
         self.record.has_tools = t.has_tools;
         self.session_title = t.title;
         self.title_request = t.title_request;
+        // 落库留痕：会话视图靠它把这条线认成「标题」（见 `classify_threads`）。流式那条
+        // 收尾不经过这里的 `record`，`finalize_stream` 照同样的口径再写一次。
+        if t.title_request {
+            self.record.other["title_request"] = serde_json::json!(true);
+        }
     }
 
     /// 这个对话被固定了模型就改用它；返回改写后的模型名。

@@ -51,22 +51,16 @@ fn patch_thinking_key(
 ) -> bool {
     if !cfg.enabled {
         return match wire {
-            Protocol::AnthropicMessages => obj.remove("thinking").is_some(),
+            // `output_config.effort` 与 `thinking` 一起删：新版 Claude Code 只靠前者定思考
+            // 深度，只删后者等于没关（口径同 `config::settings::disable_thinking`）。
+            Protocol::AnthropicMessages => {
+                let removed_thinking = obj.remove("thinking").is_some();
+                remove_nested(obj, "output_config", "effort") || removed_thinking
+            }
             Protocol::OpenAiChat => obj.remove("reasoning_effort").is_some(),
             // Responses 只去掉自己那个键；删空了才把对象也去掉（留个空对象是噪音，
             // 上游也未必认），`summary` 一类同级键不碰。
-            Protocol::OpenAiResponses => {
-                let Some(r) = obj.get_mut("reasoning").and_then(|v| v.as_object_mut()) else {
-                    return false;
-                };
-                if r.remove("effort").is_none() {
-                    return false;
-                }
-                if r.is_empty() {
-                    obj.remove("reasoning");
-                }
-                true
-            }
+            Protocol::OpenAiResponses => remove_nested(obj, "reasoning", "effort"),
         };
     }
 
@@ -122,6 +116,26 @@ fn set_nested(
         return false;
     }
     sub.insert(key.to_string(), value);
+    true
+}
+
+/// 删掉 `obj[outer]` 子对象里的一个键；删空了把子对象也去掉。返回是否真的删了。
+///
+/// 同级的其他键一律保留（`output_config.format`、`reasoning.summary` 是客户端的）。
+fn remove_nested(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    outer: &str,
+    key: &str,
+) -> bool {
+    let Some(sub) = obj.get_mut(outer).and_then(|v| v.as_object_mut()) else {
+        return false;
+    };
+    if sub.remove(key).is_none() {
+        return false;
+    }
+    if sub.is_empty() {
+        obj.remove(outer);
+    }
     true
 }
 
@@ -340,6 +354,27 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_slice(&emptied).unwrap();
         assert!(v.get("reasoning").is_none(), "删空了就别留个空对象");
+    }
+
+    #[test]
+    fn disabling_on_the_anthropic_wire_drops_output_config_effort_but_keeps_format() {
+        // 实测 Claude Code 起标题请求的原样形状（节选）：思考只靠 effort 表达。
+        let raw = br#"{"model":"deepseek","tools":[],"max_tokens":32000,"output_config":{"effort":"high","format":{"type":"json_schema"}},"stream":true}"#;
+        let out = out_body(raw, Protocol::AnthropicMessages, Some(&ReasoningConfig::default()));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert!(v["output_config"].get("effort").is_none());
+        assert_eq!(v["output_config"]["format"]["type"], "json_schema", "结构化输出是客户端要的");
+        assert!(v.get("thinking").is_none());
+        assert_eq!(v["max_tokens"], 32_000);
+
+        let only_effort = out_body(
+            br#"{"model":"deepseek","output_config":{"effort":"high"}}"#,
+            Protocol::AnthropicMessages,
+            Some(&ReasoningConfig::default()),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&only_effort).unwrap();
+        assert!(v.get("output_config").is_none(), "删空了就别留个空对象");
     }
 
     #[test]

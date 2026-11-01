@@ -234,7 +234,8 @@ pub async fn timeline(pool: &SqlitePool, session_id: &str) -> AppResult<SessionT
         "SELECT request_id, ts, thread_key, model, request_model, path, \
                 status_code, error_message, message_count, has_tools, input_tokens, output_tokens, \
                 cache_read_tokens, quota, latency_ms, \
-                CASE WHEN json_valid(other) THEN json_extract(other, '$.session_pin.from') END AS pinned_from \
+                CASE WHEN json_valid(other) THEN json_extract(other, '$.session_pin.from') END AS pinned_from, \
+                CASE WHEN json_valid(other) THEN json_extract(other, '$.title_request') END AS title_request \
          FROM request_logs WHERE session_id = ?1 ORDER BY ts ASC, request_id ASC",
     )
     .bind(session_id)
@@ -269,10 +270,12 @@ pub async fn timeline(pool: &SqlitePool, session_id: &str) -> AppResult<SessionT
             }
 
             let st = stats.entry(key.clone()).or_insert_with(|| {
-                (ThreadStat { thread_key: key.clone(), requests: 0, has_tools: false }, ts, ts, 0)
+                (ThreadStat { thread_key: key.clone(), requests: 0, has_tools: false, title: false }, ts, ts, 0)
             });
             st.0.requests += 1;
             st.0.has_tools |= r.get::<i64, _>("has_tools") != 0;
+            // 老数据没有这个标记，那些线仍按旁路显示 —— 光看日志分不清起标题与 hook 求值。
+            st.0.title |= r.get::<Option<i64>, _>("title_request").unwrap_or(0) != 0;
             st.2 = ts;
             if compacted {
                 st.3 += 1;
@@ -490,6 +493,25 @@ mod tests {
         assert_eq!(t.threads[0].kind, ThreadKind::Main);
         assert_eq!(t.threads[0].compactions, 1);
         assert_eq!(t.threads[1].kind, ThreadKind::Side);
+    }
+
+    #[tokio::test]
+    async fn a_thread_marked_as_title_request_is_shown_as_the_title_thread() {
+        let pool = crate::storage::db::open_memory().await.unwrap();
+        let mut title = rec("2", 2, "S", "title", 1, false, "m");
+        title.other = serde_json::json!({ "stream_events": 10, "title_request": true });
+        seed(&pool, &[
+            rec("1", 1, "S", "main", 5, true, "m"),
+            title,
+            // 没标记的旁路（hook 求值、老数据）仍是旁路。
+            rec("3", 3, "S", "hook", 1, false, "m"),
+        ]).await;
+
+        let t = timeline(&pool, "S").await.unwrap();
+        let kind = |k: &str| t.threads.iter().find(|th| th.thread_key == k).unwrap().kind;
+        assert_eq!(kind("main"), ThreadKind::Main);
+        assert_eq!(kind("title"), ThreadKind::Title);
+        assert_eq!(kind("hook"), ThreadKind::Side);
     }
 
     #[tokio::test]

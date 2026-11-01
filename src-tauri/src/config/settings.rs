@@ -732,6 +732,37 @@ where
     })
 }
 
+/// 把请求改成「不要求思考」，返回写进 IR 的那份配置（`enabled: false`）。
+///
+/// 全局档位「关闭」和起标题请求的强制关思考共用这一份，两条路不能各删各的。
+///
+/// 除了 IR 的 `reasoning`，还要去掉 `output_config.effort`：新版 Claude Code 根本不发
+/// `thinking`，思考深度全靠它（实测起标题请求带的就是 `effort: "high"`）。它没建模、
+/// 躺在 `extra` 里，不删的话跨协议重编码会原样带过去。同协议直通的原始 body 由
+/// `patch_outbound_body` 按同样的口径删。
+///
+/// 只删、不写 `thinking: {type: "disabled"}`：Opus 5.5 / Sonnet 5.5 对它直接 400，
+/// 把一条能过的请求变成失败不划算；何况实测经中转站的 DeepSeek 系对它照样思考。
+pub fn disable_thinking(req: &mut UnifiedRequest) -> ReasoningConfig {
+    if let Some(oc) = req
+        .extra
+        .get_mut("output_config")
+        .and_then(|v| v.as_object_mut())
+    {
+        oc.remove("effort");
+        if oc.is_empty() {
+            req.extra.shift_remove("output_config");
+        }
+    }
+    let cfg = ReasoningConfig {
+        enabled: false,
+        budget_tokens: None,
+        effort: None,
+    };
+    req.reasoning = Some(cfg.clone());
+    cfg
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -803,11 +834,7 @@ impl AppSettings {
             // 关闭用 `enabled: false` 表示，而不是 `None` —— 两者对编码器等价（都写不出
             // 任何字段），但同协议直通那条路要能分辨「显式关闭」与「不接管」：
             // 前者要去掉原始 body 里的键，后者一个字节都不能动。
-            ThinkingMode::Disabled => ReasoningConfig {
-                enabled: false,
-                budget_tokens: None,
-                effort: None,
-            },
+            ThinkingMode::Disabled => return Some(disable_thinking(req)),
             // 档位在这条请求上表达不出来时不接管（理由见 `ThinkingMode::params`）。
             mode => {
                 let (budget, effort) = mode.params(req.max_tokens)?;
@@ -822,6 +849,7 @@ impl AppSettings {
         req.reasoning = Some(cfg.clone());
         Some(cfg)
     }
+
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.bind_host(), self.listen_port)
     }
@@ -1513,6 +1541,37 @@ mod tests {
         assert_eq!(applied.budget_tokens, None);
         assert_eq!(applied.effort, None);
         assert_eq!(req.reasoning, Some(applied));
+    }
+
+    #[test]
+    fn disabling_thinking_also_drops_the_effort_claude_code_actually_sends() {
+        // 实测新版 Claude Code 的起标题请求：没有 `thinking`，思考深度只在
+        // `output_config.effort` 里。`format`（结构化输出）是客户端要的，不能跟着删。
+        let mut req = request(Some(32_000));
+        req.extra.insert(
+            "output_config".into(),
+            serde_json::json!({ "effort": "high", "format": { "type": "json_schema" } }),
+        );
+        let cfg = disable_thinking(&mut req);
+
+        assert!(!cfg.enabled);
+        assert_eq!(req.reasoning, Some(cfg));
+        assert_eq!(req.extra["output_config"], serde_json::json!({ "format": { "type": "json_schema" } }));
+
+        // 只剩 effort 的话整个对象去掉，别留个空 `{}` 给上游。
+        let mut req = request(Some(32_000));
+        req.extra.insert("output_config".into(), serde_json::json!({ "effort": "high" }));
+        disable_thinking(&mut req);
+        assert!(!req.extra.contains_key("output_config"));
+    }
+
+    #[test]
+    fn the_disabled_tier_drops_the_effort_too() {
+        // 全局档位「关闭」与起标题的强制关思考走同一份逻辑。
+        let mut req = request(Some(100_000));
+        req.extra.insert("output_config".into(), serde_json::json!({ "effort": "xhigh" }));
+        settings_with(ThinkingMode::Disabled).apply_thinking(&mut req).unwrap();
+        assert!(!req.extra.contains_key("output_config"));
     }
 
     #[test]

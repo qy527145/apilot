@@ -25,11 +25,11 @@
 //!   它就会变。工具集合**不算** —— 见 [`thread_key`]。
 //! - `count_tokens` 这类非对话请求也带会话 ID，但它们拿着各种工具子集来估算，
 //!   不是任何一条线上的一轮。它们记在会话里，不参与分线，见 [`is_conversation_path`]。
-//! - 主线 / 子代理 / 旁路的**分类**在查询时按整个会话来定（谁的请求最多谁是主线），
+//! - 主线 / 子代理 / 标题 / 旁路的**分类**在查询时按整个会话来定（谁的请求最多谁是主线），
 //!   单条请求自己说不清 —— 见 [`classify_threads`]。
-//! - 旁路里的**起标题**任务还顺带提供标题：它不带工具、真问题包在 `<session>` 里
-//!   （[`is_title_request`]），回复就是 `{"title": "…"}`（[`parse_generated_title`]）。
-//!   那比"取用户第一句话"准，所以它优先。
+//! - 旁路里的**起标题**任务单独叫「标题」，还顺带提供标题：它不带工具、真问题包在
+//!   `<session>` 里（[`is_title_request`]），回复就是 `{"title": "…"}`（[`parse_generated_title`]）。
+//!   那比"取用户第一句话"准，所以它优先。网关对它强制关思考（`gateway::pipeline::handle`）。
 //!
 //! system 里有**每轮都会变的片段**（Claude Code 第一段是带版本号与随机串的计费头），
 //! 指纹只取稳定的部分，见 [`system_fingerprint`]。
@@ -164,12 +164,25 @@ fn names_the_session(blocks: &[&str]) -> bool {
 /// 客户端要求模型输出 `{"title": "..."}`。实测有的模型会套一层 ```json 围栏，
 /// 或者前后加一句解释，所以先切出第一对花括号再解析。
 ///
+/// 还有一种是**开头的 `{"` 丢了**：实测 DeepSeek 系（经中转站）思考完转正文时，
+/// 正文偶尔从 `title": "…"}` 开始 —— 十次里两三次，与思考开关无关（显式关思考也照样
+/// 出现）。客户端自己拿它当 JSON 解析也会失败，但那是客户端的事；我们这边按原样
+/// 补回 `{"` 再解析一次，补出来的必须仍是合法 JSON 才算数，不靠猜。
+///
 /// **解析不出非空标题就返回 `None`**：从一段自由文本里猜标题，猜出来的东西
 /// 比"没有"更糟 —— 没有的话，并发落库的「用户第一句话」会继续当标题。
 pub fn parse_generated_title(text: &str) -> Option<String> {
-    let start = text.find('{')?;
     let end = text.rfind('}')?;
-    let value: Value = serde_json::from_str(&text[start..=end]).ok()?;
+    let value: Value = match text.find('{') {
+        Some(start) if start < end => serde_json::from_str(&text[start..=end]).ok(),
+        _ => None,
+    }
+    .or_else(|| {
+        let body = text[..=end].trim_start();
+        body.starts_with("title\"")
+            .then(|| serde_json::from_str(&format!("{{\"{body}")).ok())
+            .flatten()
+    })?;
     let title = value.get("title")?.as_str()?.trim();
     // 标题理应只有一行；多行是模型把说明也塞进来了，取第一行。
     let line = title.lines().next().unwrap_or(title).trim();
@@ -386,7 +399,10 @@ pub enum ThreadKind {
     Main,
     /// 带工具、但不是主线：子代理。
     Agent,
-    /// 不带工具的一次性任务：起标题、hook 求值、摘要。
+    /// 客户端的起标题任务（[`is_title_request`]）。从旁路里单拎出来：它最常见，
+    /// 网关还会特别对待它（强制关思考、从回复里取标题）。
+    Title,
+    /// 不带工具的其余一次性任务：hook 求值、摘要。
     Side,
 }
 
@@ -397,13 +413,15 @@ pub struct ThreadStat {
     pub requests: i64,
     /// 这条线里有没有带工具的请求。
     pub has_tools: bool,
+    /// 这条线里有没有起标题请求。
+    pub title: bool,
 }
 
 /// 一个会话里各条线的类别。
 ///
 /// 判据只能在整个会话的尺度上给：**带工具的线里请求最多的是主线**。用户的
 /// 那条线每轮都跑，子代理只在被派活时跑几轮，旁路任务更是一两次。
-/// 不带工具的线一律是旁路 —— 主线 agent 不可能不带工具。
+/// 不带工具的线一律是旁路 —— 主线 agent 不可能不带工具；其中起标题的那条叫「标题」。
 ///
 /// 会话里没有任何带工具的线时（纯聊天客户端），请求最多的那条就是主线。
 pub fn classify_threads(stats: &[ThreadStat]) -> HashMap<String, ThreadKind> {
@@ -411,6 +429,7 @@ pub fn classify_threads(stats: &[ThreadStat]) -> HashMap<String, ThreadKind> {
         .iter()
         .filter(|s| s.has_tools)
         .max_by_key(|s| s.requests)
+        .or_else(|| stats.iter().filter(|s| !s.title).max_by_key(|s| s.requests))
         .or_else(|| stats.iter().max_by_key(|s| s.requests))
         .map(|s| s.thread_key.clone());
 
@@ -421,6 +440,8 @@ pub fn classify_threads(stats: &[ThreadStat]) -> HashMap<String, ThreadKind> {
                 ThreadKind::Main
             } else if s.has_tools {
                 ThreadKind::Agent
+            } else if s.title {
+                ThreadKind::Title
             } else {
                 ThreadKind::Side
             };
@@ -610,20 +631,36 @@ mod tests {
 
     #[test]
     fn the_busiest_tool_thread_is_main() {
-        let s = |k: &str, n, tools| ThreadStat { thread_key: k.into(), requests: n, has_tools: tools };
-        let kinds = classify_threads(&[s("title", 200, false), s("main", 90, true), s("agent", 6, true)]);
-        // 起标题的请求再多也不是主线：主 agent 不可能不带工具。
+        let s = |k: &str, n, tools| ThreadStat { thread_key: k.into(), requests: n, has_tools: tools, title: false };
+        let kinds = classify_threads(&[s("hook", 200, false), s("main", 90, true), s("agent", 6, true)]);
+        // 旁路的请求再多也不是主线：主 agent 不可能不带工具。
         assert_eq!(kinds["main"], ThreadKind::Main);
         assert_eq!(kinds["agent"], ThreadKind::Agent);
-        assert_eq!(kinds["title"], ThreadKind::Side);
+        assert_eq!(kinds["hook"], ThreadKind::Side);
+    }
+
+    #[test]
+    fn the_title_thread_is_labelled_apart_from_other_side_tasks() {
+        let s = |k: &str, n, tools, title| ThreadStat { thread_key: k.into(), requests: n, has_tools: tools, title };
+        let kinds = classify_threads(&[
+            s("main", 40, true, false),
+            s("title", 2, false, true),
+            s("hook", 3, false, false),
+        ]);
+        assert_eq!(kinds["title"], ThreadKind::Title);
+        assert_eq!(kinds["hook"], ThreadKind::Side);
     }
 
     #[test]
     fn a_tool_less_session_still_has_a_main_thread() {
-        let s = |k: &str, n| ThreadStat { thread_key: k.into(), requests: n, has_tools: false };
-        let kinds = classify_threads(&[s("chat", 10), s("title", 1)]);
+        let s = |k: &str, n, title| ThreadStat { thread_key: k.into(), requests: n, has_tools: false, title };
+        let kinds = classify_threads(&[s("chat", 10, false), s("title", 1, true)]);
         assert_eq!(kinds["chat"], ThreadKind::Main);
-        assert_eq!(kinds["title"], ThreadKind::Side);
+        assert_eq!(kinds["title"], ThreadKind::Title);
+
+        // 纯聊天会话还没聊几句、起标题的先跑了两次：主线也不该落到标题头上。
+        let kinds = classify_threads(&[s("chat", 1, false), s("title", 2, true)]);
+        assert_eq!(kinds["chat"], ThreadKind::Main);
     }
 
     #[test]
@@ -718,6 +755,17 @@ mod tests {
                    Some("重构路由层"));
         assert_eq!(parse_generated_title("Here you go: {\"title\": \"重构路由层\"}").as_deref(),
                    Some("重构路由层"));
+    }
+
+    #[test]
+    fn a_title_reply_missing_its_opening_brace_is_still_read() {
+        // 实测（DeepSeek 经中转站，request 6105）：正文从 `title": "…"}` 开始。
+        assert_eq!(parse_generated_title("title\": \"实时请求详情页请求参数\"}").as_deref(),
+                   Some("实时请求详情页请求参数"));
+        assert_eq!(parse_generated_title("  title\":\"重构路由层\"}").as_deref(), Some("重构路由层"));
+        // 补回来也不是合法 JSON 的照样放弃，不往下猜。
+        assert_eq!(parse_generated_title("title\": \"没收尾}"), None);
+        assert_eq!(parse_generated_title("name\": \"重构路由层\"}"), None);
     }
 
     #[test]
