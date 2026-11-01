@@ -993,6 +993,13 @@ export default function TrafficPage() {
         live={openLive}
         nextRequestId={nextLiveId}
         onGoToNext={setLiveStream}
+        onOpenDetail={(id) => {
+          // 流结束之后实时报文已经撤掉，完整那份落库了 —— 直接接着看明细，
+          // 比让用户关掉弹窗、回列表里再找那一行顺手。
+          setLiveStream(null);
+          setSessionOrder(null);
+          setSelected(id);
+        }}
         onOpenChange={(o) => !o && setLiveStream(null)}
       />
 

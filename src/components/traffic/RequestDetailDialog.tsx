@@ -73,6 +73,12 @@ type ViewMode = "visual" | "formatted" | "raw";
 /** 顶层页签。时间轴单独一个 —— 它不看报文，看的是每个事件花了多久。 */
 type DetailTab = "request" | "response" | "timeline";
 
+/** 落库晚于「结束」事件时，最多补查几次、每次隔多久。见 `missingChecks`。
+ *  总时长压在三秒左右：真要落库，几百毫秒就够；一直等下去只会让"这条确实没了"
+ *  也看着像还有希望。 */
+const MAX_MISSING_CHECKS = 6;
+const MISSING_RETRY_MS = 500;
+
 /**
  * 响应侧「原始」视图取哪份数据。
  *
@@ -159,6 +165,32 @@ export function RequestDetailDialog({
     enabled: !!requestId,
     retry: 1,
   });
+
+  /**
+   * 刚结束的请求还没落库时自动补查。
+   *
+   * 流式请求的「结束」事件是在收尾**开始之前**发出去的：前端看到 `done` 时，
+   * 写日志与捕获的后台任务可能还没跑完。从实时视图点「查看完整明细」几乎必然
+   * 撞上这个窗口 —— 那时查回来是 `null`，界面若直接报「加载失败」，用户只会
+   * 以为这条记录丢了，而它只是晚了几百毫秒。
+   *
+   * 只补查有限次数（`MAX_MISSING_CHECKS`）：真的查不到（被裁剪、被删）时照样
+   * 要如实说没有。
+   */
+  const [missingChecks, setMissingChecks] = useState(0);
+  useEffect(() => {
+    setMissingChecks(0);
+  }, [requestId]);
+
+  useEffect(() => {
+    if (!requestId || isLoading || isError || data) return;
+    if (missingChecks >= MAX_MISSING_CHECKS) return;
+    const timer = window.setTimeout(() => {
+      setMissingChecks((n) => n + 1);
+      refetch();
+    }, MISSING_RETRY_MS);
+    return () => window.clearTimeout(timer);
+  }, [requestId, isLoading, isError, data, missingChecks, refetch]);
 
   // 时间轴的数据是**后加的**：改动之前落库的请求没有它。没有就不显示那个页签，
   // 而不是给一份空轴让人以为这个请求一个事件都没发。
@@ -258,6 +290,19 @@ export function RequestDetailDialog({
           <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" />
             加载中…
+          </div>
+        ) : !data && !isError ? (
+          // 查到了"没有这条"而不是查失败。最常见的原因是刚结束的流还在落库，
+          // 上面的补查正在重试 —— 说清楚，别让人以为记录丢了。
+          <div className="flex items-center justify-center gap-2 py-10 text-xs text-muted-foreground">
+            {missingChecks < MAX_MISSING_CHECKS ? (
+              <>
+                <Loader2 className="size-4 animate-spin" />
+                正在等待这条请求落库…
+              </>
+            ) : (
+              "没有找到这条记录（可能已被清理，或还没落库）。"
+            )}
           </div>
         ) : isError || !data ? (
           <div className="py-10 text-center text-xs">

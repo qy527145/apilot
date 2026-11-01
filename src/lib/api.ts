@@ -856,6 +856,23 @@ export interface InflightRequest {
   retry_of?: string | null;
 }
 
+/**
+ * 一条进行中请求的入站报文。
+ *
+ * 与 `RequestDetail` 分开：那条读数据库，而进行中的请求**还没落库**。这里取的是
+ * 跟着请求一起存在内存里的那份，请求一结束就没了 —— 之后去明细里看落库的那份。
+ */
+export interface InflightRequestDetail {
+  request_id: string;
+  method: string;
+  path: string;
+  protocol: string;
+  headers: Record<string, string>;
+  body?: string | null;
+  /** 用入站协议解出来的 IR。解不出来时 `value` 为空、`error` 写原因。 */
+  view?: DecodedRequest | null;
+}
+
 export interface Page<T> {
   items: T[];
   total: number;
@@ -1812,6 +1829,14 @@ export const api = {
     call<RequestDetail>("get_request_detail", { requestId }),
   /** 查询当前正在进行的请求。进监控页时调用一次，补齐用户进页前已开始的请求。 */
   getInflightRequests: () => call<InflightRequest[]>("get_inflight_requests"),
+  /**
+   * 取一条进行中请求的入站报文（实时视图的「请求」页签用）。
+   *
+   * 不在「进行中」里（刚跑完、或者早就结束）时返回 `null` —— 那时完整报文已经在
+   * 数据库里，去看明细即可。
+   */
+  getInflightRequest: (requestId: string) =>
+    call<InflightRequestDetail | null>("get_inflight_request", { requestId }),
   /**
    * 中断一条进行中的请求，`retry` 为真时顺带让它重跑一遍。
    *

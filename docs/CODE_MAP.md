@@ -527,7 +527,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 
 | 文件 | 内容 |
 |---|---|
-| `mod.rs` | `TrafficStats`（并发守护 `ActiveRequest`、累计计数、TTFB 环形窗口）、`TrafficEvent` |
+| `mod.rs` | `TrafficStats`（并发守护 `ActiveRequest`、累计计数、TTFB 环形窗口）、`TrafficEvent`；`InflightStore`（进行中底账：请求元信息 + 已推出去的帧 + 控制句柄 + **入站报文**）。入站报文用 `InflightRequestSnapshot` 单独存、不跟着列表序列化 —— 请求体动辄上百 KB，补查一次会带好几条；实时视图的「请求」页签按 id 取那一份（`commands/logs.rs::get_inflight_request`），请求一结束就随底账一起消失 |
 | `events.rs` | `EventBus`（按类型推送 + 节流）、`Throttle`、`event_names` |
 | `control.rs` | **进行中的请求怎么被人工打断**：`RequestControl`（`AtomicU8` 信号 + `Notify`，外加「这条请求试过哪些渠道」）。挂在 `InflightStore` 的底账条目上，与请求同生共死；命令层 `commands/logs.rs::interrupt_inflight_request`。中断与重试是两件事：见 `gateway/pipeline/outbound.rs::try_outbound`（等响应头那一段）与 `gateway/stream.rs::StreamRestart`（已经开始出字节之后） |
 | `stream_events.rs` | **流式实时事件**：`StreamBatcher`（攒批 + 封顶 + 单帧截断，纯逻辑）、`StreamEmitter`（观察者实现，`Drop` 兜底断连）、`StreamDelta`（推流用的增量形态） |

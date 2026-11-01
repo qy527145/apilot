@@ -81,6 +81,19 @@ pub fn inspect(codecs: &CodecRegistry, d: &RequestDetail) -> DetailViews {
     }
 }
 
+/// 解一份**还没落库**的入站报文（监控页的实时视图用）。
+///
+/// 与 [`inspect`] 走同一个 `decode_request`：实时视图和事后明细对同一份报文
+/// 必须得出同一个 IR，否则「正在跑的时候看到什么」与「跑完之后看到什么」会
+/// 悄悄分叉。
+pub fn decode_request_text(
+    codecs: &CodecRegistry,
+    protocol: &str,
+    body: Option<&str>,
+) -> Option<DecodedRequest> {
+    decode_request(codecs, parse_protocol(protocol)?, body)
+}
+
 fn decode_request(
     codecs: &CodecRegistry,
     protocol: Protocol,
@@ -300,6 +313,30 @@ mod tests {
         assert_eq!(req.messages.len(), 1, "system 应被提到顶层，不留在 messages 里");
         assert_eq!(req.tools[0].name, "Bash");
         assert_eq!(req.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn decode_request_text_decodes_an_inflight_body() {
+        // 实时视图拿的是内存里那份还没落库的报文，必须与事后明细解出同一个 IR。
+        let text = serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "你好"}]
+        })
+        .to_string();
+
+        let d = decode_request_text(&CodecRegistry::new(), "anthropic", Some(&text))
+            .expect("认得出的协议就该给出视图");
+        let value = d.value.expect("合法报文必须能解");
+        assert_eq!(value.messages.len(), 1);
+        assert_eq!(value.max_tokens, Some(16));
+    }
+
+    #[test]
+    fn decode_request_text_skips_unknown_protocols_and_missing_bodies() {
+        // 认不出协议时不该硬解成某个形状，界面据此显示「未捕获」。
+        assert!(decode_request_text(&CodecRegistry::new(), "gemini", Some("{}")).is_none());
+        assert!(decode_request_text(&CodecRegistry::new(), "anthropic", None).is_none());
     }
 
     #[test]

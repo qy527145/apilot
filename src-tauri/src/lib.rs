@@ -174,6 +174,7 @@ pub fn run() {
             commands::logs::validate_log_expr,
             commands::logs::get_request_detail,
             commands::logs::get_inflight_requests,
+            commands::logs::get_inflight_request,
             commands::logs::interrupt_inflight_request,
             commands::logs::clear_logs,
             commands::logs::delete_log,

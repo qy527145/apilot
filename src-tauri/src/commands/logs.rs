@@ -157,6 +157,56 @@ pub async fn get_inflight_requests(
     Ok(shell.inflight.snapshot())
 }
 
+/// 一条进行中请求的入站报文，供实时视图的「请求」页签展示。
+///
+/// 与 `get_request_detail` 分开：那条读数据库，而进行中的请求**还没有落库**，
+/// 查不到。这里取的是底账里跟着请求存的那份内存副本，请求一结束就没了 ——
+/// 之后要看就去明细里看落库的那份。
+#[derive(Debug, Clone, Serialize)]
+pub struct InflightRequestDetail {
+    pub request_id: String,
+    pub method: String,
+    pub path: String,
+    pub protocol: String,
+    pub headers: serde_json::Value,
+    /// 请求体原文。非 UTF-8 或有二进制时按 lossy 处理 —— 界面上要的是能读的文本，
+    /// 不是逐字节精确的回放（回放那边有自己的路）。
+    pub body: Option<String>,
+    /// 用入站协议解出来的 IR。解不出来时 `value` 为空、`error` 写原因，
+    /// 界面据此退回「原始」。整个为 null 表示根本没有报文。
+    pub view: Option<crate::protocol::inspect::DecodedRequest>,
+}
+
+/// 取一条进行中请求的入站报文。不在「进行中」里（刚跑完或早就结束）返回 `None`。
+#[tauri::command]
+pub async fn get_inflight_request(
+    shell: State<'_, Arc<AppShell>>,
+    request_id: String,
+) -> AppResult<Option<InflightRequestDetail>> {
+    let Some(snap) = shell.inflight.request_snapshot(&request_id) else {
+        return Ok(None);
+    };
+    let body = snap
+        .body
+        .as_deref()
+        .map(|b| String::from_utf8_lossy(b).into_owned());
+    let view = crate::protocol::inspect::decode_request_text(
+        &shell.codecs,
+        &snap.protocol,
+        body.as_deref(),
+    );
+
+    Ok(Some(InflightRequestDetail {
+        request_id,
+        method: snap.method,
+        path: snap.path,
+        protocol: snap.protocol,
+        headers: snap.headers,
+        body,
+        view,
+    }))
+}
+
 /// 中断一条进行中的请求；`retry` 为真时顺带让它重跑一遍。
 ///
 /// 返回 `false` 表示这条请求已经不在「进行中」里了（刚跑完，或者界面上的那条

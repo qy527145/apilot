@@ -18,6 +18,29 @@ use parking_lot::Mutex;
 
 use crate::traffic::stream_events::{RequestStarted, StreamFrame, MAX_FRAMES_PER_REQUEST};
 
+/// 一条进行中请求的**入站报文**。
+///
+/// 实时视图要看请求参数，可这条请求还没落库 —— `get_request_detail` 读的是
+/// 数据库，此刻查不到它。报文只能跟着底账走，请求一结束（`remove`）就一起消失，
+/// 之后再要看就去明细里看落库的那份。
+///
+/// `body` 用 `Bytes` 而不是 `Vec<u8>`：它与入站的那份共享同一块内存，克隆只是
+/// 引用计数加一，不会为了"可能有人要看"把上百 KB 的请求体再复制一遍。
+///
+/// 不参与 `InflightEntry` 的序列化：那条路是进页时补齐用的，一次会带好几条
+/// 请求，把请求体塞进去会让一次补查多出几百 KB。要看时按 id 单独取（
+/// `get_inflight_request`）。
+#[derive(Debug, Clone)]
+pub struct InflightRequestSnapshot {
+    /// 入站协议短名，取它的 codec 才能解成 IR。
+    pub protocol: String,
+    pub method: String,
+    pub path: String,
+    /// 已隐去鉴权头的请求头（`headers_to_json` 的结果）。
+    pub headers: serde_json::Value,
+    pub body: Option<bytes::Bytes>,
+}
+
 /// 「进行中」底账里的一条：请求本身，加上**已经推出去的帧**。
 ///
 /// 帧也要留一份，是因为前端进监控页时才建立订阅：一条早就跑起来的流，
@@ -42,6 +65,12 @@ pub struct InflightEntry {
     /// 前端拿不到也不该拿到。
     #[serde(skip)]
     pub control: Option<Arc<control::RequestControl>>,
+    /// 入站报文：实时视图的「请求」页签靠它展示请求参数。
+    ///
+    /// `skip` 掉的理由见 [`InflightRequestSnapshot`]：补查一次会带好几条，
+    /// 请求体不该跟着列表走。
+    #[serde(skip)]
+    pub request: Option<InflightRequestSnapshot>,
 }
 
 /// 每条请求在底账里最多留多少帧。
@@ -76,6 +105,7 @@ impl InflightStore {
                     frames: Vec::new(),
                     truncated: false,
                     control: None,
+                    request: None,
                 },
             );
     }
@@ -114,6 +144,27 @@ impl InflightStore {
             }
             None => false,
         }
+    }
+
+    /// 给这条请求挂上入站报文。
+    ///
+    /// 也是在 `insert` 之后单独调：报文在解码之前就拿到了，而底账条目要等渠道
+    /// 选完才有（那时才知道这条请求往哪走）。两边时机对不上，只能分两步。
+    pub fn attach_request(&self, request_id: &str, snapshot: InflightRequestSnapshot) {
+        if let Some(entry) = self.entries.lock().get_mut(request_id) {
+            entry.request = Some(snapshot);
+        }
+    }
+
+    /// 取一条进行中请求的入站报文。
+    ///
+    /// 单独一个入口而不是塞进快照：请求体动辄上百 KB，列表一次可能补好几条，
+    /// 只有用户真的点开某一条时才值得把那一份拷贝过去。
+    pub fn request_snapshot(&self, request_id: &str) -> Option<InflightRequestSnapshot> {
+        self.entries
+            .lock()
+            .get(request_id)
+            .and_then(|e| e.request.clone())
     }
 
     /// 这条请求刚推出去了一批帧，底账里也留一份。
@@ -344,6 +395,47 @@ mod tests {
 
         store.remove("r1");
         assert_eq!(store.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn the_inbound_request_is_kept_until_the_request_leaves_the_ledger() {
+        // 实时视图的「请求」页签靠它：进行中的请求还没落库，报文只能跟着底账走。
+        let store = InflightStore::new();
+        store.insert(started("r1", 1));
+        // 还没登记的请求挂不上（多半是已经收尾了），不该 panic。
+        store.attach_request("gone", request());
+
+        store.attach_request("r1", request());
+        let snap = store.request_snapshot("r1").expect("登记过的要能取到");
+        assert_eq!(snap.protocol, "anthropic");
+        assert_eq!(snap.body.as_deref(), Some(&b"{\"model\":\"m\"}"[..]));
+
+        // 结束之后连带撤掉：晚到的查询请求应拿到 None，而不是别人的旧报文。
+        store.remove("r1");
+        assert!(store.request_snapshot("r1").is_none());
+    }
+
+    #[test]
+    fn the_request_body_never_enters_the_inflight_list_payload() {
+        // 补查一次会带好几条进行中的请求，请求体动辄上百 KB —— 进了列表就会让
+        // 每次进监控页都多传几百 KB。要看时按 id 单独取。
+        let store = InflightStore::new();
+        store.insert(started("r1", 1));
+        store.attach_request("r1", request());
+
+        let json = serde_json::to_value(store.snapshot()).unwrap();
+        assert_eq!(json[0]["request_id"], "r1", "元信息照常序列化");
+        assert!(json[0].get("request").is_none(), "报文不该跟着列表走: {json}");
+    }
+
+    fn request() -> InflightRequestSnapshot {
+        InflightRequestSnapshot {
+            protocol: "anthropic".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            headers: serde_json::json!({"content-type": "application/json"}),
+            body: Some(bytes::Bytes::from_static(b"{\"model\":\"m\"}")),
+        }
     }
 
     #[test]

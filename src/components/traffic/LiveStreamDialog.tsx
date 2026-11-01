@@ -6,6 +6,7 @@ import {
   useState,
   type UIEvent,
 } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   ArrowDownToLine,
   Loader2,
@@ -17,6 +18,8 @@ import {
 import { toast } from "sonner";
 
 import { CopyButton } from "@/components/common/CopyButton";
+import { RawBody } from "@/components/common/RawBody";
+import { RequestView } from "@/components/traffic/InspectViews";
 import { StreamTimeline } from "@/components/traffic/StreamTimeline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,6 +27,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -147,6 +151,13 @@ interface Props {
    */
   nextRequestId?: string | null;
   onGoToNext?: (requestId: string) => void;
+  /**
+   * 打开这条请求的落库明细。
+   *
+   * 流结束之后「请求」页签就空了 —— 报文跟着「进行中」条目一起撤掉，完整的那份
+   * 在数据库里。不接这个回调，用户只能关掉弹窗、自己回列表里找那一行。
+   */
+  onOpenDetail?: (requestId: string) => void;
   onOpenChange: (open: boolean) => void;
 }
 
@@ -160,6 +171,7 @@ export function LiveStreamDialog({
   live,
   nextRequestId,
   onGoToNext,
+  onOpenDetail,
   onOpenChange,
 }: Props) {
   // 用 null 表示"跟随最新"，用序号表示"固定在某帧"。
@@ -310,9 +322,14 @@ export function LiveStreamDialog({
 
   return (
     <Dialog open={!!live} onOpenChange={onOpenChange}>
+      {/*
+       * `DialogContent` 自带的是 `grid`，再叠一个 `flex` 不保险：两个类都设
+       * `display`，谁赢取决于样式表的先后而不是 class 的顺序。布局就沿用它
+       * 本身的 grid —— 头、正文、页脚各占一行。
+       */}
       <DialogContent className="max-h-[90vh] overflow-hidden sm:max-w-5xl">
-        <DialogHeader>
-          <DialogTitle className="flex flex-wrap items-center gap-2">
+        <DialogHeader className="shrink-0">
+          <DialogTitle className="flex flex-wrap items-center gap-2 pr-8">
             <Radio
               className={cn("size-4", !live?.done && "animate-pulse text-emerald-500")}
             />
@@ -324,47 +341,6 @@ export function LiveStreamDialog({
             )}
             {live && !live.done && <Badge variant="success">进行中</Badge>}
             {live?.truncated && <Badge variant="secondary">已截断</Badge>}
-            {live && !live.done && (
-              <Button
-                size="sm"
-                variant={semanticStarted ? "outline" : "default"}
-                className="ml-auto h-6 px-2 text-[11px]"
-                disabled={pending !== null}
-                title={
-                  semanticStarted
-                    ? "结束这条响应。内容已经发出去，重试会让客户端收到第二条 message_start"
-                    : "放弃这次上游请求，换一条渠道重新来过；客户端那边感觉只是慢了一点"
-                }
-                onClick={() => interrupt(!semanticStarted)}
-              >
-                {pending !== null ? (
-                  <Loader2 className="size-3 animate-spin" />
-                ) : semanticStarted ? (
-                  <Square className="size-3" />
-                ) : (
-                  <RotateCw className="size-3" />
-                )}
-                {pending === "retry"
-                  ? "正在重试…"
-                  : pending === "cancel"
-                    ? "正在中断…"
-                    : semanticStarted
-                      ? "中断"
-                      : "中断并重试"}
-              </Button>
-            )}
-            {live?.done && nextRequestId && onGoToNext && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="ml-auto h-6 px-2 text-[11px]"
-                title="跳到下一条还在跑的请求"
-                onClick={() => onGoToNext(nextRequestId)}
-              >
-                <SkipForward className="size-3" />
-                下一条进行中
-              </Button>
-            )}
           </DialogTitle>
           <DialogDescription className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
             {live && (
@@ -387,11 +363,11 @@ export function LiveStreamDialog({
         )}
         {live?.done && !live.error && (
           <p className="text-muted-foreground text-xs">
-            流已结束。完整报文在列表里点这一行看明细。
+            流已结束。完整报文已落库，点右下角「查看完整明细」。
           </p>
         )}
 
-        <div className="grid min-h-0 grid-cols-1 gap-3 md:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
+        <div className="grid min-h-0 grid-cols-1 gap-3 overflow-hidden md:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
           {/* ---- 左：事件时间线 ---- */}
           <div className="flex min-h-0 flex-col gap-2">
             <div className="flex items-center justify-between">
@@ -445,25 +421,9 @@ export function LiveStreamDialog({
                   {waitedMs > 15_000 && (
                     <p className="text-muted-foreground/80 max-w-md text-center text-[11px]">
                       上游迟迟没有回应。多数情况是上游在排队 —— 中转站被打满时连响应头
-                      都要等几十秒，再等下去往往也不会更快。
+                      都要等几十秒，再等下去往往也不会更快。不想等就点右下角的
+                      「中断并重试」。
                     </p>
-                  )}
-                  {/* 用户盯着的就是这一块，按钮也放在这儿 —— 只在标题栏里，
-                      等得不耐烦的人还得先把视线挪上去。 */}
-                  {live && !live.done && !semanticStarted && (
-                    <Button
-                      size="sm"
-                      className="mt-1 h-7"
-                      disabled={pending !== null}
-                      onClick={() => interrupt(true)}
-                    >
-                      {pending === "retry" ? (
-                        <Loader2 className="size-3 animate-spin" />
-                      ) : (
-                        <RotateCw className="size-3" />
-                      )}
-                      {pending === "retry" ? "正在重试…" : "中断并重试"}
-                    </Button>
                   )}
                 </div>
               ) : (
@@ -479,11 +439,19 @@ export function LiveStreamDialog({
             </div>
           </div>
 
-          {/* ---- 右：内容 / 原文 ---- */}
-          <Tabs defaultValue="content" className="min-w-0">
+          {/* ---- 右：内容 / 原文 / 请求 ---- */}
+          {/*
+           * 换一条请求就整块重建：页签停在「请求」上看的是上一条的报文，
+           * 新的一条进来时会先闪一下旧的、再换掉，像是"这条请求发了别人的参数"。
+           */}
+          <Tabs key={live?.request_id} defaultValue="content" className="min-w-0">
             <TabsList>
               <TabsTrigger value="content">内容</TabsTrigger>
               <TabsTrigger value="raw">原文</TabsTrigger>
+              {/* 请求参数与响应帧是两个方向，各占一个页签：混在一起时看响应的人
+                  得先滚过几百行系统提示词，而排查「发出去的到底是什么」恰恰要用
+                  另一侧的视角。 */}
+              <TabsTrigger value="request">请求</TabsTrigger>
             </TabsList>
 
             <TabsContent
@@ -531,9 +499,198 @@ export function LiveStreamDialog({
                 </p>
               )}
             </TabsContent>
+
+            <TabsContent value="request" className="max-h-[52vh] overflow-y-auto pt-3">
+              {live && <InflightRequestPane requestId={live.request_id} />}
+            </TabsContent>
           </Tabs>
         </div>
+
+        {/* 中断 / 重试放在页脚，不放标题栏。
+            标题栏那个位置紧挨着右上角的关闭按钮（X），而关闭与"打断这次请求"是
+            两件性质完全不同的事 —— 误触一次请求就没了。页脚单独一行，离任何
+            危险控件都远，且留在这里不会随内容多少挪位置。 */}
+        <DialogFooter className="shrink-0 items-center gap-2 sm:justify-between">
+          <span className="text-muted-foreground hidden text-[11px] sm:block">
+            {live?.done
+              ? "流已结束，完整报文在明细里。"
+              : semanticStarted
+                ? "内容已经开始下发，现在中断会让客户端收到一条不完整的响应。"
+                : "还没有内容发出去，重试对客户端来说只是慢了一点。"}
+          </span>
+          <div className="flex items-center gap-2">
+            {live && !live.done && (
+              <Button
+                size="sm"
+                variant={semanticStarted ? "outline" : "default"}
+                disabled={pending !== null}
+                title={
+                  semanticStarted
+                    ? "结束这条响应。内容已经发出去，重试会让客户端收到第二条 message_start"
+                    : "放弃这次上游请求，换一条渠道重新来过；客户端那边感觉只是慢了一点"
+                }
+                onClick={() => interrupt(!semanticStarted)}
+              >
+                {pending !== null ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : semanticStarted ? (
+                  <Square className="size-3.5" />
+                ) : (
+                  <RotateCw className="size-3.5" />
+                )}
+                {pending === "retry"
+                  ? "正在重试…"
+                  : pending === "cancel"
+                    ? "正在中断…"
+                    : semanticStarted
+                      ? "中断"
+                      : "中断并重试"}
+              </Button>
+            )}
+            {live?.done && nextRequestId && onGoToNext && (
+              <Button
+                size="sm"
+                variant="outline"
+                title="跳到下一条还在跑的请求"
+                onClick={() => onGoToNext(nextRequestId)}
+              >
+                <SkipForward className="size-3.5" />
+                下一条进行中
+              </Button>
+            )}
+            {live?.done && onOpenDetail && (
+              <Button
+                size="sm"
+                title="这条请求的完整报文已经在数据库里了"
+                onClick={() => onOpenDetail(live.request_id)}
+              >
+                查看完整明细
+              </Button>
+            )}
+          </div>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/**
+ * 实时视图里的「请求」页签。
+ *
+ * 数据不来自数据库 —— 进行中的请求**还没落库**，`get_request_detail` 查不到。
+ * 后端在请求开始出站时把入站报文连同「进行中」条目一起存在内存里，这里按
+ * request_id 取那一份；请求结束后它就没了，那时看明细即可。
+ *
+ * 只在切到这个页签时才发起查询（Radix 的 TabsContent 未激活时卸载内容），
+ * 请求体动辄上百 KB，没必要为了一个可能没人看的页签先拉一遍。
+ */
+function InflightRequestPane({ requestId }: { requestId: string }) {
+  const [mode, setMode] = useState<"visual" | "formatted" | "raw">("visual");
+  const [showHeaders, setShowHeaders] = useState(false);
+
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["inflight_request", requestId],
+    queryFn: () => api.getInflightRequest(requestId),
+    // 请求体在一条请求的生命周期内不会变；切走再切回来不该重拉。
+    staleTime: Infinity,
+    retry: 1,
+  });
+
+  if (isLoading) {
+    return (
+      <p className="text-muted-foreground flex items-center justify-center gap-2 py-8 text-xs">
+        <Loader2 className="size-3 animate-spin" />
+        读取请求报文…
+      </p>
+    );
+  }
+
+  if (isError) {
+    return (
+      <p className="text-muted-foreground py-8 text-center text-xs">
+        读取请求报文失败。
+      </p>
+    );
+  }
+
+  if (!data) {
+    // 请求已经结束：底账里那条连同报文一起撤掉了，数据库里那份才是完整的。
+    return (
+      <p className="text-muted-foreground py-8 text-center text-xs">
+        这条请求已经结束，请求报文在明细里查看。
+      </p>
+    );
+  }
+
+  const headersText = JSON.stringify(data.headers ?? {}, null, 2);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-xs break-all">
+          {data.method} {data.path}
+        </span>
+        <Badge variant="outline" className="font-normal">
+          {PROTOCOL_LABEL[data.protocol as Protocol] ?? data.protocol}
+        </Badge>
+        <button
+          type="button"
+          className="text-muted-foreground hover:text-foreground text-[11px] underline"
+          onClick={() => setShowHeaders((v) => !v)}
+        >
+          Headers ({Object.keys(data.headers ?? {}).length})
+        </button>
+        <div className="ml-auto flex items-center gap-1">
+          {(
+            [
+              ["visual", "可视化"],
+              ["formatted", "格式化"],
+              ["raw", "原始"],
+            ] as const
+          ).map(([key, label]) => (
+            <Button
+              key={key}
+              variant={mode === key ? "default" : "outline"}
+              size="sm"
+              className="h-6 px-2 text-[11px]"
+              onClick={() => setMode(key)}
+            >
+              {label}
+            </Button>
+          ))}
+        </div>
+      </div>
+
+      {showHeaders && (
+        <div className="space-y-1">
+          <div className="flex justify-end">
+            <CopyButton text={headersText} />
+          </div>
+          <RawBody text={headersText} rawMode={mode === "raw"} empty="（无）" />
+        </div>
+      )}
+
+      {mode === "visual" ? (
+        data.view?.value ? (
+          <RequestView req={data.view.value} />
+        ) : (
+          <div className="bg-muted/30 space-y-1 rounded-md border p-3 text-xs">
+            <p className="font-medium">这份请求报文没法按语义解析</p>
+            <p className="text-muted-foreground break-words">
+              {data.view?.error ?? "没有可解析的请求体。"}
+            </p>
+            <p className="text-muted-foreground">
+              切到「格式化」或「原始」看原文。
+            </p>
+          </div>
+        )
+      ) : (
+        <RawBody
+          text={data.body}
+          rawMode={mode === "raw"}
+          empty="这次请求没有请求体"
+        />
+      )}
+    </div>
   );
 }

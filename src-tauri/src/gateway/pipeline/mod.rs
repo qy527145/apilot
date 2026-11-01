@@ -525,6 +525,24 @@ pub(crate) async fn handle_once(
     };
     // 先写进行中快照，再广播事件：顺序保证前端任何时刻查询都不会漏掉刚进来的请求。
     shell.inflight.insert(started_payload.clone());
+    // 入站报文也挂上去：实时视图要能看请求参数，而这条请求此刻还没落库。
+    // 与 `insert` 分开两步是因为它早在解码之前就拿到了（见 `handle_once` 开头）。
+    //
+    // **不落库、也不看 `capture_enabled`**：这里只是把管线本来就攥着的那个
+    // `Bytes` 再借一份（引用计数 +1），请求一结束就随底账一起丢掉。关掉捕获
+    // 的用户拒绝的是"留档"，不是"看一眼正在跑的请求"；要给实时视图留白，
+    // 那这个页签对所有人都是空的，反而更奇怪。
+    shell.inflight.attach_request(
+        &started_payload.request_id,
+        crate::traffic::InflightRequestSnapshot {
+            protocol: protocol.as_str().to_string(),
+            // 这三个对话入口都是 POST（`handle_raw` 那条非对话路不走这里）。
+            method: "POST".to_string(),
+            path: path.clone(),
+            headers: headers_to_json(&headers),
+            body: Some(body.clone()),
+        },
+    );
     // 控制句柄挂在底账上，随 `remove` 一起消失。挂的时机只能是这里 ——
     // 更早的话底账里还没有这一条，命令层也就查不到它。
     let control = Arc::new(crate::traffic::control::RequestControl::new());
