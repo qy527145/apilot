@@ -2,7 +2,6 @@ import type { LucideIcon } from "lucide-react";
 import {
   Activity,
   BarChart3,
-  Boxes,
   Database,
   Fingerprint,
   GitBranch,
@@ -17,9 +16,8 @@ export type ViewKey =
   | "overview"
   | "clients"
   | "providers"
-  | "models"
+  | "modelrouting"
   | "samples"
-  | "routing"
   | "traffic"
   | "tools"
   | "billing"
@@ -53,22 +51,16 @@ export const NAV_ITEMS: NavItem[] = [
     description: "上游 LLM 渠道与模型映射",
   },
   {
-    key: "models",
-    label: "模型",
-    icon: Boxes,
-    description: "各渠道声明的模型与协议可达性",
+    key: "modelrouting",
+    label: "模型路由",
+    icon: GitBranch,
+    description: "决定一条请求落到哪个渠道的哪个模型",
   },
   {
     key: "samples",
     label: "指纹样本",
     icon: Fingerprint,
     description: "远端参考库与本地模型样本",
-  },
-  {
-    key: "routing",
-    label: "路由",
-    icon: GitBranch,
-    description: "选择器热切换与路由规则链",
   },
   {
     key: "traffic",
@@ -104,6 +96,19 @@ export const NAV_ITEMS: NavItem[] = [
 
 export const VIEW_STORAGE_KEY = "apilot.currentView";
 
-export function isViewKey(v: string | null): v is ViewKey {
-  return !!v && NAV_ITEMS.some((n) => n.key === v);
+/**
+ * 已保存的视图键是否还有效。
+ *
+ * 「模型」与「路由」曾是两个页面，现在合并成 `modelrouting`。老存档里存着
+ * `models` / `routing` 时映射到新键，而不是让用户一进来就落回概览页。
+ */
+const LEGACY_VIEWS: Record<string, ViewKey> = {
+  models: "modelrouting",
+  routing: "modelrouting",
+};
+
+export function normalizeView(v: string | null): ViewKey | null {
+  if (!v) return null;
+  if (v in LEGACY_VIEWS) return LEGACY_VIEWS[v];
+  return NAV_ITEMS.some((n) => n.key === v) ? (v as ViewKey) : null;
 }

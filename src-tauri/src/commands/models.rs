@@ -1,4 +1,4 @@
-//! 模型视角的命令：模型目录、渠道选择策略、候选渠道、测速。
+//! 模型视角的命令：模型目录、渠道强制选择、候选渠道、测速。
 //!
 //! 与 `commands/providers.rs` 的分工：那边是"这个渠道提供哪些模型"（渠道视角），
 //! 这边是"这个模型在哪些渠道上有、优先走哪个"（模型视角）。同一张
@@ -11,9 +11,7 @@ use tauri::State;
 
 use crate::error::{AppError, AppResult};
 use crate::shell::AppShell;
-use crate::storage::models::{
-    ModelCandidate, ModelCatalogEntry, ModelPolicyRecord, ModelStrategy,
-};
+use crate::storage::models::{ModelCandidate, ModelCatalogEntry, ModelPolicyRecord};
 use crate::storage::providers::ModelCandidateRow;
 
 /// 全局模型替换策略的读写（写在 `config::settings` 里，这里只是转个手）。
@@ -22,7 +20,7 @@ pub fn get_model_policy(shell: State<'_, Arc<AppShell>>) -> crate::config::setti
     shell.settings().model_policy.clone()
 }
 
-/// 模型目录：所有被声明过的模型 + 各自的候选渠道、策略、当前主渠道。
+/// 模型目录：所有被声明过的模型 + 各自的候选渠道、强制渠道、当前主渠道。
 #[tauri::command]
 pub async fn list_model_catalog(
     shell: State<'_, Arc<AppShell>>,
@@ -41,12 +39,10 @@ pub async fn list_model_catalog(
         let candidates: Vec<ModelCandidate> = rows
             .into_iter()
             .map(|r| ModelCandidate {
-                latency_ms: shell.probe_latency.get(&r.provider_tag).map(|v| *v),
                 provider_tag: r.provider_tag,
                 provider_name: r.provider_name,
                 upstream_model: r.upstream_model,
                 priority: r.priority,
-                weight: r.weight,
                 enabled: r.enabled,
             })
             .collect();
@@ -74,29 +70,18 @@ pub async fn list_model_catalog(
 
 /// 当前会走哪个渠道。
 ///
-/// 加权随机策略返回 `None` —— 它每次请求都重抽，没有"当前"可言，
-/// 界面显示成"按权重随机"比显示一个会跳的数字诚实。
+/// 有策略行就按候选顺序算（点名的渠道在前）；没有行返回 `None`，由调用方
+/// 回落成"selector 会选谁"。与请求时的行为同口径。
 fn primary_of(policy: &Option<ModelPolicyRecord>, candidates: &[ModelCandidate]) -> Option<String> {
     let p = policy.as_ref()?;
-    if let Some(active) = p.active_provider.as_deref() {
-        if candidates.iter().any(|c| c.provider_tag == active) {
-            return Some(active.to_string());
-        }
-    }
-    if p.strategy == ModelStrategy::Weight {
-        return None;
-    }
-    // 展示用 roll=0（最高权重那个），请求时才会随机。
     let ranked: Vec<crate::routing::model_select::Candidate> = candidates
         .iter()
         .map(|c| crate::routing::model_select::Candidate {
             tag: c.provider_tag.clone(),
             priority: c.priority,
-            weight: c.weight,
-            latency_ms: c.latency_ms,
         })
         .collect();
-    crate::routing::model_select::order(Some(p), ranked, 0.0)
+    crate::routing::model_select::order(Some(p), ranked)
         .into_iter()
         .next()
 }
@@ -135,18 +120,15 @@ pub async fn switch_model_channel(
     model: String,
     provider_tag: String,
 ) -> AppResult<ModelPolicyRecord> {
-    let existing = crate::storage::model_policies::get(&shell.db, &model).await?;
     let next = ModelPolicyRecord {
         model: model.clone(),
-        // 之前没配过就沿用默认策略 —— 用户只是点了个渠道，不该顺便改变选法。
-        strategy: existing.map(|p| p.strategy).unwrap_or_default(),
         active_provider: Some(provider_tag),
     };
     crate::storage::model_policies::upsert(&shell.db, &next).await?;
     Ok(next)
 }
 
-/// 全量替换某模型的候选渠道（增删渠道、改上游名、调优先级/权重）。
+/// 全量替换某模型的候选渠道（增删渠道、改上游名、调优先级）。
 #[tauri::command]
 pub async fn set_model_candidates(
     shell: State<'_, Arc<AppShell>>,
@@ -164,9 +146,10 @@ pub async fn set_model_candidates(
     Ok(())
 }
 
-/// 对某模型的候选渠道跑一次测速，结果按延迟升序返回并写进缓存。
+/// 对某模型的候选渠道跑一次测速，结果按延迟升序返回。
 ///
-/// 缓存供「按延迟」策略排序使用；不落库，重启后重新测即可。
+/// 不再写进任何缓存：选渠道已经不看延迟了，这里只是给用户看"这条到底通不通、
+/// 大概多快"，所以结果随响应返回即可。
 #[tauri::command]
 pub async fn probe_model_candidates(
     shell: State<'_, Arc<AppShell>>,
@@ -176,17 +159,7 @@ pub async fn probe_model_candidates(
 
     let mut results = Vec::with_capacity(channels.len());
     for c in channels {
-        let r = super::providers::probe(shell.inner(), &c.provider).await;
-        if let Some(ms) = r.latency_ms {
-            shell
-                .probe_latency
-                .insert(c.provider.tag.clone(), ms);
-        } else {
-            // 探测失败要**清掉**旧值：留着上一次的延迟会让"按延迟选渠道"
-            // 继续把流量导向一个现在已经连不上的渠道。
-            shell.probe_latency.remove(&c.provider.tag);
-        }
-        results.push(r);
+        results.push(super::providers::probe(shell.inner(), &c.provider).await);
     }
 
     results.sort_by_key(|r| (!r.ok, r.latency_ms.unwrap_or(i64::MAX)));

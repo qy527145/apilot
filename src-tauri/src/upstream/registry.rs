@@ -139,7 +139,6 @@ mod tests {
             extra_headers: IndexMap::new(),
             param_override: None,
             model_mapping: IndexMap::new(),
-            weight: 1,
             priority: 0,
             enabled: true,
             timeout_ms: 600_000,

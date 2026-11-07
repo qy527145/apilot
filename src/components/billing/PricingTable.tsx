@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/table";
 import { qk } from "@/hooks/queries";
 import { api, type Pricing, type PricingInput } from "@/lib/api";
+import { useConfirm } from "@/lib/confirm";
 
 const FIELDS: { key: keyof PricingInput; label: string }[] = [
   { key: "model_ratio", label: "模型倍率" },
@@ -55,6 +56,7 @@ function toEditable(p: Pricing): EditableRow {
 
 export function PricingTable() {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const { data, isLoading } = useQuery({
     queryKey: qk.pricing,
     queryFn: api.listPricing,
@@ -233,8 +235,14 @@ export function PricingTable() {
                         variant="ghost"
                         size="icon"
                         onClick={() => {
-                          if (confirm(`确认删除「${row.model}」的单价？`))
-                            remove.mutate(row.model);
+                          void confirm({
+                            title: "删除单价",
+                            description: `确认删除「${row.model}」的单价？之后按兜底倍率计费。`,
+                            confirmLabel: "删除",
+                            destructive: true,
+                          }).then((ok) => {
+                            if (ok) remove.mutate(row.model);
+                          });
                         }}
                       >
                         <Trash2 className="size-4 text-destructive" />

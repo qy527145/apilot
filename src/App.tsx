@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { Sidebar } from "@/components/layout/Sidebar";
-import { VIEW_STORAGE_KEY, isViewKey, type ViewKey } from "@/components/layout/nav";
+import { VIEW_STORAGE_KEY, normalizeView, type ViewKey } from "@/components/layout/nav";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Toaster } from "@/components/ui/sonner";
+import { ConfirmProvider } from "@/lib/confirm";
 import { useAppInfo, useGatewayStatus } from "@/hooks/queries";
 import {
   UnsavedChangesProvider,
@@ -23,9 +24,8 @@ import {
 import OverviewPage from "@/pages/OverviewPage";
 import ClientsPage from "@/pages/ClientsPage";
 import ProvidersPage from "@/pages/ProvidersPage";
-import ModelsPage from "@/pages/ModelsPage";
+import ModelRoutingPage from "@/pages/ModelRoutingPage";
 import SamplesPage from "@/pages/SamplesPage";
-import RoutingPage from "@/pages/RoutingPage";
 import TrafficPage from "@/pages/TrafficPage";
 import ToolsPage from "@/pages/ToolsPage";
 import BillingPage from "@/pages/BillingPage";
@@ -52,8 +52,8 @@ const queryClient = new QueryClient({
 
 function Shell() {
   const [view, setView] = useState<ViewKey>(() => {
-    const saved = localStorage.getItem(VIEW_STORAGE_KEY);
-    return isViewKey(saved) ? saved : "overview";
+    // 老的 `models` / `routing` 会在这里折成合并后的 `modelrouting`。
+    return normalizeView(localStorage.getItem(VIEW_STORAGE_KEY)) ?? "overview";
   });
   /** 被未保存改动拦下来的目标页；非空即表示确认弹窗开着。 */
   const [pendingView, setPendingView] = useState<ViewKey | null>(null);
@@ -106,9 +106,8 @@ function Shell() {
         {view === "overview" && <OverviewPage onNavigate={selectView} />}
         {view === "clients" && <ClientsPage onNavigate={selectView} />}
         {view === "providers" && <ProvidersPage />}
-        {view === "models" && <ModelsPage onNavigate={selectView} />}
+        {view === "modelrouting" && <ModelRoutingPage onNavigate={selectView} />}
         {view === "samples" && <SamplesPage />}
-        {view === "routing" && <RoutingPage />}
         {view === "traffic" && <TrafficPage />}
         {view === "tools" && <ToolsPage />}
         {view === "billing" && <BillingPage />}
@@ -155,9 +154,11 @@ function Shell() {
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <UnsavedChangesProvider>
-        <Shell />
-      </UnsavedChangesProvider>
+      <ConfirmProvider>
+        <UnsavedChangesProvider>
+          <Shell />
+        </UnsavedChangesProvider>
+      </ConfirmProvider>
       <Toaster />
     </QueryClientProvider>
   );

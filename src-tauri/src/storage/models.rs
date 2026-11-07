@@ -237,7 +237,8 @@ pub struct Provider {
     pub param_override: Option<serde_json::Value>,
     /// 入站模型名 → 上游模型名。
     pub model_mapping: indexmap::IndexMap<String, String>,
-    pub weight: i64,
+    /// 渠道级排序位。模型级的顺序在 `provider_models.priority` 上，
+    /// 这一列只决定「selector 的成员顺序」与通吃渠道的兜底次序。
     pub priority: i64,
     pub enabled: bool,
     pub timeout_ms: i64,
@@ -359,42 +360,6 @@ impl Provider {
     }
 }
 
-/// 某模型在多个渠道都有时，怎么决定走哪个。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelStrategy {
-    /// 按每模型的优先级（高者先），失败换下一个。默认 —— 行为最好预测。
-    Priority,
-    /// 按最近一次测速的延迟（低者先）；没测过的排最后。
-    Latency,
-    /// 按权重加权随机选主渠道，其余按优先级依次兜底。用于分流。
-    Weight,
-}
-
-impl ModelStrategy {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Priority => "priority",
-            Self::Latency => "latency",
-            Self::Weight => "weight",
-        }
-    }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "latency" => Self::Latency,
-            "weight" => Self::Weight,
-            _ => Self::Priority,
-        }
-    }
-}
-
-impl Default for ModelStrategy {
-    fn default() -> Self {
-        Self::Priority
-    }
-}
-
 /// 一个模型的渠道选择策略。
 ///
 /// **没有这一行 = 完全交给 selector 与路由规则** —— 这是全部旧行为得以保持的界线：
@@ -402,24 +367,23 @@ impl Default for ModelStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPolicyRecord {
     pub model: String,
-    pub strategy: ModelStrategy,
-    /// 手动切换到的渠道 tag。设了就无视策略，直接用它。
+    /// 强制走这个渠道 tag（必须在候选里）。`None` = 按候选列表的顺序走。
+    ///
+    /// 选渠道只剩两件事：一张按优先级排好的候选列表，以及这个"点名"。
+    /// 曾经的按延迟 / 按权重随机会让"这个模型现在走哪个渠道"变成一个
+    /// 每次请求都要重算、且界面上说不清的问题，已经去掉。
     pub active_provider: Option<String>,
 }
 
-/// 一条候选渠道。`priority` / `weight` 是**这个模型在**该渠道上的值，
-/// 不是渠道自身的 —— 模型页调的就是它们。
+/// 一条候选渠道。`priority` 是**这个模型在**该渠道上的值，不是渠道自身的 ——
+/// 合并页面拖出来的顺序就是它。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCandidate {
     pub provider_tag: String,
     pub provider_name: String,
     pub upstream_model: Option<String>,
     pub priority: i64,
-    pub weight: i64,
     pub enabled: bool,
-    /// 最近一次测速的延迟；没测过是 `None`。
-    #[serde(default)]
-    pub latency_ms: Option<i64>,
 }
 
 /// 模型页要的一整条：模型名 + 它的候选渠道 + 策略。
@@ -442,7 +406,6 @@ pub struct ProviderModel {
     pub upstream_model: Option<String>,
     pub client_group: String,
     pub priority: i64,
-    pub weight: i64,
     pub enabled: bool,
 }
 
@@ -463,7 +426,6 @@ mod tests {
             extra_headers: Default::default(),
             param_override: None,
             model_mapping: Default::default(),
-            weight: 1,
             priority: 0,
             enabled: true,
             timeout_ms: 600_000,

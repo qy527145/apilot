@@ -1,30 +1,30 @@
-//! 每个模型的渠道选择策略。
+//! 每个模型的渠道强制选择。
 //!
-//! 表里**没有行**就等于"这个模型交给 selector 与路由规则管" —— 这条界线是
-//! 旧行为得以保持的关键：不在模型页碰过的模型，路由结果与改动前逐条一致。
+//! 选渠道只有两件事：`provider_models.priority` 排出来的候选顺序，以及这张表里
+//! 的"点名"（`active_provider`）。表里**没有行**就等于"这个模型交给 selector 与
+//! 路由规则管" —— 这条界线是旧行为得以保持的关键。
 
 use sqlx::{Row, SqlitePool};
 
-use super::models::{ModelPolicyRecord, ModelStrategy};
+use super::models::ModelPolicyRecord;
 use crate::error::AppResult;
 use crate::util::now_ms;
 
 pub async fn get(pool: &SqlitePool, model: &str) -> AppResult<Option<ModelPolicyRecord>> {
-    let row = sqlx::query("SELECT model, strategy, active_provider FROM model_policies WHERE model = ?1")
+    let row = sqlx::query("SELECT model, active_provider FROM model_policies WHERE model = ?1")
         .bind(model)
         .fetch_optional(pool)
         .await?;
 
     Ok(row.as_ref().map(|r| ModelPolicyRecord {
         model: r.get("model"),
-        strategy: ModelStrategy::parse(r.get::<String, _>("strategy").as_str()),
         active_provider: r.get("active_provider"),
     }))
 }
 
 /// 一次读回全部策略，避免模型目录逐条查库。
 pub async fn all(pool: &SqlitePool) -> AppResult<Vec<ModelPolicyRecord>> {
-    let rows = sqlx::query("SELECT model, strategy, active_provider FROM model_policies")
+    let rows = sqlx::query("SELECT model, active_provider FROM model_policies")
         .fetch_all(pool)
         .await?;
 
@@ -32,7 +32,6 @@ pub async fn all(pool: &SqlitePool) -> AppResult<Vec<ModelPolicyRecord>> {
         .iter()
         .map(|r| ModelPolicyRecord {
             model: r.get("model"),
-            strategy: ModelStrategy::parse(r.get::<String, _>("strategy").as_str()),
             active_provider: r.get("active_provider"),
         })
         .collect())
@@ -53,16 +52,16 @@ pub async fn upsert(pool: &SqlitePool, rec: &ModelPolicyRecord) -> AppResult<()>
         }
     }
 
+    // 老库上 `strategy` 列还在（NOT NULL DEFAULT 'priority'），不写它就走默认值：
+    // 那一列已经没有任何读取点，删列要重建表，不值得为它动迁移。
     sqlx::query(
-        "INSERT INTO model_policies (model, strategy, active_provider, updated_at)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO model_policies (model, active_provider, updated_at)
+         VALUES (?1, ?2, ?3)
          ON CONFLICT(model) DO UPDATE SET
-             strategy = excluded.strategy,
              active_provider = excluded.active_provider,
              updated_at = excluded.updated_at",
     )
     .bind(&rec.model)
-    .bind(rec.strategy.as_str())
     .bind(rec.active_provider.as_deref().filter(|s| !s.is_empty()))
     .bind(now_ms())
     .execute(pool)
@@ -103,7 +102,6 @@ mod tests {
                 protocols: Vec::new(),
                 extra_headers: Default::default(),
                 param_override: None,
-                weight: 1,
                 priority: 0,
                 enabled: true,
                 timeout_ms: 60_000,
@@ -131,7 +129,6 @@ mod tests {
             &p,
             &ModelPolicyRecord {
                 model: "m".into(),
-                strategy: ModelStrategy::Latency,
                 active_provider: None,
             },
         )
@@ -139,14 +136,13 @@ mod tests {
         .unwrap();
 
         let got = get(&p, "m").await.unwrap().unwrap();
-        assert_eq!(got.strategy, ModelStrategy::Latency);
+        assert_eq!(got.active_provider, None);
 
         // 再写一次是原地更新，不是插一行新的。
         upsert(
             &p,
             &ModelPolicyRecord {
                 model: "m".into(),
-                strategy: ModelStrategy::Weight,
                 active_provider: Some("a".into()),
             },
         )
@@ -155,7 +151,6 @@ mod tests {
 
         assert_eq!(all(&p).await.unwrap().len(), 1);
         let got = get(&p, "m").await.unwrap().unwrap();
-        assert_eq!(got.strategy, ModelStrategy::Weight);
         assert_eq!(got.active_provider.as_deref(), Some("a"));
     }
 
@@ -167,7 +162,6 @@ mod tests {
             &p,
             &ModelPolicyRecord {
                 model: "m".into(),
-                strategy: ModelStrategy::Priority,
                 active_provider: Some("nope".into()),
             },
         )
@@ -184,7 +178,6 @@ mod tests {
             &p,
             &ModelPolicyRecord {
                 model: "m".into(),
-                strategy: ModelStrategy::Priority,
                 active_provider: Some(String::new()),
             },
         )
@@ -200,7 +193,6 @@ mod tests {
             &p,
             &ModelPolicyRecord {
                 model: "m".into(),
-                strategy: ModelStrategy::Priority,
                 active_provider: None,
             },
         )
@@ -211,13 +203,5 @@ mod tests {
         assert!(get(&p, "m").await.unwrap().is_none());
         // 删不存在的也不报错。
         delete(&p, "m").await.unwrap();
-    }
-
-    #[test]
-    fn strategy_parse_falls_back_to_priority() {
-        // 脏数据不该让整个模型页打不开。
-        assert_eq!(ModelStrategy::parse("nonsense"), ModelStrategy::Priority);
-        assert_eq!(ModelStrategy::parse("latency"), ModelStrategy::Latency);
-        assert_eq!(ModelStrategy::parse("weight"), ModelStrategy::Weight);
     }
 }

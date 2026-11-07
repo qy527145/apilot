@@ -92,8 +92,6 @@ pub enum Outcome {
         basis: CandidateBasis,
         /// 第一个是主渠道，其余按顺序故障转移。
         candidates: Vec<CandidateView>,
-        /// 结果里带随机性或这里没模拟的部分，给用户的提醒。
-        notes: Vec<String>,
     },
 }
 
@@ -200,8 +198,7 @@ async fn route_to_channels(
     };
 
     let (candidates, basis) =
-        build_candidates_explained(shell, &primary, model, protocol, crate::util::rand_unit())
-            .await;
+        build_candidates_explained(shell, &primary, model, protocol).await;
 
     let candidates = candidates
         .iter()
@@ -223,29 +220,9 @@ async fn route_to_channels(
         selector,
         rule_id,
         model: model.to_string(),
-        notes: notes_for(basis),
         basis,
         candidates,
     }
-}
-
-fn notes_for(basis: CandidateBasis) -> Vec<String> {
-    let mut notes = Vec::new();
-    if let CandidateBasis::ModelPolicy {
-        strategy: crate::storage::models::ModelStrategy::Weight,
-        pinned: false,
-    } = basis
-    {
-        notes.push("按权重随机选主渠道：每次测试（和每个真实请求）的主渠道可能不同".into());
-    }
-    if let CandidateBasis::ModelPolicy {
-        strategy: crate::storage::models::ModelStrategy::Latency,
-        pinned: false,
-    } = basis
-    {
-        notes.push("按最近一次测速排序：测速结果变了，顺序也会跟着变".into());
-    }
-    notes
 }
 
 /// 把条件拼成请求头 —— 交给线上同一个 `detect_client` 和规则链去读。
@@ -320,22 +297,5 @@ mod tests {
         let h = build_headers(&i);
         assert_eq!(h.len(), 1);
         assert_eq!(h.get("x-ok").unwrap(), "1");
-    }
-
-    #[test]
-    fn only_unpinned_random_or_latency_orderings_carry_a_note() {
-        use crate::storage::models::ModelStrategy;
-        let weight = CandidateBasis::ModelPolicy {
-            strategy: ModelStrategy::Weight,
-            pinned: false,
-        };
-        assert_eq!(notes_for(weight).len(), 1);
-        // 手动切换过的渠道盖过策略，结果是确定的，不该再吓唬用户。
-        let pinned = CandidateBasis::ModelPolicy {
-            strategy: ModelStrategy::Weight,
-            pinned: true,
-        };
-        assert!(notes_for(pinned).is_empty());
-        assert!(notes_for(CandidateBasis::Selector).is_empty());
     }
 }

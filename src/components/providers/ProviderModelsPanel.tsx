@@ -39,7 +39,7 @@ import {
 
 interface Row {
   model: string;
-  /** 上游名。这里只读展示 —— 改它去路由页的「模型的渠道选择」。 */
+  /** 上游名。这里只读展示 —— 改它去「模型路由」页的「模型的渠道选择」。 */
   upstream_model: string;
 }
 
@@ -51,10 +51,10 @@ type ProbeState = Record<string, Capability | "loading" | "done">;
 /**
  * 渠道行展开后的模型声明编辑器：**这个渠道支持哪些模型**。
  *
- * 只管"有哪些"，不管"叫什么"——上游名归路由页的「模型的渠道选择」管（那边按
- * 「模型 × 渠道」列候选，是同一张 provider_models 表的另一个视角）。
+ * 只管"有哪些"，不管"叫什么"——上游名归「模型路由」页的「模型的渠道选择」管
+ * （那边按「模型 × 渠道」列候选，是同一张 provider_models 表的另一个视角）。
  * 注意 ModelChannelPicker 这个组件虽然在 components/models/ 目录下，但渲染它的是
- * RoutingPage —— 别按目录名猜成模型页，界面上它属于路由页。
+ * ModelRoutingPage —— 别按目录名猜成别的页面。
  * 两处都能全量替换自己那一维，
  * 所以这里的保存必须按模型名保留已有的上游名，见 `providers::set_models`。
  */
@@ -117,7 +117,7 @@ export function ProviderModelsPanel({
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.providerModels(providerId) });
-      // 模型页的目录是从 provider_models 派生的，声明变了它也得变。
+      // 模型路由页的目录是从 provider_models 派生的，声明变了它也得变。
       qc.invalidateQueries({ queryKey: qk.modelCatalog });
       // 接管页的就绪判定取决于"有没有声明过模型"，改完得让它重新问一次后端。
       qc.invalidateQueries({ queryKey: qk.takeoverReadiness });
@@ -312,11 +312,11 @@ export function ProviderModelsPanel({
       </div>
 
       <p className="text-muted-foreground text-xs">
-        这份清单决定模型页里出现哪些模型、路由时哪些模型名会选中这条渠道。
+        这份清单决定模型路由页里出现哪些模型、路由时哪些模型名会选中这条渠道。
         新建渠道时会自动从上游拉一份填进来；拉不到（服务商没有{" "}
         <code>/v1/models</code>）或想增删，在这里改就好。
         每行右边的「→ 上游名」是这个渠道实际发给上游的模型名，只读 —— 要改去
-        <b>路由页</b>的「模型的渠道选择」。
+        <b>模型路由</b>页的「模型的渠道选择」。
         一个模型都不声明的渠道视为「通吃」，任何模型名都会转发过去。
       </p>
 

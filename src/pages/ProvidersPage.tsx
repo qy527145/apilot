@@ -41,6 +41,7 @@ import {
   type Protocol,
   type Provider,
 } from "@/lib/api";
+import { useConfirm } from "@/lib/confirm";
 import { cn, formatNumber } from "@/lib/utils";
 
 const KIND_LABEL: Record<string, string> = {
@@ -60,6 +61,7 @@ const supportedProtocols = (p: Provider): Protocol[] =>
 
 export default function ProvidersPage() {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Provider | null>(null);
   /** 复制来源：非空时对话框走「新建」，但表单预填它的全部配置。 */
@@ -110,7 +112,7 @@ export default function ProvidersPage() {
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: qk.providers });
-      // 渠道的启用状态会改变模型页的候选列表。
+      // 渠道的启用状态会改变模型路由页的候选列表。
       qc.invalidateQueries({ queryKey: qk.modelCatalog });
     },
   });
@@ -197,7 +199,6 @@ export default function ProvidersPage() {
                   </TableHead>
                   <TableHead className="text-center">状态</TableHead>
                   <TableHead className="text-right">优先级</TableHead>
-                  <TableHead className="text-right">权重</TableHead>
                   <TableHead className="text-right">操作</TableHead>
                 </TableRow>
               </TableHeader>
@@ -287,9 +288,6 @@ export default function ProvidersPage() {
                         <TableCell className="text-right tabular-nums">
                           {formatNumber(p.priority)}
                         </TableCell>
-                        <TableCell className="text-right tabular-nums">
-                          {formatNumber(p.weight)}
-                        </TableCell>
                         <TableCell>
                           <div className="flex items-center justify-end gap-1">
                             <ProbeButton
@@ -328,9 +326,14 @@ export default function ProvidersPage() {
                                   variant="ghost"
                                   size="icon"
                                   disabled={del.isPending}
-                                  onClick={() => {
-                                    if (confirm(`确认删除渠道「${p.name}」？`))
-                                      del.mutate(p.id);
+                                  onClick={async () => {
+                                    const ok = await confirm({
+                                      title: "删除渠道",
+                                      description: `确认删除渠道「${p.name}」？选择器里对它的引用会一并移除。`,
+                                      confirmLabel: "删除",
+                                      destructive: true,
+                                    });
+                                    if (ok) del.mutate(p.id);
                                   }}
                                 >
                                   <Trash2 className="size-4 text-destructive" />
@@ -343,7 +346,7 @@ export default function ProvidersPage() {
                       </TableRow>
                       {isOpen && (
                         <TableRow>
-                          <TableCell colSpan={9} className="bg-muted/20 p-0">
+                          <TableCell colSpan={8} className="bg-muted/20 p-0">
                             <ProviderModelsPanel
                               providerId={p.id}
                               providerName={p.name}
@@ -421,7 +424,7 @@ function ProbeButton({
  * 「状态」那一列的药丸开关。
  *
  * 用按钮而不是 `Switch`：这一列原先是个只读徽标，换成开关轨之后宽度、点击热区
- * 都变了，而同桌还有优先级 / 权重两列数字挤在右边。药丸保持原来的视觉分量
+ * 都变了，而同桌还有优先级一列数字挤在右边。药丸保持原来的视觉分量
  * （绿=启用、灰=停用），点一下就切，且带明确的 hover 反馈。
  */
 function StatusToggle({

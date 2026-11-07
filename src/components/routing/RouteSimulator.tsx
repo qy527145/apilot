@@ -45,16 +45,14 @@ const STAGE_LABEL: Record<SimulateResult["model_steps"][number]["stage"], string
   rule: "路由规则",
 };
 
-const STRATEGY_LABEL = { priority: "优先级", latency: "延迟", weight: "权重" } as const;
-
 function describeBasis(b: CandidateBasis): string {
   switch (b.kind) {
     case "model_policy":
       return b.pinned
-        ? "模型渠道策略：手动指定的渠道"
-        : `模型渠道策略：按${STRATEGY_LABEL[b.strategy]}`;
+        ? "模型渠道：指定了具体渠道"
+        : "模型渠道：按候选列表的优先级";
     case "model_policy_fallback":
-      return "模型配了渠道策略，但没有可用渠道，落回选择器";
+      return "模型配了渠道，但没有可用渠道，落回选择器";
     case "declared_channels":
       return "声明了该模型的渠道优先，选择器选的渠道兜底";
     case "selector":
@@ -318,11 +316,6 @@ function ResultView({ result }: { result: SimulateResult }) {
               </div>
             ))}
           </div>
-          {outcome.notes.map((n) => (
-            <div key={n} className="text-amber-600 dark:text-amber-400">
-              {n}
-            </div>
-          ))}
         </div>
       )}
     </div>

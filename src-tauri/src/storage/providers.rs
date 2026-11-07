@@ -30,8 +30,6 @@ pub struct ProviderInput {
     pub extra_headers: IndexMap<String, String>,
     #[serde(default)]
     pub param_override: Option<Value>,
-    #[serde(default = "default_weight")]
-    pub weight: i64,
     #[serde(default)]
     pub priority: i64,
     #[serde(default = "default_true")]
@@ -49,9 +47,6 @@ pub struct ProviderInput {
 
 fn default_auth_style() -> AuthStyle {
     AuthStyle::Bearer
-}
-fn default_weight() -> i64 {
-    1
 }
 fn default_true() -> bool {
     true
@@ -143,7 +138,7 @@ async fn unique_tag(pool: &SqlitePool, base: &str) -> AppResult<String> {
 }
 
 const SELECT_COLUMNS: &str = "id, tag, name, kind, base_url, api_key, auth_style, \
-     protocols, extra_headers, param_override, model_mapping, weight, priority, enabled, \
+     protocols, extra_headers, param_override, model_mapping, priority, enabled, \
      timeout_ms, proxy, metadata_source, created_at, updated_at";
 
 fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Provider {
@@ -167,7 +162,6 @@ fn row_to_provider(row: &sqlx::sqlite::SqliteRow) -> Provider {
             .get::<Option<String>, _>("param_override")
             .and_then(|s| serde_json::from_str(&s).ok()),
         model_mapping: json_map(row.get("model_mapping")),
-        weight: row.get("weight"),
         priority: row.get("priority"),
         enabled: row.get::<i64, _>("enabled") != 0,
         timeout_ms: row.get("timeout_ms"),
@@ -246,10 +240,10 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             let result = sqlx::query(
                 "UPDATE providers SET name=?1, kind=?2, base_url=?3,
                      api_key = COALESCE(?4, api_key), auth_style=?5, protocols=?6,
-                     extra_headers=?7, param_override=?8, weight=?9,
-                     priority=?10, enabled=?11, timeout_ms=?12, updated_at=?13,
-                     proxy=?14, metadata_source=?15
-                 WHERE id=?16",
+                     extra_headers=?7, param_override=?8,
+                     priority=?9, enabled=?10, timeout_ms=?11, updated_at=?12,
+                     proxy=?13, metadata_source=?14
+                 WHERE id=?15",
             )
             .bind(&input.name)
             .bind(input.kind.as_str())
@@ -259,7 +253,6 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(&protocols)
             .bind(&extra)
             .bind(&param_override)
-            .bind(input.weight)
             .bind(input.priority)
             .bind(input.enabled as i64)
             .bind(input.timeout_ms)
@@ -279,9 +272,9 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             let tag = unique_tag(pool, &slugify(&input.name)).await?;
             let result = sqlx::query(
                 "INSERT INTO providers (tag, name, kind, base_url, api_key, auth_style,
-                     protocols, extra_headers, param_override, weight, priority,
+                     protocols, extra_headers, param_override, priority,
                      enabled, timeout_ms, created_at, updated_at, proxy, metadata_source)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,?15,?16)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14,?15)",
             )
             .bind(&tag)
             .bind(&input.name)
@@ -292,7 +285,6 @@ pub async fn upsert(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provi
             .bind(&protocols)
             .bind(&extra)
             .bind(&param_override)
-            .bind(input.weight)
             .bind(input.priority)
             .bind(input.enabled as i64)
             .bind(input.timeout_ms)
@@ -362,7 +354,7 @@ pub async fn set_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> AppResult
 
 pub async fn list_models(pool: &SqlitePool, provider_id: i64) -> AppResult<Vec<ProviderModel>> {
     let rows = sqlx::query(
-        "SELECT id, provider_id, model, upstream_model, client_group, priority, weight, enabled
+        "SELECT id, provider_id, model, upstream_model, client_group, priority, enabled
          FROM provider_models WHERE provider_id = ?1 ORDER BY model ASC",
     )
     .bind(provider_id)
@@ -378,7 +370,6 @@ pub async fn list_models(pool: &SqlitePool, provider_id: i64) -> AppResult<Vec<P
             upstream_model: r.get("upstream_model"),
             client_group: r.get("client_group"),
             priority: r.get("priority"),
-            weight: r.get("weight"),
             enabled: r.get::<i64, _>("enabled") != 0,
         })
         .collect())
@@ -429,9 +420,9 @@ async fn rebuild_model_mapping(
 /// （`set_model_candidates`）。已有的上游名按模型名原样保留，否则在渠道面板
 /// 点一次保存就会把别处配好的重定向全抹掉。
 ///
-/// 写的优先级/权重直接取该渠道自己的值 —— 每模型的 priority/weight 是
+/// 写的优先级直接取该渠道自己的值 —— 每模型的 priority 是
 /// `channels_for_model` 的排序依据，默认应当等于渠道级的值，
-/// 否则"没单独配过"的模型会因为 0/1 的默认值被排到别的渠道后面。
+/// 否则"没单独配过"的模型会因为 0 的默认值被排到别的渠道后面。
 pub async fn set_models(
     pool: &SqlitePool,
     provider_id: i64,
@@ -439,8 +430,8 @@ pub async fn set_models(
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
 
-    let (base_priority, base_weight): (i64, i64) = sqlx::query_as(
-        "SELECT priority, weight FROM providers WHERE id = ?1",
+    let base_priority: i64 = sqlx::query_scalar(
+        "SELECT priority FROM providers WHERE id = ?1",
     )
     .bind(provider_id)
     .fetch_optional(&mut *tx)
@@ -473,14 +464,13 @@ pub async fn set_models(
 
         sqlx::query(
             "INSERT INTO provider_models (provider_id, model, upstream_model, client_group,
-                 priority, weight, enabled)
-             VALUES (?1, ?2, ?3, '*', ?4, ?5, ?6)",
+                 priority, enabled)
+             VALUES (?1, ?2, ?3, '*', ?4, ?5)",
         )
         .bind(provider_id)
         .bind(model)
         .bind(upstream)
         .bind(base_priority)
-        .bind(base_weight)
         .bind(enabled)
         .execute(&mut *tx)
         .await?;
@@ -496,10 +486,9 @@ pub async fn set_models(
 pub struct ModelCandidateRow {
     pub provider_tag: String,
     pub upstream_model: Option<String>,
+    /// 这个模型在该渠道上的排序位，**高者先**。合并页面拖出来的顺序就是它。
     #[serde(default)]
     pub priority: i64,
-    #[serde(default = "default_weight")]
-    pub weight: i64,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -536,16 +525,17 @@ pub async fn set_model_candidates(
             .await?
             .ok_or_else(|| AppError::ProviderNotFound(row.provider_tag.clone()))?;
 
+        // `weight` 列还在表上，但已经没有任何读取点：选渠道只看 priority。
+        // 不写它就取列默认值，省得为一个死字段维护写入。
         sqlx::query(
             "INSERT INTO provider_models (provider_id, model, upstream_model, client_group,
-                 priority, weight, enabled)
-             VALUES (?1, ?2, ?3, '*', ?4, ?5, ?6)",
+                 priority, enabled)
+             VALUES (?1, ?2, ?3, '*', ?4, ?5)",
         )
         .bind(provider_id)
         .bind(model)
         .bind(&row.upstream_model)
         .bind(row.priority)
-        .bind(row.weight)
         .bind(row.enabled as i64)
         .execute(&mut *tx)
         .await?;
@@ -575,12 +565,12 @@ pub async fn candidates_for_model(
     model: &str,
 ) -> AppResult<Vec<ProviderModelCandidate>> {
     let rows = sqlx::query(
-        "SELECT p.tag, p.name, m.upstream_model, m.priority, m.weight,
+        "SELECT p.tag, p.name, m.upstream_model, m.priority,
                 (m.enabled = 1 AND p.enabled = 1) AS effective_enabled
          FROM provider_models m
          JOIN providers p ON p.id = m.provider_id
          WHERE m.model = ?1
-         ORDER BY m.priority DESC, m.weight DESC, p.id ASC",
+         ORDER BY m.priority DESC, p.id ASC",
     )
     .bind(model)
     .fetch_all(pool)
@@ -593,7 +583,6 @@ pub async fn candidates_for_model(
             provider_name: r.get("name"),
             upstream_model: r.get("upstream_model"),
             priority: r.get("priority"),
-            weight: r.get("weight"),
             // 渠道停用或这一条被停用，都算不可用 —— 界面只关心"它现在会不会被选中"。
             enabled: r.get::<i64, _>("effective_enabled") != 0,
         })
@@ -607,7 +596,6 @@ pub struct ProviderModelCandidate {
     pub provider_name: String,
     pub upstream_model: Option<String>,
     pub priority: i64,
-    pub weight: i64,
     pub enabled: bool,
 }
 
@@ -643,22 +631,21 @@ pub async fn has_declared_models(pool: &SqlitePool) -> AppResult<bool> {
 ///
 /// 没在 `provider_models` 里声明任何模型的渠道视为"通吃"，也会被返回 ——
 /// 否则用户新建渠道后必须手工录入模型才能用，体验很差。
-/// 候选渠道 + 它在**这个模型上**的优先级/权重。
+/// 候选渠道 + 它在**这个模型上**的优先级。
 ///
-/// 排序要用的是每模型的值（模型页调的就是它们），而 `Provider` 上带的是渠道级的
-/// 那两个，取值口径不同，所以必须一起返回，不能让调用方自己去猜。
+/// 排序要用的是每模型的值（合并页面调的就是它），而 `Provider` 上带的是渠道级的
+/// 那个，取值口径不同，所以必须一起返回，不能让调用方自己去猜。
 #[derive(Debug, Clone)]
 pub struct CandidateChannel {
     pub provider: Provider,
     pub priority: i64,
-    pub weight: i64,
 }
 
 /// 提供该模型的启用渠道，按优先级排好序。
 ///
-/// 排序用的是 **`provider_models` 上的每模型 priority/weight**（迁移 v4 已把
+/// 排序用的是 **`provider_models` 上的每模型 priority**（迁移 v4 已把
 /// 既有行按渠道的值回填了一次，所以老配置的顺序与改动前一致），
-/// 没声明过模型的"通吃"渠道回落到渠道自身的值。
+/// 没声明过模型的"通吃"渠道回落到渠道自身的优先级。
 ///
 /// 子查询而不是 JOIN：`SELECT_COLUMNS` 里的列名没有限定前缀，与 `provider_models`
 /// 一起查会撞上同名的 `id`。
@@ -671,11 +658,7 @@ pub async fn candidate_channels(
                 COALESCE(
                   (SELECT m.priority FROM provider_models m
                    WHERE m.provider_id = p.id AND m.model = ?1 AND m.enabled = 1),
-                  p.priority) AS eff_priority,
-                COALESCE(
-                  (SELECT m.weight FROM provider_models m
-                   WHERE m.provider_id = p.id AND m.model = ?1 AND m.enabled = 1),
-                  p.weight) AS eff_weight
+                  p.priority) AS eff_priority
          FROM providers p
          WHERE p.enabled = 1
            AND (
@@ -685,7 +668,7 @@ pub async fn candidate_channels(
                WHERE m.provider_id = p.id AND m.model = ?1 AND m.enabled = 1
              )
            )
-         ORDER BY eff_priority DESC, eff_weight DESC, p.id ASC"
+         ORDER BY eff_priority DESC, p.id ASC"
     ))
     .bind(model)
     .fetch_all(pool)
@@ -696,7 +679,6 @@ pub async fn candidate_channels(
         .map(|r| CandidateChannel {
             provider: row_to_provider(r),
             priority: r.get("eff_priority"),
-            weight: r.get("eff_weight"),
         })
         .collect())
 }
@@ -728,7 +710,6 @@ mod tests {
             protocols: Vec::new(),
             extra_headers: IndexMap::new(),
             param_override: None,
-            weight: 1,
             priority: 0,
             enabled: true,
             timeout_ms: 600_000,
@@ -1044,7 +1025,6 @@ mod tests {
             provider_tag: tag.into(),
             upstream_model: upstream.map(String::from),
             priority,
-            weight: 1,
             enabled: true,
         }
     }
@@ -1340,7 +1320,6 @@ mod tests {
         assert_eq!(read.api_key.as_deref(), Some("sk-test"), "密钥不能被抹掉");
         assert_eq!(read.protocols, created.protocols, "协议声明不能被重置");
         assert_eq!(read.base_url, created.base_url);
-        assert_eq!(read.weight, created.weight);
     }
 
     #[tokio::test]

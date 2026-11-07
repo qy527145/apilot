@@ -1,38 +1,25 @@
 import { useEffect, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
+import { ArrowDown, ArrowUp, Check, Gauge, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
-import { Check, Gauge, RotateCcw } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
   api,
   type ModelCandidate,
   type ModelCatalogEntry,
-  type ModelStrategy,
 } from "@/lib/api";
 import { cn, formatMs } from "@/lib/utils";
 
-const STRATEGY_LABEL: Record<ModelStrategy, string> = {
-  priority: "按优先级",
-  latency: "按延迟",
-  weight: "按权重随机",
-};
-
 /**
- * 「同一个模型在多个渠道都有时用哪个」。
+ * 「这个模型在多个渠道都有时走哪个」。
  *
- * 界面上它属于**路由页**：模型页只决定模型名，渠道归谁由这里和 selector 决定。
- * 但运行时那条界线没变 —— 模型配过策略就按策略走，没配过才回落 selector。
+ * 只有两件事：一张拖出来的顺序（写回 `provider_models.priority`，靠前的先走），
+ * 以及点击某一行把它钉成「永远走这个渠道」。没有按延迟、按权重之类的自动策略 ——
+ * 那些会让"现在到底走哪个"每请求变一次，界面上说不清，也没法复现。
  */
 export function ModelChannelPicker({
   models,
@@ -49,8 +36,9 @@ export function ModelChannelPicker({
           <Badge variant="outline">{models.length} 个模型</Badge>
         </div>
         <p className="text-muted-foreground text-xs">
-          同一个模型有多个渠道时用哪个。配过策略的模型按这里的选法走；
-          没配过的仍交给上面的选择器与路由规则 —— 想统一交给规则管，就点「交回路由规则」。
+          同一模型在多个渠道都有时，从上往下依次尝试，第一个成功的就是这次请求实际用的渠道。
+          点某一行把它钉住 = 永远先走它；再点一次取消。
+          配过的模型按这里的顺序走，没配过的仍交给路由规则与选择器。
           <br />
           「上游名」是这个渠道真正接受的模型名：留空就同名；填上它就实现了
           <b>客户端不用改配置</b>
@@ -84,23 +72,56 @@ function ModelRow({
   onInvalidate: () => void;
 }) {
   const [probing, setProbing] = useState(false);
+  const [latency, setLatency] = useState<Record<string, number | null>>({});
 
-  const resolve = useMutation({
-    mutationFn: (tag: string) => api.switchModelChannel(entry.model, tag),
-    onSuccess: (p) => {
+  const pinned = entry.policy?.active_provider ?? null;
+
+  /** 整份候选按顺序写回，优先级由位置决定（越靠前越大）。 */
+  const writeOrder = useMutation({
+    mutationFn: ({
+      ordered,
+      tag,
+      upstream,
+    }: {
+      ordered: ModelCandidate[];
+      tag?: string;
+      upstream?: string | null;
+    }) =>
+      api.setModelCandidates(
+        entry.model,
+        ordered.map((c, i) => ({
+          provider_tag: c.provider_tag,
+          upstream_model:
+            c.provider_tag === tag ? (upstream ?? null) : (c.upstream_model ?? null),
+          priority: ordered.length - i,
+          enabled: c.enabled,
+        })),
+      ),
+    onSuccess: (_r, { tag, upstream }) => {
       onInvalidate();
-      toast.success(`已切到 ${p.active_provider}`);
+      if (tag !== undefined) {
+        toast.success(
+          upstream ? `已改为发往上游的 ${upstream}` : "已恢复为同名",
+        );
+      }
     },
   });
 
-  const setStrategy = useMutation({
-    mutationFn: (strategy: ModelStrategy) =>
-      api.upsertModelPolicy({
-        model: entry.model,
-        strategy,
-        active_provider: entry.policy?.active_provider ?? null,
-      }),
-    onSuccess: onInvalidate,
+  const pin = useMutation({
+    mutationFn: (tag: string) => api.switchModelChannel(entry.model, tag),
+    onSuccess: () => {
+      onInvalidate();
+      toast.success("已钉住这个渠道");
+    },
+  });
+
+  const unpin = useMutation({
+    mutationFn: () =>
+      api.upsertModelPolicy({ model: entry.model, active_provider: null }),
+    onSuccess: () => {
+      onInvalidate();
+      toast.success("已取消钉住的渠道，按上面的顺序走");
+    },
   });
 
   const reset = useMutation({
@@ -112,44 +133,30 @@ function ModelRow({
   });
 
   const probe = useMutation({
-    mutationFn: () => {
-      setProbing(true);
-      return api.probeModelCandidates(entry.model);
-    },
+    mutationFn: () => api.probeModelCandidates(entry.model),
+    onMutate: () => setProbing(true),
     onSettled: () => setProbing(false),
     onSuccess: (results) => {
-      onInvalidate();
+      // 测速结果只用于展示：选渠道不看延迟，这里不再写任何缓存。
+      setLatency(
+        Object.fromEntries(results.map((r) => [r.tag, r.ok ? r.latency_ms ?? 0 : null])),
+      );
       const ok = results.filter((r) => r.ok).length;
       toast.success(`测速完成：${ok}/${results.length} 个渠道可用`);
     },
   });
 
-  // `set_model_candidates` 是按模型全量替换，所以每次都要把整份候选列表发回去，
-  // 只改目标渠道那一行的上游名。
-  const setUpstream = useMutation({
-    mutationFn: ({ tag, upstream }: { tag: string; upstream: string | null }) =>
-      api.setModelCandidates(
-        entry.model,
-        entry.candidates.map((c) => ({
-          provider_tag: c.provider_tag,
-          upstream_model:
-            c.provider_tag === tag ? upstream : (c.upstream_model ?? null),
-          priority: c.priority,
-          weight: c.weight,
-          enabled: c.enabled,
-        })),
-      ),
-    onSuccess: (_r, { upstream }) => {
-      onInvalidate();
-      toast.success(
-        upstream ? `已改为发往上游的 ${upstream}` : "已恢复为同名",
-      );
-    },
-  });
+  const ordered = [...entry.candidates].sort((a, b) => b.priority - a.priority);
+
+  const move = (index: number, to: number) => {
+    if (to < 0 || to >= ordered.length) return;
+    const next = [...ordered];
+    const [row] = next.splice(index, 1);
+    next.splice(to, 0, row);
+    writeOrder.mutate({ ordered: next });
+  };
 
   const managed = !!entry.policy;
-  const strategy = entry.policy?.strategy ?? "priority";
-  const hasLatency = entry.candidates.some((c) => c.latency_ms != null);
 
   return (
     <div className="space-y-2 rounded-md border p-3">
@@ -160,33 +167,6 @@ function ModelRow({
           <Badge variant="default">由这里决定</Badge>
         ) : (
           <Badge variant="secondary">沿用路由规则</Badge>
-        )}
-      </div>
-
-      <div className="flex flex-wrap items-center gap-3 text-xs">
-        <div className="flex items-center gap-2">
-          <span className="text-muted-foreground">选法</span>
-          <Select
-            value={strategy}
-            onValueChange={(v) => setStrategy.mutate(v as ModelStrategy)}
-          >
-            <SelectTrigger size="sm" className="h-7 w-36">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {(Object.keys(STRATEGY_LABEL) as ModelStrategy[]).map((s) => (
-                <SelectItem key={s} value={s}>
-                  {STRATEGY_LABEL[s]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        {strategy === "latency" && !hasLatency && (
-          <span className="text-amber-600 dark:text-amber-400">
-            还没测过速，先点右边的「测速」
-          </span>
         )}
 
         <div className="ml-auto flex items-center gap-1.5">
@@ -214,24 +194,29 @@ function ModelRow({
         </div>
       </div>
 
-      {/* 点一行即切换主渠道 —— 与代理软件选节点是同一个交互。 */}
-      {entry.candidates.map((c) => (
+      {/* 顺序即优先级：从上往下依次尝试，第一个成功的就是实际用的渠道。 */}
+      {ordered.map((c, i) => (
         <CandidateRow
           key={c.provider_tag}
           candidate={c}
+          index={i}
+          total={ordered.length}
           model={entry.model}
-          primary={entry.primary === c.provider_tag}
-          // 加权随机每次请求都重抽，没有"当前"可点。
-          canSwitch={strategy !== "weight"}
-          saving={setUpstream.isPending}
-          onSwitch={() => resolve.mutate(c.provider_tag)}
+          pinned={pinned === c.provider_tag}
+          latencyMs={latency[c.provider_tag]}
+          saving={writeOrder.isPending}
+          onMoveUp={() => move(i, i - 1)}
+          onMoveDown={() => move(i, i + 1)}
+          onTogglePin={() =>
+            pinned === c.provider_tag ? unpin.mutate() : pin.mutate(c.provider_tag)
+          }
           onSetUpstream={(upstream) =>
-            setUpstream.mutate({ tag: c.provider_tag, upstream })
+            writeOrder.mutate({ ordered, tag: c.provider_tag, upstream })
           }
         />
       ))}
 
-      {entry.candidates.length === 0 && (
+      {ordered.length === 0 && (
         <p className="text-muted-foreground text-xs">
           还没有渠道声明这个模型。
         </p>
@@ -242,51 +227,85 @@ function ModelRow({
 
 function CandidateRow({
   candidate,
+  index,
+  total,
   model,
-  primary,
-  canSwitch,
+  pinned,
+  latencyMs,
   saving,
-  onSwitch,
+  onMoveUp,
+  onMoveDown,
+  onTogglePin,
   onSetUpstream,
 }: {
   candidate: ModelCandidate;
+  index: number;
+  total: number;
   /** 入站模型名，用作上游名输入框的 placeholder（留空 = 同名）。 */
   model: string;
-  primary: boolean;
-  canSwitch: boolean;
-  /** 有上游名正在落库，期间锁住输入框。 */
+  pinned: boolean;
+  latencyMs: number | null | undefined;
   saving: boolean;
-  onSwitch: () => void;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  onTogglePin: () => void;
   onSetUpstream: (upstream: string | null) => void;
 }) {
-  const switching = canSwitch && candidate.enabled;
+  const selectable = candidate.enabled;
 
   return (
     <div
       className={cn(
         "flex w-full items-center gap-3 rounded-md border px-3 py-2 text-xs",
-        primary && "border-emerald-500/50 bg-emerald-500/5",
-        (!candidate.enabled || !canSwitch) && "opacity-60",
+        pinned && "border-emerald-500/50 bg-emerald-500/5",
+        !selectable && "opacity-60",
       )}
     >
-      {/* 点左半边即切换主渠道。右半边是输入框，不能包进这个 button 里 ——
+      <div className="flex shrink-0 flex-col">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-5"
+          disabled={index === 0}
+          onClick={onMoveUp}
+          title="上移"
+        >
+          <ArrowUp className="size-3" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-5"
+          disabled={index === total - 1}
+          onClick={onMoveDown}
+          title="下移"
+        >
+          <ArrowDown className="size-3" />
+        </Button>
+      </div>
+
+      {/* 点左半边即钉住 / 取消。右半边是输入框，不能包进这个 button 里 ——
           嵌套的表单控件会互相吃掉事件（回车、失焦都对不上）。 */}
       <button
         type="button"
-        disabled={!switching}
-        onClick={onSwitch}
+        disabled={!selectable}
+        onClick={onTogglePin}
         className={cn(
           "flex min-w-0 flex-1 items-center gap-3 text-left",
-          switching && "cursor-pointer hover:opacity-80",
+          selectable && "cursor-pointer hover:opacity-80",
         )}
       >
         <span
           className={cn(
             "flex size-4 shrink-0 items-center justify-center rounded-full border",
-            primary && "border-emerald-500 bg-emerald-500 text-white",
+            pinned && "border-emerald-500 bg-emerald-500 text-white",
           )}
         >
-          {primary && <Check className="size-3" />}
+          {pinned && <Check className="size-3" />}
+        </span>
+
+        <span className="text-muted-foreground w-5 shrink-0 text-right tabular-nums">
+          {index + 1}
         </span>
 
         <span className="min-w-0 flex-1">
@@ -312,18 +331,13 @@ function CandidateRow({
         onCommit={onSetUpstream}
       />
 
-      <span className="text-muted-foreground w-28 shrink-0 text-right tabular-nums">
-        优先级 {candidate.priority}
-        {candidate.weight !== 1 && ` · 权重 ${candidate.weight}`}
-      </span>
-
       <span className="w-16 shrink-0 text-right tabular-nums">
-        {candidate.latency_ms != null ? (
-          <span className="text-muted-foreground">
-            {formatMs(candidate.latency_ms)}
-          </span>
-        ) : (
+        {latencyMs === undefined ? (
           <span className="text-muted-foreground/50">—</span>
+        ) : latencyMs === null ? (
+          <span className="text-destructive">失败</span>
+        ) : (
+          <span className="text-muted-foreground">{formatMs(latencyMs)}</span>
         )}
       </span>
     </div>

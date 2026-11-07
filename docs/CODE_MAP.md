@@ -199,7 +199,7 @@ Anthropic 的 `input_tokens` 本就不含缓存；OpenAI 与 Responses 的 `prom
 | `session_pin.rs` | **对话级模型固定**：`SessionPins`（`ArcSwap` 里的全量快照，每请求查一次）+ `model_for`（范围 `tools` 只改带工具的请求，`all` 连旁路；`count_tokens` 在两种范围下都跟着改 —— 按 A 计数、按 B 对话会让客户端的上下文估算出错）。生效在模型策略**之后** |
 | `model_script.rs` | **用户 JS 脚本的执行器**（QuickJS，见 `Cargo.toml` 的 rquickjs）。脚本被限制成 `ctx` 的**纯函数**（无 I/O、无 `hasChannels()`），因此结果能按 (脚本, 模型, 客户端) 缓存，命中完全不进引擎。任何语法错 / 抛错 / 超时 / 非字符串返回都折成"不改写"，**绝不失败请求**。`run_json` 是给改写脚本复用的通用入口（不做 memo —— 请求体每次都不同） |
 | `rewrite_script.rs` | **请求 / 响应改写脚本**：`ctx.json` 是 IR 的 JSON 字符串，返回 JSON 字符串即改写。请求脚本在路由之后、缓存键之前生效；只要改动了就强制重编码（放弃同协议直通）。响应脚本只在 `finish_buffered` 里、计费之后生效，**真正的流式改不了** |
-| `model_select.rs` | **按模型策略给候选渠道排序**（`order()`）：按优先级 / 按延迟 / 加权随机。随机源与延迟都从外面传，所以三种策略都能脱离数据库测 |
+| `model_select.rs` | **给候选渠道排序**（`order()`）：只有两条规则 —— 每模型 `priority` 降序、`active_provider` 点名的渠道提到最前；其余保持优先级顺序作故障转移。没有随机、没有测速，结果确定可复现 |
 | `metadata.rs` | `RouteMetadata`（贯穿规则链的上下文，可被非终结动作改写）、`RouteOptions` |
 | `rule_item.rs` | 匹配条件：`RuleItem` 枚举（client / model / protocol / path / header / token_estimate / logical）、`glob_match` |
 | `rule.rs` | `RouteAction`（**终结**：`Final` / `Reject`；**非终结**：`ModelOverride` / `RouteOptions` / `Sniff`）、`RouteRule` |
@@ -496,13 +496,13 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
 | `db.rs` | 连接池 + PRAGMA（WAL / foreign_keys / busy_timeout）；启动时把 `auto_vacuum` 切到 `INCREMENTAL`（老库会做一次 `VACUUM`），`reclaim_space()` 在删除后真正缩文件；`open_memory()` 供测试 |
 | `pack.rs` | **捕获正文的 zstd 压缩**：`APZ1` 魔数 + u32 原始长度 + 压缩体。无魔数的老行原样读；小报文不压；坏数据返回 `None` 而不是半份内容。只在落库/读库这一层发生，转发路径不碰 |
 | `models.rs` | `Provider`、`ProviderKind`、`AuthStyle`、`ProviderModel`、`ProtocolEndpoint`。**`Provider::auth_header()`** 是鉴权头的唯一构造点；`wire_for()` 决定直通还是转换，`endpoint` / `endpoint_verbatim` 是出站 URL 的拼接点 |
-| `providers.rs` | 渠道 CRUD、**`set_enabled`**（渠道页那枚启停开关：只改启用位，不走整份 `upsert`）、模型映射、**`candidate_channels`**（按每模型优先级排序，路由的候选来源）/ `candidates_for_model`（含停用渠道，模型页展示用）、**`set_model_candidates`**（跨渠道写，与 `set_models` 是同一张表的两个方向）、`has_declared_models`（接管前置条件） |
+| `providers.rs` | 渠道 CRUD、**`set_enabled`**（渠道页那枚启停开关：只改启用位，不走整份 `upsert`）、模型映射、**`candidate_channels`**（按每模型优先级排序，路由的候选来源）/ `candidates_for_model`（含停用渠道，模型路由页展示用）、**`set_model_candidates`**（跨渠道写，与 `set_models` 是同一张表的两个方向）、`has_declared_models`（接管前置条件） |
 | `routing.rs` | 路由规则 / selector / 兜底配置的读写；`ensure_default_selector` |
 | `pricing.rs` | 单价系数读写；`load_table` 装配 `PricingTable` |
 | `logs.rs` | 请求明细 + 双向捕获原文（入站 / 出站 / **发给客户端的响应头**）；`query`（动态过滤：时间、客户端、模型、协议、状态、是否流式）、`get_detail`、`facets`（筛选下拉的候选值）、`clear_all`、`prune_captures`（条数）/ `prune_captures_before` + `prune_logs`（时间）。捕获还含流式响应的 `response_content`（IR）与两侧原始 SSE 帧。正文经 `pack.rs` 压缩，`payload_bytes` 记**解压后**大小（表达式筛选的读取预算按它算）；保留条数在**流式与非流式两条收尾**都执行，保留天数由 `shell.rs::prune_history` 定期执行 |
 | `session_pins.rs` | 对话级模型固定的读写（`session_model_pins` 表）。判定在 `routing/session_pin.rs` |
 | `sessions.rs` | **按对话聚合**：`list`（会话列表，带标题，模型按首次出现保序）/ `timeline`（一个会话的全部请求 + 各条线 + 压缩点）/ `save_title`（写 `session_titles`，会话级一行；`TitleSource::Generated` 覆盖 `FirstLine`，同来源先到者说话）。标题的两个来源：客户端起标题任务的回复（`traffic/session.rs::parse_generated_title`）优先，取不到才用用户第一句话（`first_user_line`）。「主线 / 子代理 / 旁路」与「哪里压缩过」**查询时现算**，不落库 —— 要看整个会话才定得下来 |
-| `model_policies.rs` | 每模型的渠道选择策略读写。**没有行 = 交给 selector 与路由规则** |
+| `model_policies.rs` | 每模型的**强制渠道**读写（`active_provider`）。**没有行 = 交给 selector 与路由规则** |
 | `aggregates.rs` | **`AggregateBuffer`**（内存聚合 + 定期 upsert）、`summary` / `summary_by` / `timeseries` / `p50_ttfb` / `speed_averages`（按 token 加权的平均 TTFT / ITL / TPS，样本口径的唯一真源在 `logs::speed_sample`）。按模型汇总时额外返回 `request_models`（被折叠进该生效模型的客户端模型名），供统计页标出改写 |
 
 **迁移规则**：`MIGRATIONS` 数组**只追加，不修改已发布的条目**。
@@ -518,7 +518,7 @@ TUI / 桌面版会中招 —— 而用户不可能猜到要去重启一个后台
   打开时的旧快照把别处刚配好的重定向覆盖回去。
 - 两个写入口是同一张表的两个视角，各自全量替换自己那一维，所以谁都不能把对方那一列
   冲成默认值：`set_models`（渠道页，「这个渠道有哪些模型」）保留已有的
-  `upstream_model` / `enabled`；`set_model_candidates`（路由页，「这个模型在哪些渠道上、
+  `upstream_model` / `enabled`；`set_model_candidates`（模型路由页，「这个模型在哪些渠道上、
   上游叫什么」）保留渠道维。
 
 ---
@@ -571,7 +571,7 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 |---|---|---|
 | `app.rs` | 6 | `app_info`（含数据目录 / 数据库路径 / **日志目录**）、`get_settings`、`update_settings`、`set_model_policy`（只改模型策略，避免整份 `AppSettings` 回传冲掉别处刚改的设置）、`validate_model_script` / `validate_rewrite_script`（只编译不执行，给脚本文本框做行内报错） |
 | `gateway.rs` | 3 | `gateway_start` / `stop` / `status` |
-| `providers.rs` | 9 | 渠道 CRUD、`test_provider`、**`set_provider_enabled`**（渠道页的启停开关：只改启用位，写完重载注册表）、模型声明（`set_provider_models` 只收模型名，上游名归 `models.rs`）、`fetch_provider_models`（拉上游 `/v1/models`）、**`detect_provider_protocols`**（协议自动检测：三种入口各发一次空体请求，判定见 **`judge_protocol`** —— 只有"路径存在"的证据才算数，且**不写库**）；同文件的 **`probe()`** 是普通函数而非命令，被路由页复用 |
+| `providers.rs` | 9 | 渠道 CRUD、`test_provider`、**`set_provider_enabled`**（渠道页的启停开关：只改启用位，写完重载注册表）、模型声明（`set_provider_models` 只收模型名，上游名归 `models.rs`）、`fetch_provider_models`（拉上游 `/v1/models`）、**`detect_provider_protocols`**（协议自动检测：三种入口各发一次空体请求，判定见 **`judge_protocol`** —— 只有"路径存在"的证据才算数，且**不写库**）；同文件的 **`probe()`** 是普通函数而非命令，被模型路由页复用 |
 | `routing.rs` | 10 | 规则 CRUD + 排序、selector CRUD + **`switch_selector`**（热切换）、`run_urltest` |
 | `billing.rs` | 6 | 单价 CRUD、`billing_summary` / `totals` / `timeseries` |
 | `cache.rs` | 4 | `cache_stats`、`clear_cache`、策略读写 |
@@ -607,8 +607,8 @@ apilot://stream            → StreamEvent      （流式请求的实时事件�
 
 | 表 | 主键 / 唯一 | 用途 |
 |---|---|---|
-| `model_policies` | `model` | 每个模型的渠道选择策略（priority / latency / weight + 手动选中的渠道）。**没有行 = 交给 selector 与路由规则** |
-| `providers` | `tag` 唯一（内部生成，界面不显示） | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、派生的模型映射、权重、超时、**代理覆盖**（`proxy`，NULL = 跟随全局）、**元数据来源**（`metadata_source`：auto / models_dev / litellm / off，决定保存时是否自动补价格） |
+| `model_policies` | `model` | 每个模型的**强制渠道**（`active_provider`：钉住走哪个渠道）。老库还有一列 `strategy`，已无读取点。**没有行 = 交给 selector 与路由规则**；行存在但 `active_provider` 为空 = 按 `provider_models.priority` 的顺序走 |
+| `providers` | `tag` 唯一（内部生成，界面不显示） | 渠道：base_url、鉴权、**支持的协议集合**（`protocols`，驱动直通/转换的判定）、派生的模型映射、优先级、超时、**代理覆盖**（`proxy`，NULL = 跟随全局）、**元数据来源**（`metadata_source`：auto / models_dev / litellm / off，决定保存时是否自动补价格） |
 | `provider_models` | `(provider_id, model, client_group)` | 模型↔渠道映射（等价 new-api 的 abilities）。**没声明任何模型的渠道视为通吃**。`upstream_model` 就是「客户端发这个名，上游该收哪个名」。写入都会重算 `providers.model_mapping`（见上） |
 | `route_rules` | `id` | 规则链，按 `sort_index` 求值；`items` / `action` 存 JSON |
 | `selectors` | `tag` | selector 定义 + **`current_provider`**（热切换的持久化落点） |
@@ -640,10 +640,11 @@ React 19 + Vite 8 + Tailwind v4 + shadcn/ui。**无路由库** —— `App.tsx` 
 | `src/lib/logExpr.ts` | 监控页自定义表达式筛选的**前端那一半**：为「进行中」请求组装内置对象并求值（已落库的走后端 QuickJS）。两边必须同语义，改一个就要改另一个 |
 | `src/lib/utils.ts` | `cn`、`quotaToUsd`（1 USD = 500000 quota）、格式化 |
 | `src/hooks/queries.ts` | react-query 封装 |
-| `src/pages/*.tsx` | 10 个页面：Overview / Clients / Providers / Models / Samples / Routing / Traffic / Billing / Cache / Settings。**两页分工**：Models 只管**模型名**（全局 + 客户端两级替换、模型并集列表只读）；Routing 管**渠道**（selector 热切换、规则链、每个模型走哪个渠道、以及该渠道上的**上游模型名**）。Providers 是渠道视角 —— 同一份 `provider_models` 的三个方向。**Samples** 管指纹参考库、本地样本与检测记录（远端更新 / 本地标签 / 历史回看与入库） |
+| `src/pages/*.tsx` | 9 个页面：Overview / Clients / Providers / **ModelRouting** / Samples / Traffic / Billing / Cache / Settings。**ModelRouting 是原来「模型」与「路由」两页的合并**（用户要回答的只有一个问题："这条请求落到哪个渠道的哪个模型"），三个页签：模型与渠道（模型替换 + 每模型候选渠道的顺序与钉住）/ 规则与选择器 / 规则测试。Providers 是渠道视角 —— 同一份 `provider_models` 的两个方向。**Samples** 管指纹参考库、本地样本与检测记录 |
 | `src/components/ui/` | 手写的 shadcn 组件（19 个） |
-| `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（渠道选择 + 每渠道的上游模型名，挂在路由页） |
-| `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板 |
+| `src/components/models/` | 模型名那一轴：`ModelPolicyCard`（两级四模式）、`CustomRuleEditor`（映射表 / JS 双轨）、`ModelChannelPicker`（**顺序即优先级**：上下移写回 `provider_models.priority`、点一行钉住该渠道、每渠道的上游模型名；渲染在 ModelRoutingPage） |
+| `src/components/routing/` | 规则编辑器（递归条件树 + 5 种动作）、拖拽排序、selector 热切换面板、规则测试（`RouteSimulator`） |
+| `src/lib/confirm.tsx` | **应用内确认框**（`useConfirm`）。别用 `window.confirm`：macOS 的 WKWebView 不实现 JS 对话框，`confirm()` 直接返回 `false` 而不弹窗 —— 表现为「点删除没反应」，且只在 Mac 上复现 |
 | `src/components/providers/` | 渠道对话框与预设（含「支持的协议」声明与**自动检测** —— 逐个协议探一次，只补勾不取消；新建后自动拉一次上游模型列表并声明）、模型声明面板 `ProviderModelsPanel`（`ModelPickerDialog` 负责从上游拉列表并勾选；每行还有**单次模型测试**、**指纹检测**与三枚**能力徽标**，点徽标即实测一项；顶部还有**批量指纹检测**）；`CatalogCapabilitiesDialog` / `CatalogPriceDialog` 是两个目录导入入口；`FingerprintDialog` 负责确认、并行开关、随机/手动挑战与实时进度；`FingerprintBatchDialog` 负责多模型批量（模型并发可配置）、逐行进度/摘要/重测；`FingerprintChallengePicker`、`FingerprintProgressCards` 是单模型与批量共用的挑战选择/进度卡片；`FingerprintResultView` 展示结果并处理入库；`FingerprintHistoryDialog` 回看历史检测 |
 | `src/components/traffic/` | 请求详情：`RequestDetailDialog`（顶层「请求 / 响应 / 时间轴」三段，前两段内部再分方向与「可视化 / 格式化 / 原始」三态）+ `InspectViews`（按语义渲染 IR：系统提示词、工具列表、对话上下文、回答、思考、工具调用、token 明细）+ **`StreamTimeline`**（每个事件一根耗时条；实时与明细两处共用，数据一个是内存里的 `at_ms`、一个是从库里读的 `stream_timings`）；`LiveStreamDialog`（**进行中**的流式请求：左侧事件时间轴 + 右侧「内容」（增量折叠）/「原文」两视图，数据来自 `apilot://stream`，不查库）；`FilterExprPanel`（监控页的**自定义表达式**筛选：编辑框 + 后端行内校验 + 示例 + 内置对象结构说明）；`TimeRangePicker`（监控页的**自定义时间范围**：按钮上直接显示所选区间，弹层里两个时间框 + 常用区间；与预设页签互斥）；**`SessionsView`**（监控页「对话」视图：左会话列表、右时间线，按线筛、压缩点横条、换模型高亮，点行复用 `RequestDetailDialog`，「在请求列表中查看」带 `session_id` 筛选切回去）；**`ReplayDialog`**（回放 / A-B 对比：选目标渠道与模型，并排显示原始与回放的回答、耗时、token；回放是真实出站请求，**不写日志、不计费**） |
 

@@ -1,6 +1,6 @@
 //! 候选渠道的组装与排序。
 //!
-//! 「用哪个渠道」有两条优先级：模型策略 > selector。这个文件是它在出站前的落点。
+//! 「用哪个渠道」有两条优先级：模型渠道配置 > selector。这个文件是它在出站前的落点。
 
 use std::sync::Arc;
 
@@ -11,12 +11,12 @@ use crate::upstream::outbound::Outbound;
 
 /// 组装候选渠道：主渠道 + 其余（用于故障转移）。
 ///
-/// 主渠道由谁决定，取决于这个模型有没有配过渠道策略
-/// （`model_policies` 表，界面上在**路由页**的「模型的渠道选择」里改）：
+/// 主渠道由谁决定，取决于这个模型在 `model_policies` 里有没有行
+/// （界面上在**模型路由页**的「模型的渠道选择」里改）：
 ///
-/// - **配过** → 按策略在声明了这个模型的所有渠道里排序，第一个当主渠道。
-///   这就是"像切换代理一样切换渠道"的落点。
-/// - **没配过** → 沿用 `selector` 选出来的那个（现有行为，一键不动）。
+/// - **有行** → 按候选列表（`provider_models.priority`）排序，点名的渠道提到最前，
+///   第一个当主渠道。这就是"像切换代理一样切换渠道"的落点。
+/// - **没有行** → 沿用 `selector` 选出来的那个（现有行为，一键不动）。
 ///
 /// 这条界线是整个方案不破坏既有配置的基础，改动时别把它弄丢了。
 ///
@@ -29,7 +29,7 @@ pub(super) async fn build_candidates(
     model: &str,
     protocol_in: Protocol,
 ) -> Vec<Arc<dyn Outbound>> {
-    build_candidates_explained(shell, primary, model, protocol_in, crate::util::rand_unit())
+    build_candidates_explained(shell, primary, model, protocol_in)
         .await
         .0
 }
@@ -38,10 +38,9 @@ pub(super) async fn build_candidates(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum CandidateBasis {
-    /// 模型配了渠道策略（路由页「模型的渠道选择」）。
+    /// 模型配了渠道（模型路由页「模型的渠道选择」）。
     ModelPolicy {
-        strategy: crate::storage::models::ModelStrategy,
-        /// 手动切换到的渠道盖过了策略。
+        /// 这个模型点了个具体渠道，它排在第一位。
         pinned: bool,
     },
     /// 配了策略，但声明了这个模型的渠道一个都用不了，落回 selector。
@@ -52,14 +51,12 @@ pub enum CandidateBasis {
     Selector,
 }
 
-/// [`build_candidates`] 的本体，外加排序依据。`roll` 是加权策略用的 [0,1) 随机数，
-/// 与 `model_select::order` 一样从外面传，不在这里偷偷取随机数。
+/// [`build_candidates`] 的本体，外加排序依据。
 pub(crate) async fn build_candidates_explained(
     shell: &Arc<AppShell>,
     primary: &Arc<dyn Outbound>,
     model: &str,
     protocol_in: Protocol,
-    roll: f64,
 ) -> (Vec<Arc<dyn Outbound>>, CandidateBasis) {
     let channels = crate::storage::providers::candidate_channels(&shell.db, model)
         .await
@@ -72,14 +69,11 @@ pub(crate) async fn build_candidates_explained(
 
     let (mut out, basis) = match policy {
         Some(ref p) => {
-            // 延迟策略要有测速结果；没测过的候选在 order() 里会被排到最后。
             let ranked: Vec<crate::routing::model_select::Candidate> = channels
                 .iter()
                 .map(|c| crate::routing::model_select::Candidate {
                     tag: c.provider.tag.clone(),
                     priority: c.priority,
-                    weight: c.weight,
-                    latency_ms: shell.probe_latency.get(&c.provider.tag).map(|v| *v),
                 })
                 .collect();
 
@@ -87,7 +81,7 @@ pub(crate) async fn build_candidates_explained(
                 .active_provider
                 .as_deref()
                 .is_some_and(|a| ranked.iter().any(|c| c.tag == a));
-            let ordered = crate::routing::model_select::order(Some(p), ranked, roll);
+            let ordered = crate::routing::model_select::order(Some(p), ranked);
 
             let mut cs: Vec<Arc<dyn Outbound>> = Vec::new();
             for tag in ordered {
@@ -101,7 +95,7 @@ pub(crate) async fn build_candidates_explained(
             if cs.is_empty() {
                 (vec![primary.clone()], CandidateBasis::ModelPolicyFallback)
             } else {
-                (cs, CandidateBasis::ModelPolicy { strategy: p.strategy, pinned })
+                (cs, CandidateBasis::ModelPolicy { pinned })
             }
         }
         None => {
@@ -176,7 +170,7 @@ impl model_policy::ModelEnv for ShellModelEnv {
 
 /// 把候选渠道按「能原生说客户端协议」重排：能直通的不转换。
 ///
-/// `sort_by_key` 是稳定排序，同一组内部保持调用方排好的 priority / weight 顺序
+/// `sort_by_key` 是稳定排序，同一组内部保持调用方排好的 priority 顺序
 /// —— 只在"协议匹配与否"这一维上重新分组，不推翻用户的优先级配置。
 ///
 /// 首选渠道不参与排序：它是 selector 选出来的，位置由用户的路由规则决定，

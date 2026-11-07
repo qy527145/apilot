@@ -26,6 +26,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { qk } from "@/hooks/queries";
 import { api, type RouteRule } from "@/lib/api";
+import { useConfirm } from "@/lib/confirm";
 import { cn } from "@/lib/utils";
 import { summarizeAction, summarizeItem } from "@/components/routing/ruleSummary";
 
@@ -47,6 +48,7 @@ export function RuleList({
   onEdit,
 }: Props) {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const [items, setItems] = useState<RouteRule[]>(rules);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -145,8 +147,14 @@ export function RuleList({
                   onToggle={() => toggle.mutate(rule)}
                   onEdit={() => onEdit(rule)}
                   onDelete={() => {
-                    if (confirm(`确认删除规则「${rule.name}」？`))
-                      remove.mutate(rule.id);
+                    void confirm({
+                      title: "删除规则",
+                      description: `确认删除规则「${rule.name}」？`,
+                      confirmLabel: "删除",
+                      destructive: true,
+                    }).then((ok) => {
+                      if (ok) remove.mutate(rule.id);
+                    });
                   }}
                 />
               ))}

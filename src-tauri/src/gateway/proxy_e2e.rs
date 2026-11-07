@@ -160,7 +160,6 @@ fn provider(base_url: &str, kind: ProviderKind) -> Provider {
         extra_headers: Default::default(),
         param_override: None,
         model_mapping: Default::default(),
-        weight: 1,
         priority: 0,
         enabled: true,
         timeout_ms: 30_000,

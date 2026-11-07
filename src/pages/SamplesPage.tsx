@@ -55,6 +55,7 @@ import {
   type FingerprintLibraryInfo,
   type FingerprintLocalLabel,
 } from "@/lib/api";
+import { useConfirm } from "@/lib/confirm";
 
 function formatTime(value: number) {
   if (!value) return "—";
@@ -97,6 +98,7 @@ export default function SamplesPage() {
 
 function RemoteLibrary() {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const [updateOpen, setUpdateOpen] = useState(false);
   const [baseUrl, setBaseUrl] = useState(FINGERPRINT_REMOTE_BASE);
   const { data, isLoading } = useQuery({
@@ -193,9 +195,13 @@ function RemoteLibrary() {
               variant="outline"
               disabled={data?.source === "embedded" || reset.isPending}
               onClick={() => {
-                if (confirm("恢复内置参考库？远端下载的文件会保留但不再使用。")) {
-                  reset.mutate();
-                }
+                void confirm({
+                  title: "恢复内置参考库",
+                  description: "远端下载的文件会保留但不再使用。",
+                  confirmLabel: "恢复",
+                }).then((ok) => {
+                  if (ok) reset.mutate();
+                });
               }}
             >
               {reset.isPending ? (
@@ -303,6 +309,7 @@ function RemoteLibrary() {
 
 function LocalLibrary() {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const [selected, setSelected] = useState<string | null>(null);
   const labelsQuery = useQuery({
     queryKey: qk.fingerprintLabels,
@@ -410,9 +417,14 @@ function LocalLibrary() {
               className="text-destructive shrink-0"
               disabled={removeLabel.isPending}
               onClick={() => {
-                if (confirm(`删除「${current.label}」下的全部 ${current.samples} 条样本？`)) {
-                  removeLabel.mutate(current.label);
-                }
+                void confirm({
+                  title: "删除标签",
+                  description: `删除「${current.label}」下的全部 ${current.samples} 条样本？`,
+                  confirmLabel: "删除",
+                  destructive: true,
+                }).then((ok) => {
+                  if (ok) removeLabel.mutate(current.label);
+                });
               }}
             >
               <Trash2 className="size-4" />
@@ -514,6 +526,7 @@ function LabelRow({
 
 function DetectionHistory() {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const [selected, setSelected] = useState<number | null>(null);
   const { data, isLoading } = useQuery({
     queryKey: qk.fingerprintDetections,
@@ -633,9 +646,14 @@ function DetectionHistory() {
                         title="删除这条检测记录"
                         disabled={remove.isPending}
                         onClick={() => {
-                          if (confirm("删除这条检测记录？已加入本地样本库的数据不受影响。")) {
-                            remove.mutate(item.id);
-                          }
+                          void confirm({
+                            title: "删除检测记录",
+                            description: "已加入本地样本库的数据不受影响。",
+                            confirmLabel: "删除",
+                            destructive: true,
+                          }).then((ok) => {
+                            if (ok) remove.mutate(item.id);
+                          });
                         }}
                       >
                         <Trash2 className="size-4 text-destructive" />

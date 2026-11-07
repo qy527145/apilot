@@ -67,7 +67,6 @@ interface FormState {
   protocols: Protocol[];
   /** 各协议的路径覆盖，留空表示用默认路径。 */
   paths: Partial<Record<Protocol, string>>;
-  weight: string;
   priority: string;
   timeout_ms: string;
   enabled: boolean;
@@ -89,7 +88,6 @@ const EMPTY: FormState = {
   // 而"没声明过协议"在后端本来就等于"只有首选那一种"。
   protocols: ["anthropic"],
   paths: {},
-  weight: "1",
   priority: "0",
   // 600 秒与后端 `default_timeout()` 对齐。这里曾经是 60 秒，而 reqwest 的
   // 请求超时是**总时限**（连响应体一起算），于是长回答一律在 60 秒被腰斩，
@@ -174,7 +172,6 @@ function toForm(p: Provider): FormState {
     auth_style: p.auth_style,
     protocols,
     paths,
-    weight: String(p.weight),
     priority: String(p.priority),
     timeout_ms: String(p.timeout_ms),
     enabled: p.enabled,
@@ -240,7 +237,7 @@ export function ProviderDialog({
   /**
    * 新建渠道后顺手把上游的模型列表拉回来声明上。
    *
-   * 没这份声明，这个渠道就是「通吃」：模型页里看不到它的模型，
+   * 没这份声明，这个渠道就是「通吃」：模型路由页里看不到它的模型，
    * 路由也没法按模型把它选出来。拉不到（服务商没有 /v1/models）不阻断创建 ——
    * 退回到原来的通吃语义，用户仍可在渠道行展开后手填。
    */
@@ -271,7 +268,7 @@ export function ProviderDialog({
       toast.success(`渠道已创建，已声明 ${models.length} 个模型`, {
         // 声明之后这个渠道就不再"通吃"了：客户端发来的名字必须在列表里才会路由过来。
         // 不说清楚的话，用户会觉得"刚加的渠道怎么不接我的请求"。
-        description: "客户端要用的模型名得在列表里才会走这个渠道；需要改名去路由页配。",
+        description: "客户端要用的模型名得在列表里才会走这个渠道；需要改名去「模型路由」页配。",
       });
     } catch {
       toast.success("渠道已创建", {
@@ -350,7 +347,7 @@ export function ProviderDialog({
     mutationFn: (input: ProviderInput) => api.upsertProvider(input),
     onSuccess: (saved) => {
       qc.invalidateQueries({ queryKey: qk.providers });
-      // 改渠道的启用状态 / 删渠道都会影响模型页的候选列表。
+      // 改渠道的启用状态 / 删渠道都会影响模型路由页的候选列表。
       qc.invalidateQueries({ queryKey: qk.modelCatalog });
       qc.invalidateQueries({ queryKey: qk.providerModels(saved.id) });
       // 保存时后端可能按元数据来源自动同步了价格。
@@ -430,7 +427,6 @@ export function ProviderDialog({
       }),
       extra_headers: form.extra_headers,
       param_override: paramOverride,
-      weight: Number(form.weight) || 0,
       priority: Number(form.priority) || 0,
       enabled: form.enabled,
       timeout_ms: Number(form.timeout_ms) || 600000,
@@ -702,15 +698,7 @@ export function ProviderDialog({
             )}
           </div>
 
-          <div className="grid grid-cols-3 gap-4">
-            <div className="space-y-2">
-              <Label>权重</Label>
-              <Input
-                type="number"
-                value={form.weight}
-                onChange={(e) => set("weight", e.target.value)}
-              />
-            </div>
+          <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label>优先级</Label>
               <Input

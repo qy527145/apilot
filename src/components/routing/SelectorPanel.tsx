@@ -34,6 +34,7 @@ import {
   type Selector,
   type SelectorInput,
 } from "@/lib/api";
+import { useConfirm } from "@/lib/confirm";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -52,6 +53,7 @@ export function SelectorPanel({
   onRetry,
 }: Props) {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [draft, setDraft] = useState<SelectorInput>({
     tag: "",
@@ -233,8 +235,14 @@ export function SelectorPanel({
                     variant="ghost"
                     size="icon"
                     onClick={() => {
-                      if (confirm(`确认删除选择器「${s.name}」？`))
-                        remove.mutate(s.tag);
+                      void confirm({
+                        title: "删除选择器",
+                        description: `确认删除选择器「${s.name}」？指向它的路由规则会失去目标。`,
+                        confirmLabel: "删除",
+                        destructive: true,
+                      }).then((ok) => {
+                        if (ok) remove.mutate(s.tag);
+                      });
                     }}
                   >
                     <Trash2 className="size-4 text-destructive" />

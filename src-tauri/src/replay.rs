@@ -6,7 +6,7 @@
 //! - 一律按非流式发，拿到完整回答才能与原始响应并排比较；
 //! - 目标模型按渠道的 `model_mapping` 映射后再发；线协议按 `wire_for(入站协议)`
 //!   选，与真实路由同口径 —— 否则对比的就不是"同一条请求换个渠道"了；
-//! - 目标渠道选「自动」时按**模型策略 > 原渠道（若它声明了这个模型）> 候选渠道**
+//! - 目标渠道选「自动」时按**模型渠道配置 > 原渠道（若它声明了这个模型）> 候选渠道**
 //!   选，而不是无脑沿用原渠道。只改目标模型时，原渠道往往根本不服务新模型。
 
 use std::sync::Arc;
@@ -206,16 +206,10 @@ async fn resolve_provider(
                 .map(|c| crate::routing::model_select::Candidate {
                     tag: c.provider.tag.clone(),
                     priority: c.priority,
-                    weight: c.weight,
-                    latency_ms: shell.probe_latency.get(&c.provider.tag).map(|v| *v),
                 })
                 .collect();
             Some(
-                crate::routing::model_select::order(
-                    Some(&policy),
-                    ranked,
-                    crate::util::rand_unit(),
-                )
+                crate::routing::model_select::order(Some(&policy), ranked)
                 .into_iter()
                 .filter(|tag| shell.registry.get(tag).is_some())
                 .collect(),
@@ -416,7 +410,6 @@ mod tests {
             extra_headers: Default::default(),
             param_override: None,
             model_mapping: Default::default(),
-            weight: 0,
             priority: 0,
             enabled: true,
             timeout_ms: 60_000,

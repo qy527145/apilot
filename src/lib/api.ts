@@ -98,7 +98,6 @@ export interface ProviderInput {
   protocols: ProtocolEndpoint[];
   extra_headers: Record<string, string>;
   param_override?: unknown | null;
-  weight: number;
   priority: number;
   enabled: boolean;
   timeout_ms: number;
@@ -120,7 +119,6 @@ export interface Provider {
   extra_headers: Record<string, string>;
   param_override?: unknown | null;
   model_mapping: Record<string, string>;
-  weight: number;
   priority: number;
   enabled: boolean;
   timeout_ms: number;
@@ -246,25 +244,21 @@ export function emptyCustomRules(): CustomRules {
   return { form: "table", table: [], script: null };
 }
 
-/** 同一个模型在多个渠道都有时怎么选。 */
-export type ModelStrategy = "priority" | "latency" | "weight";
-
-/** 一条候选渠道。priority / weight 是**这个模型在**该渠道上的值。 */
+/**
+ * 一条候选渠道。`priority` 是**这个模型在**该渠道上的值，高者先 ——
+ * 合并页面拖出来的顺序就是它。
+ */
 export interface ModelCandidate {
   provider_tag: string;
   provider_name: string;
   upstream_model?: string | null;
   priority: number;
-  weight: number;
   enabled: boolean;
-  /** 最近一次测速的延迟；没测过是 null。 */
-  latency_ms?: number | null;
 }
 
 export interface ModelPolicyRecord {
   model: string;
-  strategy: ModelStrategy;
-  /** 手动切换到的渠道；null 表示按策略自动。 */
+  /** 强制走这个渠道（pointed）；null 表示按候选列表的优先级顺序走。 */
   active_provider?: string | null;
 }
 
@@ -274,7 +268,7 @@ export interface ModelCatalogEntry {
   candidates: ModelCandidate[];
   /** null 表示这个模型交给路由规则与选择器管。 */
   policy?: ModelPolicyRecord | null;
-  /** 当前会走哪个渠道。加权随机策略下为 null（每次请求重抽）。 */
+  /** 当前会走哪个渠道。没配过策略时是 selector 会选的那个。 */
   primary?: string | null;
 }
 
@@ -283,7 +277,6 @@ export interface ModelCandidateInput {
   provider_tag: string;
   upstream_model?: string | null;
   priority: number;
-  weight: number;
   enabled: boolean;
 }
 
@@ -458,7 +451,7 @@ export interface SimulateInput {
 export type ClientSource = "token" | "header" | "user_agent" | "path" | "unknown";
 
 export type CandidateBasis =
-  | { kind: "model_policy"; strategy: ModelStrategy; pinned: boolean }
+  | { kind: "model_policy"; pinned: boolean }
   | { kind: "model_policy_fallback" }
   | { kind: "declared_channels" }
   | { kind: "selector" };
@@ -482,7 +475,6 @@ export type SimulateOutcome =
       model: string;
       basis: CandidateBasis;
       candidates: SimulateCandidate[];
-      notes: string[];
     };
 
 export interface SimulateResult {
@@ -1913,7 +1905,7 @@ export const api = {
 
   setModelCandidates: (model: string, candidates: ModelCandidateInput[]) =>
     call<null>("set_model_candidates", { model, candidates }),
-  /** 对候选渠道跑一次测速，结果缓存起来供「按延迟」策略用。 */
+  /** 对候选渠道跑一次连通性测速，结果只用于展示。 */
   probeModelCandidates: (model: string) =>
     call<ProbeResult[]>("probe_model_candidates", { model }),
 };

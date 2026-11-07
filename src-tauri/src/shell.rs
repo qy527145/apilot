@@ -49,12 +49,6 @@ pub struct AppShell {
     /// 指纹参考库。启动时加载内置/远端快照；远端更新后原子热切换。
     pub fingerprint: Arc<crate::fingerprint::FingerprintEngine>,
 
-    /// 最近一次测速的延迟（provider_tag → 毫秒）。
-    ///
-    /// 只活在内存里：它是易变的遥测数据，重启后重新测即可，落库反而会让人
-    /// 对着几天前的数字做决策。由「测速」命令写入，供按延迟选渠道的策略读取。
-    pub probe_latency: Arc<dashmap::DashMap<String, i64>>,
-
     /// 最近拉到的上游模型目录，按来源缓存。
     ///
     /// 缓存而不是每次重拉，是因为「预览差异」和「确认应用」是两次命令调用 ——
@@ -132,7 +126,6 @@ impl AppShell {
             gateway: Arc::new(crate::gateway::server::GatewayServer::new()),
             session_pins: Arc::new(session_pins),
             fingerprint: Arc::new(crate::fingerprint::FingerprintEngine::load()),
-            probe_latency: Arc::new(dashmap::DashMap::new()),
             catalog_cache: Arc::new(dashmap::DashMap::new()),
             started_at: now_ms(),
         });
